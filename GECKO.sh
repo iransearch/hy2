@@ -225,15 +225,6 @@ install_hysteria2_gecko_v292() {
     return 1
   fi
 
-  if [ -f "$HYSTERIA_SERVICE" ] || [ -f "$HYSTERIA_CONFIG" ] || [ -x "$HYSTERIA_BIN" ]; then
-    echo "Hysteria2 Gecko already seems installed."
-    read -rp "Reinstall and overwrite current config? [y/N]: " REINSTALL_HY2
-    case "$REINSTALL_HY2" in
-      y|Y|yes|YES|Yes) ;;
-      *) echo "Cancelled."; return 0 ;;
-    esac
-  fi
-
   command -v curl >/dev/null 2>&1 || { apt update -y && apt install -y curl; }
   command -v openssl >/dev/null 2>&1 || { apt update -y && apt install -y openssl; }
   command -v python3 >/dev/null 2>&1 || { apt update -y && apt install -y python3; }
@@ -496,72 +487,613 @@ EOF
 }
 
 
-show_hysteria2_gecko_link() {
-  clear
-  echo "======================================================="
-  echo " Hysteria2 Gecko Client Link"
-  echo "======================================================="
-  if [ -f /etc/hysteria2/client-link.txt ]; then
-    cat /etc/hysteria2/client-link.txt
-  else
-    echo "Client link not found: /etc/hysteria2/client-link.txt"
+detect_hysteria_arch_global() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    armv6l|armv6) echo "armv6" ;;
+    i386|i686) echo "386" ;;
+    *) echo "unsupported" ;;
+  esac
+}
+
+install_hysteria_binary_multiarch_global() {
+  HYSTERIA_VERSION_GLOBAL="v2.9.2"
+  HYSTERIA_BIN_GLOBAL="/usr/local/bin/hysteria"
+  HY2_ARCH_GLOBAL="$(detect_hysteria_arch_global)"
+
+  if [ "$HY2_ARCH_GLOBAL" = "unsupported" ]; then
+    echo "Unsupported architecture: $(uname -m)"
+    return 1
   fi
-  echo "======================================================="
+
+  command -v curl >/dev/null 2>&1 || { apt update -y && apt install -y curl; }
+  command -v openssl >/dev/null 2>&1 || { apt update -y && apt install -y openssl; }
+  command -v python3 >/dev/null 2>&1 || { apt update -y && apt install -y python3; }
+
+  HYSTERIA_URL_GLOBAL="https://github.com/apernet/hysteria/releases/download/app%2F${HYSTERIA_VERSION_GLOBAL}/hysteria-linux-${HY2_ARCH_GLOBAL}"
+  echo "Downloading Hysteria ${HYSTERIA_VERSION_GLOBAL} linux-${HY2_ARCH_GLOBAL}..."
+  TMP_BIN_GLOBAL="$(mktemp /tmp/hysteria-global.XXXXXX)"
+
+  if ! curl -fL --retry 3 --retry-delay 2 -o "$TMP_BIN_GLOBAL" "$HYSTERIA_URL_GLOBAL"; then
+    rm -f "$TMP_BIN_GLOBAL"
+    echo "Download failed: $HYSTERIA_URL_GLOBAL"
+    return 1
+  fi
+
+  chmod +x "$TMP_BIN_GLOBAL"
+  install -m 0755 "$TMP_BIN_GLOBAL" "$HYSTERIA_BIN_GLOBAL.new"
+  mv -f "$HYSTERIA_BIN_GLOBAL.new" "$HYSTERIA_BIN_GLOBAL"
+  rm -f "$TMP_BIN_GLOBAL"
 }
 
-show_hysteria2_gecko_status() {
-  clear
-  echo "======================================================="
-  echo " Hysteria2 Gecko Status"
-  echo "======================================================="
-  if systemctl list-unit-files | grep -q '^hysteria2-gecko.service'; then
-    systemctl status hysteria2-gecko.service --no-pager || true
+install_socat_dep_global() {
+  command -v socat >/dev/null 2>&1 && return 0
+
+  if command -v apt >/dev/null 2>&1; then
+    apt update -y && apt install -y socat curl python3 ca-certificates
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y socat curl python3 ca-certificates
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y socat curl python3 ca-certificates
   else
-    echo "hysteria2-gecko.service is not installed."
+    echo "Unsupported package manager. Install socat manually."
+    return 1
   fi
 }
 
-restart_hysteria2_gecko() {
-  clear
-  echo "Restarting hysteria2-gecko.service..."
-  systemctl restart hysteria2-gecko.service
-  systemctl status hysteria2-gecko.service --no-pager || true
+yaml_quote_hy2_global() {
+  python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$1"
 }
 
-stop_hysteria2_gecko() {
-  clear
-  echo "Stopping hysteria2-gecko.service..."
-  systemctl stop hysteria2-gecko.service || true
-  systemctl status hysteria2-gecko.service --no-pager || true
+urlencode_hy2_global() {
+  python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
 }
 
-start_hysteria2_gecko() {
-  clear
-  echo "Starting hysteria2-gecko.service..."
-  systemctl start hysteria2-gecko.service
-  systemctl status hysteria2-gecko.service --no-pager || true
+b64url_decode_hy2_global() {
+  python3 - "$1" <<'PY'
+import sys, base64
+s = sys.argv[1].strip()
+s += "=" * (-len(s) % 4)
+print(base64.urlsafe_b64decode(s.encode()).decode())
+PY
 }
 
-uninstall_hysteria2_gecko() {
+json_get_hy2_global() {
+  python3 -c 'import sys,json; print(json.loads(sys.stdin.read()).get(sys.argv[1], ""))' "$1"
+}
+
+create_hy2_relay_link_global() {
+  python3 - "$@" <<'PY'
+import sys, json, base64
+keys = ["server","port","auth","obfs","obfs_password","sni","remark","version"]
+obj = dict(zip(keys, sys.argv[1:]))
+obj["obfs"] = "gecko"
+raw = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode()
+print("hy2relay://" + base64.urlsafe_b64encode(raw).decode().rstrip("="))
+PY
+}
+
+parse_hy2_relay_link_to_env_global() {
+  LINK="$1"
+  if ! echo "$LINK" | grep -q '^hy2relay://'; then
+    echo "Invalid relay link. It must start with hy2relay://"
+    return 1
+  fi
+
+  PAYLOAD="${LINK#hy2relay://}"
+  JSON_PAYLOAD="$(b64url_decode_hy2_global "$PAYLOAD")"
+
+  RELAY_KHAREJ_SERVER="$(printf '%s' "$JSON_PAYLOAD" | json_get_hy2_global server)"
+  RELAY_KHAREJ_PORT="$(printf '%s' "$JSON_PAYLOAD" | json_get_hy2_global port)"
+  RELAY_AUTH="$(printf '%s' "$JSON_PAYLOAD" | json_get_hy2_global auth)"
+  RELAY_OBFS="$(printf '%s' "$JSON_PAYLOAD" | json_get_hy2_global obfs)"
+  RELAY_OBFS_PASSWORD="$(printf '%s' "$JSON_PAYLOAD" | json_get_hy2_global obfs_password)"
+  RELAY_SNI="$(printf '%s' "$JSON_PAYLOAD" | json_get_hy2_global sni)"
+  RELAY_REMARK="$(printf '%s' "$JSON_PAYLOAD" | json_get_hy2_global remark)"
+
+  if [ "$RELAY_OBFS" != "gecko" ]; then
+    echo "Invalid relay link. Only Gecko obfuscation is allowed."
+    return 1
+  fi
+
+  if [ -z "$RELAY_KHAREJ_SERVER" ] || [ -z "$RELAY_KHAREJ_PORT" ] || [ -z "$RELAY_AUTH" ] || [ -z "$RELAY_OBFS_PASSWORD" ] || [ -z "$RELAY_SNI" ]; then
+    echo "Invalid relay link. Missing required fields."
+    return 1
+  fi
+
+  export RELAY_KHAREJ_SERVER RELAY_KHAREJ_PORT RELAY_AUTH RELAY_OBFS RELAY_OBFS_PASSWORD RELAY_SNI RELAY_REMARK
+}
+
+make_hy2_client_link_global() {
+  SERVER_ADDR="$1"
+  SERVER_PORT="$2"
+  AUTH_VALUE="$3"
+  OBFS_VALUE="$4"
+  SNI_VALUE="$5"
+  REMARK_VALUE="$6"
+
+  EN_AUTH="$(urlencode_hy2_global "$AUTH_VALUE")"
+  EN_OBFS="$(urlencode_hy2_global "$OBFS_VALUE")"
+  EN_SNI="$(urlencode_hy2_global "$SNI_VALUE")"
+  EN_REMARK="$(urlencode_hy2_global "$REMARK_VALUE")"
+
+  echo "hy2://$EN_AUTH@$SERVER_ADDR:$SERVER_PORT?sni=$EN_SNI&insecure=1&Insecure=1&obfs=gecko&obfs-password=$EN_OBFS#$EN_REMARK"
+}
+
+install_kharej_main_hysteria_gecko_with_relay_link() {
   clear
   echo "======================================================="
-  echo " Uninstall Hysteria2 Gecko"
+  echo " Install Main Hysteria2 Gecko Server - Kharej"
   echo "======================================================="
-  read -rp "Remove hysteria2-gecko service, binary and /etc/hysteria2? [y/N]: " CONFIRM
+  echo "This is the real Hysteria2 Gecko server."
+  echo "It generates a hy2relay:// link for the Iran UDP relay."
+  echo "======================================================="
+
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Please run as root."
+    return 1
+  fi
+
+  HYSTERIA_BIN="/usr/local/bin/hysteria"
+  HYSTERIA_DIR="/etc/hysteria2-gecko-main"
+  HYSTERIA_CONFIG="$HYSTERIA_DIR/server.yaml"
+  HYSTERIA_SERVICE="/etc/systemd/system/hysteria2-gecko-main.service"
+
+  if [ -f "$HYSTERIA_SERVICE" ] || [ -f "$HYSTERIA_CONFIG" ]; then
+    echo "Main Gecko server already seems installed."
+    read -rp "Reinstall and overwrite config/link? [y/N]: " REINSTALL_MAIN_GECKO
+    case "$REINSTALL_MAIN_GECKO" in
+      y|Y|yes|YES|Yes) ;;
+      *) echo "Cancelled."; return 0 ;;
+    esac
+  fi
+
+  install_hysteria_binary_multiarch_global
+
+  read -rp "Hysteria UDP port on Kharej server [443]: " HY2_SERVER_PORT
+  HY2_SERVER_PORT="${HY2_SERVER_PORT:-443}"
+  if ! [[ "$HY2_SERVER_PORT" =~ ^[0-9]+$ ]] || [ "$HY2_SERVER_PORT" -lt 1 ] || [ "$HY2_SERVER_PORT" -gt 65535 ]; then
+    echo "Invalid port."
+    return 1
+  fi
+
+  DEFAULT_AUTH="$(openssl rand -hex 16)"
+  DEFAULT_OBFS="$(openssl rand -base64 18 | tr -d '=+/')"
+
+  read -rp "Auth password [$DEFAULT_AUTH]: " HY2_AUTH
+  HY2_AUTH="${HY2_AUTH:-$DEFAULT_AUTH}"
+
+  read -rp "Gecko obfs password [$DEFAULT_OBFS]: " HY2_OBFS
+  HY2_OBFS="${HY2_OBFS:-$DEFAULT_OBFS}"
+
+  read -rp "SNI / certificate CN [www.google.com]: " HY2_SNI
+  HY2_SNI="${HY2_SNI:-www.google.com}"
+
+  read -rp "Remark [GECKO-RELAY]: " HY2_REMARK
+  HY2_REMARK="${HY2_REMARK:-GECKO-RELAY}"
+
+  echo
+  echo "Masquerade mode:"
+  echo "  1) Disable / default 404"
+  echo "  2) Static file website"
+  echo "  3) Reverse proxy to a website"
+  echo "  4) Simple string response"
+  read -rp "Choose masquerade mode [3]: " MASQ_MODE
+  MASQ_MODE="${MASQ_MODE:-3}"
+
+  MASQ_CONFIG=""
+  case "$MASQ_MODE" in
+    1)
+      echo "Masquerade disabled."
+      ;;
+    2)
+      read -rp "Static website directory [/var/www/hysteria2-masq]: " MASQ_DIR
+      MASQ_DIR="${MASQ_DIR:-/var/www/hysteria2-masq}"
+      mkdir -p "$MASQ_DIR"
+      if [ ! -f "$MASQ_DIR/index.html" ]; then
+        echo "Welcome" > "$MASQ_DIR/index.html"
+      fi
+      MASQ_DIR_YAML="$(yaml_quote_hy2_global "$MASQ_DIR")"
+      MASQ_CONFIG=$(cat <<EOF_MASQ
+
+masquerade:
+  type: file
+  file:
+    dir: $MASQ_DIR_YAML
+EOF_MASQ
+)
+      ;;
+    3)
+      read -rp "Proxy target URL [https://www.google.com/]: " MASQ_URL
+      MASQ_URL="${MASQ_URL:-https://www.google.com/}"
+      MASQ_URL_YAML="$(yaml_quote_hy2_global "$MASQ_URL")"
+      MASQ_CONFIG=$(cat <<EOF_MASQ
+
+masquerade:
+  type: proxy
+  proxy:
+    url: $MASQ_URL_YAML
+    rewriteHost: true
+    insecure: false
+EOF_MASQ
+)
+      ;;
+    4)
+      read -rp "Response text [hello]: " MASQ_TEXT
+      MASQ_TEXT="${MASQ_TEXT:-hello}"
+      MASQ_TEXT_YAML="$(yaml_quote_hy2_global "$MASQ_TEXT")"
+      MASQ_CONFIG=$(cat <<EOF_MASQ
+
+masquerade:
+  type: string
+  string:
+    content: $MASQ_TEXT_YAML
+    statusCode: 200
+    headers:
+      content-type: text/plain
+EOF_MASQ
+)
+      ;;
+    *)
+      echo "Invalid masquerade mode."
+      return 1
+      ;;
+  esac
+
+  AUTH_YAML="$(yaml_quote_hy2_global "$HY2_AUTH")"
+  OBFS_YAML="$(yaml_quote_hy2_global "$HY2_OBFS")"
+
+  systemctl stop hysteria2-gecko-main.service >/dev/null 2>&1 || true
+  mkdir -p "$HYSTERIA_DIR"
+
+  echo "Generating self-signed certificate..."
+  openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+    -keyout "$HYSTERIA_DIR/server.key" \
+    -out "$HYSTERIA_DIR/server.crt" \
+    -subj "/CN=$HY2_SNI" \
+    -days 3650 >/dev/null 2>&1
+  chmod 600 "$HYSTERIA_DIR/server.key"
+
+  cat > "$HYSTERIA_CONFIG" <<EOF
+listen: :$HY2_SERVER_PORT
+
+tls:
+  cert: $HYSTERIA_DIR/server.crt
+  key: $HYSTERIA_DIR/server.key
+  sniGuard: disable
+
+auth:
+  type: password
+  password: $AUTH_YAML
+
+obfs:
+  type: gecko
+  gecko:
+    password: $OBFS_YAML
+    minPacketSize: 512
+    maxPacketSize: 1200${MASQ_CONFIG}
+
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 30s
+  maxIncomingStreams: 1024
+  disablePathMTUDiscovery: false
+EOF
+
+  cat > "$HYSTERIA_SERVICE" <<EOF
+[Unit]
+Description=Main Hysteria2 Gecko Server for Iran Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$HYSTERIA_BIN server -c $HYSTERIA_CONFIG
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now hysteria2-gecko-main.service
+  systemctl restart hysteria2-gecko-main.service
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "$HY2_SERVER_PORT/udp" >/dev/null 2>&1 || true
+  fi
+  if command -v csf >/dev/null 2>&1; then
+    if ! grep -q "^UDP_IN.*$HY2_SERVER_PORT" /etc/csf/csf.conf 2>/dev/null; then
+      sed -i "s/^UDP_IN = \"\(.*\)\"/UDP_IN = \"\1,$HY2_SERVER_PORT\"/" /etc/csf/csf.conf || true
+      csf -r >/dev/null 2>&1 || true
+    fi
+  fi
+
+  KHAREJ_IP="$(curl -4fsSL --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+  RELAY_LINK="$(create_hy2_relay_link_global "$KHAREJ_IP" "$HY2_SERVER_PORT" "$HY2_AUTH" "gecko" "$HY2_OBFS" "$HY2_SNI" "$HY2_REMARK" "1")"
+  DIRECT_CLIENT_LINK="$(make_hy2_client_link_global "$KHAREJ_IP" "$HY2_SERVER_PORT" "$HY2_AUTH" "$HY2_OBFS" "$HY2_SNI" "$HY2_REMARK")"
+
+  cat > "$HYSTERIA_DIR/relay-link.txt" <<EOF
+$RELAY_LINK
+EOF
+
+  cat > "$HYSTERIA_DIR/direct-client-link.txt" <<EOF
+$DIRECT_CLIENT_LINK
+EOF
+
+  cat > "$HYSTERIA_DIR/server-info.txt" <<EOF
+Kharej Server IP: $KHAREJ_IP
+Hysteria UDP Port: $HY2_SERVER_PORT
+Auth Password: $HY2_AUTH
+Obfs Type: gecko
+Gecko Obfs Password: $HY2_OBFS
+SNI: $HY2_SNI
+Remark: $HY2_REMARK
+
+Relay Link for Iran:
+$RELAY_LINK
+
+Direct Client Link to Kharej:
+$DIRECT_CLIENT_LINK
+EOF
+
+  echo
+  echo "======================================================="
+  echo "Main Hysteria2 Gecko server installed on KHAREJ."
+  echo "Paste this RELAY link on IRAN server:"
+  echo "-------------------------------------------------------"
+  echo "$RELAY_LINK"
+  echo "-------------------------------------------------------"
+  echo "Direct client link to Kharej:"
+  echo "$DIRECT_CLIENT_LINK"
+  echo "Saved:"
+  echo "  $HYSTERIA_DIR/relay-link.txt"
+  echo "  $HYSTERIA_DIR/direct-client-link.txt"
+  echo "======================================================="
+}
+
+install_iran_udp_gecko_relay_from_link() {
+  clear
+  echo "======================================================="
+  echo " Install Iran UDP Relay for Hysteria2 Gecko"
+  echo "======================================================="
+  echo "Iran server does NOT terminate Hysteria."
+  echo "It only forwards UDP packets to Kharej."
+  echo "Client -> Iran is Gecko. Iran -> Kharej is the same Gecko traffic."
+  echo "No full-system tunnel, no TUN, no default route change."
+  echo "======================================================="
+
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Please run as root."
+    return 1
+  fi
+
+  RELAY_DIR="/etc/hysteria2-gecko-udp-relay"
+  RELAY_SERVICE="/etc/systemd/system/hysteria2-gecko-udp-relay.service"
+
+  if [ -f "$RELAY_SERVICE" ] || [ -d "$RELAY_DIR" ]; then
+    echo "Iran UDP relay already seems installed."
+    read -rp "Reinstall and overwrite relay config? [y/N]: " REINSTALL_IRAN_RELAY
+    case "$REINSTALL_IRAN_RELAY" in
+      y|Y|yes|YES|Yes) ;;
+      *) echo "Cancelled."; return 0 ;;
+    esac
+  fi
+
+  install_socat_dep_global
+
+  read -rp "Paste hy2relay:// link from Kharej: " RELAY_LINK_INPUT
+  parse_hy2_relay_link_to_env_global "$RELAY_LINK_INPUT" || return 1
+
+  echo
+  echo "Parsed Gecko relay link:"
+  echo "  Kharej Hysteria Server: $RELAY_KHAREJ_SERVER:$RELAY_KHAREJ_PORT"
+  echo "  Obfs:                   gecko"
+  echo "  SNI:                    $RELAY_SNI"
+  echo
+
+  read -rp "Iran input UDP port for users [${RELAY_KHAREJ_PORT}]: " IRAN_INPUT_PORT
+  IRAN_INPUT_PORT="${IRAN_INPUT_PORT:-$RELAY_KHAREJ_PORT}"
+  if ! [[ "$IRAN_INPUT_PORT" =~ ^[0-9]+$ ]] || [ "$IRAN_INPUT_PORT" -lt 1 ] || [ "$IRAN_INPUT_PORT" -gt 65535 ]; then
+    echo "Invalid Iran input port."
+    return 1
+  fi
+
+  systemctl stop hysteria2-gecko-udp-relay.service >/dev/null 2>&1 || true
+  mkdir -p "$RELAY_DIR"
+
+  cat > "$RELAY_SERVICE" <<EOF
+[Unit]
+Description=Iran UDP Relay to Kharej Hysteria2 Gecko Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat -T 600 UDP-LISTEN:$IRAN_INPUT_PORT,fork,reuseaddr UDP:$RELAY_KHAREJ_SERVER:$RELAY_KHAREJ_PORT
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now hysteria2-gecko-udp-relay.service
+  systemctl restart hysteria2-gecko-udp-relay.service
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "$IRAN_INPUT_PORT/udp" >/dev/null 2>&1 || true
+  fi
+  if command -v csf >/dev/null 2>&1; then
+    if ! grep -q "^UDP_IN.*$IRAN_INPUT_PORT" /etc/csf/csf.conf 2>/dev/null; then
+      sed -i "s/^UDP_IN = \"\(.*\)\"/UDP_IN = \"\1,$IRAN_INPUT_PORT\"/" /etc/csf/csf.conf || true
+      csf -r >/dev/null 2>&1 || true
+    fi
+  fi
+
+  IRAN_IP="$(curl -4fsSL --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+  FINAL_REMARK="${RELAY_REMARK:-GECKO-IRAN-RELAY}"
+  FINAL_CLIENT_LINK="$(make_hy2_client_link_global "$IRAN_IP" "$IRAN_INPUT_PORT" "$RELAY_AUTH" "$RELAY_OBFS_PASSWORD" "$RELAY_SNI" "$FINAL_REMARK")"
+
+  cat > "$RELAY_DIR/relay-info.txt" <<EOF
+Kharej Hysteria Gecko Server: $RELAY_KHAREJ_SERVER:$RELAY_KHAREJ_PORT
+Iran UDP Listen Port: $IRAN_INPUT_PORT
+Auth Password: $RELAY_AUTH
+Gecko Obfs Password: $RELAY_OBFS_PASSWORD
+SNI: $RELAY_SNI
+Remark: $FINAL_REMARK
+
+Client link through Iran:
+$FINAL_CLIENT_LINK
+
+Original Relay Link:
+$RELAY_LINK_INPUT
+EOF
+
+  cat > "$RELAY_DIR/client-link-through-iran.txt" <<EOF
+$FINAL_CLIENT_LINK
+EOF
+
+  echo
+  echo "======================================================="
+  echo "Iran UDP Gecko relay installed."
+  echo "Users should connect to IRAN, not Kharej:"
+  echo "-------------------------------------------------------"
+  echo "$FINAL_CLIENT_LINK"
+  echo "-------------------------------------------------------"
+  echo "Meaning:"
+  echo "  Client Address:     $IRAN_IP"
+  echo "  Client Port:        $IRAN_INPUT_PORT"
+  echo "  Auth/Gecko/SNI:     Same as Kharej server"
+  echo "  Backend Kharej:     $RELAY_KHAREJ_SERVER:$RELAY_KHAREJ_PORT"
+  echo "Saved: $RELAY_DIR/client-link-through-iran.txt"
+  echo "======================================================="
+}
+
+show_kharej_relay_link() {
+  clear
+  echo "======================================================="
+  echo " Kharej Relay Link"
+  echo "======================================================="
+  if [ -f /etc/hysteria2-gecko-main/relay-link.txt ]; then
+    cat /etc/hysteria2-gecko-main/relay-link.txt
+  else
+    echo "Relay link not found. Install Main Gecko Server on Kharej first."
+  fi
+}
+
+show_iran_client_link() {
+  clear
+  echo "======================================================="
+  echo " Client Link Through Iran Relay"
+  echo "======================================================="
+  if [ -f /etc/hysteria2-gecko-udp-relay/client-link-through-iran.txt ]; then
+    cat /etc/hysteria2-gecko-udp-relay/client-link-through-iran.txt
+  else
+    echo "Client link not found. Install Iran UDP Relay first."
+  fi
+}
+
+show_gecko_relay_status() {
+  clear
+  echo "======================================================="
+  echo " Gecko Relay Status"
+  echo "======================================================="
+  echo
+  echo "[Kharej Main Hysteria2 Gecko Server]"
+  systemctl status hysteria2-gecko-main.service --no-pager 2>/dev/null || echo "hysteria2-gecko-main.service not installed."
+  echo
+  echo "[Iran UDP Relay]"
+  systemctl status hysteria2-gecko-udp-relay.service --no-pager 2>/dev/null || echo "hysteria2-gecko-udp-relay.service not installed."
+}
+
+restart_gecko_relay_services() {
+  clear
+  systemctl restart hysteria2-gecko-main.service >/dev/null 2>&1 || true
+  systemctl restart hysteria2-gecko-udp-relay.service >/dev/null 2>&1 || true
+  show_gecko_relay_status
+}
+
+stop_gecko_relay_services() {
+  clear
+  systemctl stop hysteria2-gecko-main.service >/dev/null 2>&1 || true
+  systemctl stop hysteria2-gecko-udp-relay.service >/dev/null 2>&1 || true
+  show_gecko_relay_status
+}
+
+uninstall_gecko_relay_services() {
+  clear
+  echo "======================================================="
+  echo " Uninstall Gecko Relay Services"
+  echo "======================================================="
+  echo "This removes only:"
+  echo "  - hysteria2-gecko-main.service"
+  echo "  - hysteria2-gecko-udp-relay.service"
+  echo "It does NOT remove the old /etc/hysteria2 installation."
+  read -rp "Continue? [y/N]: " CONFIRM
   case "$CONFIRM" in
     y|Y|yes|YES|Yes)
-      systemctl disable --now hysteria2-gecko.service >/dev/null 2>&1 || true
-      rm -f /etc/systemd/system/hysteria2-gecko.service
-      rm -rf /etc/systemd/system/hysteria2-gecko.service.d
-      rm -f /usr/local/bin/hysteria
-      rm -rf /etc/hysteria2
+      systemctl disable --now hysteria2-gecko-main.service >/dev/null 2>&1 || true
+      systemctl disable --now hysteria2-gecko-udp-relay.service >/dev/null 2>&1 || true
+      rm -f /etc/systemd/system/hysteria2-gecko-main.service
+      rm -f /etc/systemd/system/hysteria2-gecko-udp-relay.service
+      rm -rf /etc/hysteria2-gecko-main
+      rm -rf /etc/hysteria2-gecko-udp-relay
       systemctl daemon-reload
-      echo "Hysteria2 Gecko removed."
+      echo "Gecko relay services removed."
       ;;
     *)
       echo "Cancelled."
       ;;
   esac
+}
+
+hysteria2_gecko_relay_menu() {
+  while true; do
+    clear
+    echo "======================================================="
+    echo " Hysteria2 Gecko Two-Server Relay Menu"
+    echo "======================================================="
+    echo "Architecture:"
+    echo "  Client -> Iran UDP Relay -> Kharej Hysteria2 Gecko Server"
+    echo
+    echo " 1) Kharej: Install Main Hysteria2 Gecko Server + Generate Relay Link"
+    echo " 2) Kharej: Show Relay Link"
+    echo " 3) Iran:   Install UDP Relay from Relay Link"
+    echo " 4) Iran:   Show Final Client Link Through Iran"
+    echo " 5) Status"
+    echo " 6) Restart services"
+    echo " 7) Stop services"
+    echo " 8) Uninstall relay services"
+    echo " 0) Back"
+    echo "======================================================="
+    echo "Gecko-only: no normal/no-obfs mode."
+    echo "Iran changes no system route; only one UDP input port is relayed."
+    echo "======================================================="
+    read -rp "Choose: " RELAY_CHOICE
+
+    case "$RELAY_CHOICE" in
+      1) install_kharej_main_hysteria_gecko_with_relay_link; read -rp "Press Enter to return to relay menu..." ;;
+      2) show_kharej_relay_link; read -rp "Press Enter to return to relay menu..." ;;
+      3) install_iran_udp_gecko_relay_from_link; read -rp "Press Enter to return to relay menu..." ;;
+      4) show_iran_client_link; read -rp "Press Enter to return to relay menu..." ;;
+      5) show_gecko_relay_status; read -rp "Press Enter to return to relay menu..." ;;
+      6) restart_gecko_relay_services; read -rp "Press Enter to return to relay menu..." ;;
+      7) stop_gecko_relay_services; read -rp "Press Enter to return to relay menu..." ;;
+      8) uninstall_gecko_relay_services; read -rp "Press Enter to return to relay menu..." ;;
+      0) return ;;
+      *) echo "Invalid choice."; sleep 1 ;;
+    esac
+  done
 }
 
 while true; do
@@ -612,14 +1144,9 @@ while true; do
 
   echo -e "1)  \e[93mTUI Menu\e[0m"
   echo -e "2)  \e[93mLegacy Menu\e[0m"
-  echo -e "3)  \e[96mInstall/Reinstall Hysteria2 v2.9.2 + Gecko + Masquerade\e[0m"
+  echo -e "3)  \e[96mInstall Hysteria2 v2.9.2 + Gecko + Masquerade\e[0m"
   echo -e "4)  \e[92mApply Optimize 10 + 12 (Network + System Limits)\e[0m"
-  echo -e "5)  \e[96mShow Hysteria2 Gecko client link\e[0m"
-  echo -e "6)  \e[96mHysteria2 Gecko service status\e[0m"
-  echo -e "7)  \e[96mRestart Hysteria2 Gecko service\e[0m"
-  echo -e "8)  \e[96mStop Hysteria2 Gecko service\e[0m"
-  echo -e "9)  \e[96mStart Hysteria2 Gecko service\e[0m"
-  echo -e "10) \e[91mUninstall Hysteria2 Gecko\e[0m"
+  echo -e "5)  \e[96mGecko Two-Server Relay Menu (Client -> Iran -> Kharej)\e[0m"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -647,28 +1174,8 @@ while true; do
     read -rp "Press Enter to return to menu..."
     ;;
   5)
-    show_hysteria2_gecko_link
-    read -rp "Press Enter to return to menu..."
-    ;;
-  6)
-    show_hysteria2_gecko_status
-    read -rp "Press Enter to return to menu..."
-    ;;
-  7)
-    restart_hysteria2_gecko
-    read -rp "Press Enter to return to menu..."
-    ;;
-  8)
-    stop_hysteria2_gecko
-    read -rp "Press Enter to return to menu..."
-    ;;
-  9)
-    start_hysteria2_gecko
-    read -rp "Press Enter to return to menu..."
-    ;;
-  10)
-    uninstall_hysteria2_gecko
-    read -rp "Press Enter to return to menu..."
+    clear
+    hysteria2_gecko_relay_menu
     ;;
   0)
     clear
