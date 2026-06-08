@@ -1,71 +1,248 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
-HYSTERIA_VERSION="v2.9.2"
-HYSTERIA_BIN="/usr/local/bin/hysteria"
-HYSTERIA_DIR="/etc/hysteria2"
-HYSTERIA_CONFIG="$HYSTERIA_DIR/server.yaml"
-HYSTERIA_SERVICE="/etc/systemd/system/hysteria2-gecko.service"
+source <(curl -sSL https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box_Config_Installer/Source.sh)
 
-detect_hysteria_arch() {
-  case "$(uname -m)" in
-    x86_64|amd64) echo "amd64" ;;
-    aarch64|arm64) echo "arm64" ;;
-    armv7l|armv7) echo "armv7" ;;
-    armv6l|armv6) echo "armv6" ;;
-    i386|i686) echo "386" ;;
-    *) echo "unsupported" ;;
+root_check
+add_alias
+get_cpu_usage
+get_ram_usage
+get_storage_usage
+check_system_info
+check_system_ip
+
+processes=("SH:Hysteria2:/etc/hysteria2/server.json" "ST:ShadowTLS:/etc/shadowtls/config.json" "WS:WebSocket:/etc/ws/config.json" "RS:Reality:/etc/reality/config.json" "NS:Naive:/etc/naive/config.json" "TS:TUIC:/etc/tuic/server.json" "GS:gRPC:/etc/grpc/config.json")
+
+
+apply_hy2_network_and_limits_optimize() {
+  echo "======================================================="
+  echo " Apply Optimize 10 + 12: Network Settings + System Limits"
+  echo "======================================================="
+
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Please run as root."
+    return 1
+  fi
+
+  BACKUP_DIR="/root/hy2-optimize-backup-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$BACKUP_DIR"
+
+  echo "Creating backups in: $BACKUP_DIR"
+  [ -f /etc/sysctl.conf ] && cp -a /etc/sysctl.conf "$BACKUP_DIR/sysctl.conf.bak"
+  [ -f /etc/security/limits.conf ] && cp -a /etc/security/limits.conf "$BACKUP_DIR/limits.conf.bak"
+  [ -f /etc/profile ] && cp -a /etc/profile "$BACKUP_DIR/profile.bak"
+
+  echo
+  echo "[1/2] Applying Network settings optimization..."
+  cat > /etc/sysctl.d/99-hysteria2-network-optimize.conf <<'EOF_SYSCTL'
+# Hysteria2 / QUIC network optimization
+# Equivalent target: Linux Optimizer menu option 10 - Network settings
+
+fs.file-max = 67108864
+
+net.core.default_qdisc = fq
+net.core.netdev_max_backlog = 32768
+net.core.optmem_max = 262144
+net.core.somaxconn = 65536
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_rmem = 16384 1048576 33554432
+net.ipv4.tcp_wmem = 16384 1048576 33554432
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_fin_timeout = 25
+net.ipv4.tcp_keepalive_time = 1200
+net.ipv4.tcp_keepalive_probes = 7
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_max_orphans = 819200
+net.ipv4.tcp_max_syn_backlog = 20480
+net.ipv4.tcp_max_tw_buckets = 1440000
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_notsent_lowat = 32768
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_adv_win_scale = -2
+net.ipv4.tcp_ecn = 1
+net.ipv4.tcp_ecn_fallback = 1
+net.ipv4.tcp_syncookies = 1
+
+net.unix.max_dgram_qlen = 256
+
+vm.min_free_kbytes = 65536
+vm.swappiness = 10
+vm.vfs_cache_pressure = 250
+vm.dirty_ratio = 20
+
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.neigh.default.gc_thresh1 = 512
+net.ipv4.neigh.default.gc_thresh2 = 2048
+net.ipv4.neigh.default.gc_thresh3 = 16384
+net.ipv4.neigh.default.gc_stale_time = 60
+net.ipv4.conf.default.arp_announce = 2
+net.ipv4.conf.lo.arp_announce = 2
+net.ipv4.conf.all.arp_announce = 2
+kernel.panic = 1
+EOF_SYSCTL
+
+  # udp_mem exists on many kernels, but not all. Apply only when available to avoid noisy failures.
+  if [ -e /proc/sys/net/ipv4/udp_mem ]; then
+    cat >> /etc/sysctl.d/99-hysteria2-network-optimize.conf <<'EOF_UDP'
+net.ipv4.udp_mem = 65536 1048576 33554432
+EOF_UDP
+  fi
+
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+  echo tcp_bbr > /etc/modules-load.d/99-hysteria2-bbr.conf 2>/dev/null || true
+
+  sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-hysteria2-network-optimize.conf || true
+
+  echo
+  echo "[2/2] Applying System Limits optimization..."
+  cat > /etc/security/limits.d/99-hysteria2-limits.conf <<'EOF_LIMITS'
+# Hysteria2 / high connection count limits
+# Equivalent target: Linux Optimizer menu option 12 - System Limits
+
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+
+* soft nproc 1048576
+* hard nproc 1048576
+root soft nproc 1048576
+root hard nproc 1048576
+
+* soft memlock unlimited
+* hard memlock unlimited
+root soft memlock unlimited
+root hard memlock unlimited
+EOF_LIMITS
+
+  mkdir -p /etc/systemd/system.conf.d /etc/systemd/user.conf.d
+  cat > /etc/systemd/system.conf.d/99-hysteria2-limits.conf <<'EOF_SYSTEMD_SYSTEM'
+[Manager]
+DefaultLimitNOFILE=1048576
+DefaultLimitNPROC=1048576
+DefaultLimitMEMLOCK=infinity
+EOF_SYSTEMD_SYSTEM
+
+  cat > /etc/systemd/user.conf.d/99-hysteria2-limits.conf <<'EOF_SYSTEMD_USER'
+[Manager]
+DefaultLimitNOFILE=1048576
+DefaultLimitNPROC=1048576
+DefaultLimitMEMLOCK=infinity
+EOF_SYSTEMD_USER
+
+  # Keep profile ulimit idempotent: remove old block and append a clean one.
+  sed -i '/# BEGIN HYSTERIA2 OPTIMIZE LIMITS/,/# END HYSTERIA2 OPTIMIZE LIMITS/d' /etc/profile 2>/dev/null || true
+  cat >> /etc/profile <<'EOF_PROFILE'
+# BEGIN HYSTERIA2 OPTIMIZE LIMITS
+ulimit -n 1048576 2>/dev/null || true
+ulimit -u 1048576 2>/dev/null || true
+ulimit -l unlimited 2>/dev/null || true
+# END HYSTERIA2 OPTIMIZE LIMITS
+EOF_PROFILE
+
+  systemctl daemon-reexec >/dev/null 2>&1 || systemctl daemon-reload >/dev/null 2>&1 || true
+
+  # Ensure the custom Hysteria service also has explicit runtime limits.
+  if [ -f /etc/systemd/system/hysteria2-gecko.service ]; then
+    mkdir -p /etc/systemd/system/hysteria2-gecko.service.d
+    cat > /etc/systemd/system/hysteria2-gecko.service.d/override.conf <<'EOF_HY2_LIMITS'
+[Service]
+LimitNOFILE=1048576
+LimitNPROC=1048576
+LimitMEMLOCK=infinity
+EOF_HY2_LIMITS
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl restart hysteria2-gecko.service >/dev/null 2>&1 || true
+  fi
+
+  echo
+  echo "======================================================="
+  echo "Optimize 10 + 12 applied successfully."
+  echo "Network sysctl: /etc/sysctl.d/99-hysteria2-network-optimize.conf"
+  echo "Limits file:     /etc/security/limits.d/99-hysteria2-limits.conf"
+  echo "Backups:         $BACKUP_DIR"
+  echo "BBR status:      $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+  echo "Current nofile:  $(ulimit -n 2>/dev/null || echo unknown)"
+  echo "======================================================="
+  echo
+  read -rp "Reboot now to fully apply system/user limits? [y/N]: " REBOOT_NOW
+  case "$REBOOT_NOW" in
+    y|Y|yes|YES|Yes)
+      echo "Rebooting..."
+      reboot
+      ;;
+    *)
+      echo "Reboot skipped. Recommended: reboot once later."
+      ;;
   esac
 }
 
-root_check() {
-  if [ "$(id -u)" -ne 0 ]; then
-    echo "Please run as root."
-    exit 1
-  fi
-}
-
-install_deps() {
-  if command -v apt >/dev/null 2>&1; then
-    apt update -y
-    apt install -y curl openssl python3 ca-certificates
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl openssl python3 ca-certificates
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y curl openssl python3 ca-certificates
-  else
-    echo "Unsupported package manager. Install curl openssl python3 manually."
-    exit 1
-  fi
-}
-
-urlencode() {
-  python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
-}
 
 install_hysteria2_gecko_v292() {
-  echo "======================================================="
-  echo " Hysteria2 ${HYSTERIA_VERSION} + Gecko Obfuscation Installer"
-  echo "======================================================="
+  set -e
+  HYSTERIA_BIN="/usr/local/bin/hysteria"
+  HYSTERIA_DIR="/etc/hysteria2"
+  HYSTERIA_CONFIG="$HYSTERIA_DIR/server.yaml"
+  HYSTERIA_SERVICE="/etc/systemd/system/hysteria2-gecko.service"
+  HYSTERIA_VERSION="v2.9.2"
 
-  root_check
-  install_deps
+  detect_hysteria_arch() {
+    case "$(uname -m)" in
+      x86_64|amd64) echo "amd64" ;;
+      aarch64|arm64) echo "arm64" ;;
+      armv7l|armv7) echo "armv7" ;;
+      armv6l|armv6) echo "armv6" ;;
+      i386|i686) echo "386" ;;
+      *) echo "unsupported" ;;
+    esac
+  }
 
   HY2_ARCH="$(detect_hysteria_arch)"
   if [ "$HY2_ARCH" = "unsupported" ]; then
     echo "Unsupported architecture: $(uname -m)"
-    exit 1
+    return 1
   fi
 
-  HYSTERIA_RELEASE="app%2F${HYSTERIA_VERSION}"
-  HYSTERIA_URL="https://github.com/apernet/hysteria/releases/download/${HYSTERIA_RELEASE}/hysteria-linux-${HY2_ARCH}"
+  HYSTERIA_URL="https://github.com/apernet/hysteria/releases/download/app%2F${HYSTERIA_VERSION}/hysteria-linux-${HY2_ARCH}"
+
+  echo "======================================================="
+  echo " Hysteria2 v2.9.2 + Gecko Obfuscation Installer"
+  echo "======================================================="
+
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Please run as root."
+    return 1
+  fi
+
+  if [ -f "$HYSTERIA_SERVICE" ] || [ -f "$HYSTERIA_CONFIG" ] || [ -x "$HYSTERIA_BIN" ]; then
+    echo "Hysteria2 Gecko already seems installed."
+    read -rp "Reinstall and overwrite current config? [y/N]: " REINSTALL_HY2
+    case "$REINSTALL_HY2" in
+      y|Y|yes|YES|Yes) ;;
+      *) echo "Cancelled."; return 0 ;;
+    esac
+  fi
+
+  command -v curl >/dev/null 2>&1 || { apt update -y && apt install -y curl; }
+  command -v openssl >/dev/null 2>&1 || { apt update -y && apt install -y openssl; }
+  command -v python3 >/dev/null 2>&1 || { apt update -y && apt install -y python3; }
 
   read -rp "Port [2020]: " HY2_PORT
   HY2_PORT="${HY2_PORT:-2020}"
-
   if ! [[ "$HY2_PORT" =~ ^[0-9]+$ ]] || [ "$HY2_PORT" -lt 1 ] || [ "$HY2_PORT" -gt 65535 ]; then
     echo "Invalid port."
-    exit 1
+    return 1
   fi
 
   DEFAULT_AUTH="$(openssl rand -hex 16)"
@@ -79,101 +256,156 @@ install_hysteria2_gecko_v292() {
   read -rp "SNI / certificate CN [www.google.com]: " HY2_SNI
   HY2_SNI="${HY2_SNI:-www.google.com}"
 
+  # Gecko packet sizes are intentionally not asked from the user.
+  # Hysteria defaults are used: minPacketSize=512, maxPacketSize=1200.
+  # The official share URI only carries obfs type + password, not packet sizes.
+  GECKO_MIN=512
+  GECKO_MAX=1200
+
   read -rp "Remark [HY2-GECKO]: " HY2_REMARK
   HY2_REMARK="${HY2_REMARK:-HY2-GECKO}"
 
   echo
   echo "Masquerade mode:"
-  echo " 1) Disable / default 404"
-  echo " 2) Static file website"
-  echo " 3) Reverse proxy to a website"
-  echo " 4) Simple string response"
+  echo "  1) Disable / default 404"
+  echo "  2) Static file website"
+  echo "  3) Reverse proxy to a website"
+  echo "  4) Simple string response"
   read -rp "Choose masquerade mode [3]: " MASQ_MODE
   MASQ_MODE="${MASQ_MODE:-3}"
 
   MASQ_CONFIG=""
-
   case "$MASQ_MODE" in
     1)
-      MASQ_CONFIG=""
+      echo "Masquerade disabled. Hysteria will use the default 404 behavior for normal HTTP/3 requests."
       ;;
     2)
       read -rp "Static website directory [/var/www/hysteria2-masq]: " MASQ_DIR
       MASQ_DIR="${MASQ_DIR:-/var/www/hysteria2-masq}"
       mkdir -p "$MASQ_DIR"
-      [ -f "$MASQ_DIR/index.html" ] || echo "Welcome" > "$MASQ_DIR/index.html"
-      MASQ_CONFIG=$(cat <<EOF
+      if [ ! -f "$MASQ_DIR/index.html" ]; then
+        cat > "$MASQ_DIR/index.html" <<'EOF_STATIC_INDEX'
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Welcome</title></head>
+<body><h1>Welcome</h1></body>
+</html>
+EOF_STATIC_INDEX
+      fi
+      MASQ_DIR_YAML="$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$MASQ_DIR")"
+      MASQ_CONFIG=$(cat <<EOF_MASQ
+
 masquerade:
   type: file
   file:
-    dir: "$MASQ_DIR"
-EOF
+    dir: $MASQ_DIR_YAML
+EOF_MASQ
 )
       ;;
     3)
-      read -rp "Proxy target [https://www.bing.com]: " MASQ_PROXY
-      MASQ_PROXY="${MASQ_PROXY:-https://www.bing.com}"
-      MASQ_CONFIG=$(cat <<EOF
+      read -rp "Proxy target URL [https://www.google.com/]: " MASQ_URL
+      MASQ_URL="${MASQ_URL:-https://www.google.com/}"
+      read -rp "Rewrite Host header? [Y/n]: " MASQ_REWRITE
+      MASQ_REWRITE="${MASQ_REWRITE:-Y}"
+      case "$MASQ_REWRITE" in
+        n|N|no|NO|No) MASQ_REWRITE_BOOL="false" ;;
+        *) MASQ_REWRITE_BOOL="true" ;;
+      esac
+      read -rp "Allow insecure upstream TLS? [y/N]: " MASQ_INSECURE
+      MASQ_INSECURE="${MASQ_INSECURE:-N}"
+      case "$MASQ_INSECURE" in
+        y|Y|yes|YES|Yes) MASQ_INSECURE_BOOL="true" ;;
+        *) MASQ_INSECURE_BOOL="false" ;;
+      esac
+      MASQ_URL_YAML="$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$MASQ_URL")"
+      MASQ_CONFIG=$(cat <<EOF_MASQ
+
 masquerade:
   type: proxy
   proxy:
-    url: "$MASQ_PROXY"
-    rewriteHost: true
-EOF
+    url: $MASQ_URL_YAML
+    rewriteHost: $MASQ_REWRITE_BOOL
+    insecure: $MASQ_INSECURE_BOOL
+EOF_MASQ
 )
       ;;
     4)
-      read -rp "Response string [Hello]: " MASQ_STRING
-      MASQ_STRING="${MASQ_STRING:-Hello}"
-      MASQ_CONFIG=$(cat <<EOF
+      read -rp "Response text [hello]: " MASQ_TEXT
+      MASQ_TEXT="${MASQ_TEXT:-hello}"
+      read -rp "HTTP status code [200]: " MASQ_STATUS
+      MASQ_STATUS="${MASQ_STATUS:-200}"
+      if ! [[ "$MASQ_STATUS" =~ ^[0-9]+$ ]] || [ "$MASQ_STATUS" -lt 100 ] || [ "$MASQ_STATUS" -gt 599 ]; then
+        echo "Invalid status code. Using 200."
+        MASQ_STATUS=200
+      fi
+      read -rp "Content-Type [text/plain]: " MASQ_CONTENT_TYPE
+      MASQ_CONTENT_TYPE="${MASQ_CONTENT_TYPE:-text/plain}"
+      MASQ_TEXT_YAML="$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$MASQ_TEXT")"
+      MASQ_CT_YAML="$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$MASQ_CONTENT_TYPE")"
+      MASQ_CONFIG=$(cat <<EOF_MASQ
+
 masquerade:
   type: string
   string:
-    content: "$MASQ_STRING"
+    content: $MASQ_TEXT_YAML
+    statusCode: $MASQ_STATUS
     headers:
-      content-type: text/plain
-    statusCode: 200
-EOF
+      content-type: $MASQ_CT_YAML
+EOF_MASQ
 )
       ;;
     *)
-      echo "Invalid masquerade mode."
-      exit 1
+      echo "Invalid masquerade mode. Using reverse proxy default."
+      MASQ_URL="https://www.google.com/"
+      MASQ_URL_YAML="$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$MASQ_URL")"
+      MASQ_CONFIG=$(cat <<EOF_MASQ
+
+masquerade:
+  type: proxy
+  proxy:
+    url: $MASQ_URL_YAML
+    rewriteHost: true
+    insecure: false
+EOF_MASQ
+)
       ;;
   esac
 
+  AUTH_YAML="$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$HY2_AUTH")"
+  OBFS_YAML="$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$HY2_OBFS")"
+
+  echo "Preparing Hysteria binary install..."
   systemctl stop hysteria2-gecko.service >/dev/null 2>&1 || true
   systemctl stop hysteria-server.service >/dev/null 2>&1 || true
   systemctl stop hysteria.service >/dev/null 2>&1 || true
 
+  # If an old Hysteria process is still running from another service/manual start, stop it.
   if command -v pgrep >/dev/null 2>&1 && pgrep -x hysteria >/dev/null 2>&1; then
     pkill -x hysteria >/dev/null 2>&1 || true
     sleep 1
   fi
 
-  echo "Downloading Hysteria ${HYSTERIA_VERSION} linux-${HY2_ARCH}..."
+  echo "Downloading Hysteria v2.9.2 linux-${HY2_ARCH}..."
   TMP_BIN="$(mktemp /tmp/hysteria-v292.XXXXXX)"
-
   if ! curl -fL --retry 3 --retry-delay 2 -o "$TMP_BIN" "$HYSTERIA_URL"; then
     rm -f "$TMP_BIN"
-    echo "Download failed: $HYSTERIA_URL"
-    exit 1
+    echo "Download failed."
+    return 1
   fi
-
   chmod +x "$TMP_BIN"
+
+  # Atomic replacement prevents 'Text file busy' when the old binary was recently running.
   install -m 0755 "$TMP_BIN" "$HYSTERIA_BIN.new"
   mv -f "$HYSTERIA_BIN.new" "$HYSTERIA_BIN"
   rm -f "$TMP_BIN"
 
   mkdir -p "$HYSTERIA_DIR"
-
   echo "Generating self-signed certificate..."
   openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
     -keyout "$HYSTERIA_DIR/server.key" \
     -out "$HYSTERIA_DIR/server.crt" \
     -subj "/CN=$HY2_SNI" \
     -days 3650 >/dev/null 2>&1
-
   chmod 600 "$HYSTERIA_DIR/server.key"
 
   cat > "$HYSTERIA_CONFIG" <<EOF
@@ -182,15 +414,18 @@ listen: :$HY2_PORT
 tls:
   cert: $HYSTERIA_DIR/server.crt
   key: $HYSTERIA_DIR/server.key
+  sniGuard: disable
 
 auth:
   type: password
-  password: "$HY2_AUTH"
+  password: $AUTH_YAML
 
 obfs:
   type: gecko
   gecko:
-    password: "$HY2_OBFS"
+    password: $OBFS_YAML
+    minPacketSize: $GECKO_MIN
+    maxPacketSize: $GECKO_MAX${MASQ_CONFIG}
 
 quic:
   initStreamReceiveWindow: 8388608
@@ -200,21 +435,11 @@ quic:
   maxIdleTimeout: 30s
   maxIncomingStreams: 1024
   disablePathMTUDiscovery: false
-
-bandwidth:
-  up: 1 gbps
-  down: 1 gbps
-
-ignoreClientBandwidth: false
-
-disableUDP: false
-
-$MASQ_CONFIG
 EOF
 
   cat > "$HYSTERIA_SERVICE" <<EOF
 [Unit]
-Description=Hysteria2 Gecko Server
+Description=Hysteria2 Gecko v2.9.2 Server
 After=network-online.target
 Wants=network-online.target
 
@@ -222,10 +447,8 @@ Wants=network-online.target
 Type=simple
 ExecStart=$HYSTERIA_BIN server -c $HYSTERIA_CONFIG
 Restart=always
-RestartSec=3
+RestartSec=5
 LimitNOFILE=1048576
-LimitNPROC=1048576
-LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -233,19 +456,24 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now hysteria2-gecko.service
+  systemctl restart hysteria2-gecko.service
 
   if command -v ufw >/dev/null 2>&1; then
     ufw allow "$HY2_PORT/udp" >/dev/null 2>&1 || true
   fi
+  if command -v csf >/dev/null 2>&1; then
+    if ! grep -q "^UDP_IN.*$HY2_PORT" /etc/csf/csf.conf 2>/dev/null; then
+      sed -i "s/^UDP_IN = \"\(.*\)\"/UDP_IN = \"\1,$HY2_PORT\"/" /etc/csf/csf.conf || true
+      csf -r >/dev/null 2>&1 || true
+    fi
+  fi
 
   SERVER_IP="$(curl -4fsSL --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
-
-  EN_AUTH="$(urlencode "$HY2_AUTH")"
-  EN_OBFS="$(urlencode "$HY2_OBFS")"
-  EN_SNI="$(urlencode "$HY2_SNI")"
-  EN_REMARK="$(urlencode "$HY2_REMARK")"
-
-  HY2_LINK="hy2://$EN_AUTH@$SERVER_IP:$HY2_PORT?sni=$EN_SNI&insecure=1&obfs=gecko&obfs-password=$EN_OBFS#$EN_REMARK"
+  EN_AUTH="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_AUTH")"
+  EN_OBFS="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_OBFS")"
+  EN_SNI="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_SNI")"
+  EN_REMARK="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_REMARK")"
+  HY2_LINK="hy2://$EN_AUTH@$SERVER_IP:$HY2_PORT?sni=$EN_SNI&insecure=1&Insecure=1&obfs=gecko&obfs-password=$EN_OBFS#$EN_REMARK"
 
   cat > "$HYSTERIA_DIR/client-link.txt" <<EOF
 $HY2_LINK
@@ -253,13 +481,202 @@ EOF
 
   echo
   echo "======================================================="
-  echo " Installed successfully."
-  echo " Architecture: linux-${HY2_ARCH}"
-  echo " Config: $HYSTERIA_CONFIG"
-  echo " Service: hysteria2-gecko.service"
-  echo " Client link:"
+  echo "Hysteria2 Gecko installed."
+  echo "Service: hysteria2-gecko.service"
+  echo "Config: $HYSTERIA_CONFIG"
+  echo "Link saved: $HYSTERIA_DIR/client-link.txt"
+  echo "Note: Gecko packet sizes are server/config defaults and are NOT included in the client URI."
+  echo "-------------------------------------------------------"
   echo "$HY2_LINK"
+  echo "======================================================="
+  echo
+  echo "Useful commands:"
+  echo "  systemctl status hysteria2-gecko --no-pager"
+  echo "  journalctl -u hysteria2-gecko -f"
+}
+
+
+show_hysteria2_gecko_link() {
+  clear
+  echo "======================================================="
+  echo " Hysteria2 Gecko Client Link"
+  echo "======================================================="
+  if [ -f /etc/hysteria2/client-link.txt ]; then
+    cat /etc/hysteria2/client-link.txt
+  else
+    echo "Client link not found: /etc/hysteria2/client-link.txt"
+  fi
   echo "======================================================="
 }
 
-install_hysteria2_gecko_v292
+show_hysteria2_gecko_status() {
+  clear
+  echo "======================================================="
+  echo " Hysteria2 Gecko Status"
+  echo "======================================================="
+  if systemctl list-unit-files | grep -q '^hysteria2-gecko.service'; then
+    systemctl status hysteria2-gecko.service --no-pager || true
+  else
+    echo "hysteria2-gecko.service is not installed."
+  fi
+}
+
+restart_hysteria2_gecko() {
+  clear
+  echo "Restarting hysteria2-gecko.service..."
+  systemctl restart hysteria2-gecko.service
+  systemctl status hysteria2-gecko.service --no-pager || true
+}
+
+stop_hysteria2_gecko() {
+  clear
+  echo "Stopping hysteria2-gecko.service..."
+  systemctl stop hysteria2-gecko.service || true
+  systemctl status hysteria2-gecko.service --no-pager || true
+}
+
+start_hysteria2_gecko() {
+  clear
+  echo "Starting hysteria2-gecko.service..."
+  systemctl start hysteria2-gecko.service
+  systemctl status hysteria2-gecko.service --no-pager || true
+}
+
+uninstall_hysteria2_gecko() {
+  clear
+  echo "======================================================="
+  echo " Uninstall Hysteria2 Gecko"
+  echo "======================================================="
+  read -rp "Remove hysteria2-gecko service, binary and /etc/hysteria2? [y/N]: " CONFIRM
+  case "$CONFIRM" in
+    y|Y|yes|YES|Yes)
+      systemctl disable --now hysteria2-gecko.service >/dev/null 2>&1 || true
+      rm -f /etc/systemd/system/hysteria2-gecko.service
+      rm -rf /etc/systemd/system/hysteria2-gecko.service.d
+      rm -f /usr/local/bin/hysteria
+      rm -rf /etc/hysteria2
+      systemctl daemon-reload
+      echo "Hysteria2 Gecko removed."
+      ;;
+    *)
+      echo "Cancelled."
+      ;;
+  esac
+}
+
+while true; do
+  echo "
+╭━━━╮╱╱╱╱╱╱╱╱╱╭━━╮╱╱╱╱╱╱╱╭━━━╮╱╱╱╱╱╭━╮╱╱╱╱╭━━╮╱╱╱╱╱╭╮╱╱╱╭╮╭╮
+┃╭━╮┃╱╱╱╱╱╱╱╱╱┃╭╮┃╱╱╱╱╱╱╱┃╭━╮┃╱╱╱╱╱┃╭╯╱╱╱╱╰┫┣╯╱╱╱╱╭╯╰╮╱╱┃┃┃┃
+┃╰━━┳┳━╮╭━━╮╱╱┃╰╯╰┳━━┳╮╭╮┃┃╱╰╋━━┳━┳╯╰┳┳━━╮╱┃┃╭━╮╭━┻╮╭╋━━┫┃┃┃╭━━┳━╮
+╰━━╮┣┫╭╮┫╭╮┣━━┫╭━╮┃╭╮┣╋╋╯┃┃╱╭┫╭╮┃╭╋╮╭╋┫╭╮┃╱┃┃┃╭╮┫━━┫┃┃╭╮┃┃┃┃┃┃━┫╭╯
+┃╰━╯┃┃┃┃┃╰╯┣━━┫╰━╯┃╰╯┣╋╋╮┃╰━╯┃╰╯┃┃┃┃┃┃┃╰╯┃╭┫┣┫┃┃┣━━┃╰┫╭╮┃╰┫╰┫┃━┫┃
+╰━━━┻┻╯╰┻━╮┃╱╱╰━━━┻━━┻╯╰╯╰━━━┻━━┻╯╰┻╯╰┻━╮┃╰━━┻╯╰┻━━┻━┻╯╰┻━┻━┻━━┻╯
+╱╱╱╱╱╱╱╱╭━╯┃╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╭━╯┃
+╱╱╱╱╱╱╱╱╰━━╯╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╰━━╯V6.1.0"
+
+  echo "By theTCS"
+
+  echo
+
+  echo "#######################################################"
+  echo "Operating System: $SYS"
+  echo "Kernel: $KERNEL"
+  echo "Architecture: $ARCHITECTURE"
+  echo "Virtualization: $VIRT"
+  echo "======================================================="
+  echo "CPU Usage: $cpu_usage%"
+  echo "Memory Usage: $memory_usage%"
+  echo "Storage Usage: $storage_usage%"
+  echo "======================================================="
+  echo "IPv4: $WAN4"
+  echo "IPv6: $WAN6"
+  echo "Country/ISP: $COUNTRY $ISP"
+  echo "======================================================="
+  for process_info in "${processes[@]}"; do
+    IFS=":" read -r process_name custom_name json_file <<<"$process_info"
+    check_and_display_process_status "$process_name" "$custom_name" "$json_file"
+  done
+  echo "#######################################################"
+
+  echo
+
+  echo "
+▒█▀▀▀█ █▀▀ █░░ █▀▀ █▀▀ ▀▀█▀▀ 　 █▀▄▀█ █▀▀ █▀▀▄ █░░█ 　 ▄ 
+░▀▀▀▄▄ █▀▀ █░░ █▀▀ █░░ ░░█░░ 　 █░▀░█ █▀▀ █░░█ █░░█ 　 ░ 
+▒█▄▄▄█ ▀▀▀ ▀▀▀ ▀▀▀ ▀▀▀ ░░▀░░ 　 ▀░░░▀ ▀▀▀ ▀░░▀ ░▀▀▀ 　 ▀"
+
+  echo
+
+  echo
+
+  echo -e "1)  \e[93mTUI Menu\e[0m"
+  echo -e "2)  \e[93mLegacy Menu\e[0m"
+  echo -e "3)  \e[96mInstall/Reinstall Hysteria2 v2.9.2 + Gecko + Masquerade\e[0m"
+  echo -e "4)  \e[92mApply Optimize 10 + 12 (Network + System Limits)\e[0m"
+  echo -e "5)  \e[96mShow Hysteria2 Gecko client link\e[0m"
+  echo -e "6)  \e[96mHysteria2 Gecko service status\e[0m"
+  echo -e "7)  \e[96mRestart Hysteria2 Gecko service\e[0m"
+  echo -e "8)  \e[96mStop Hysteria2 Gecko service\e[0m"
+  echo -e "9)  \e[96mStart Hysteria2 Gecko service\e[0m"
+  echo -e "10) \e[91mUninstall Hysteria2 Gecko\e[0m"
+  echo -e "0)  \e[95mExit\e[0m"
+
+  read -p "Enter your choice: " user_choice
+
+  case $user_choice in
+
+  1)
+    check_dep
+    clear    
+    tui
+    ;;
+  2)
+    check_dep
+    clear
+    legacy
+    ;;
+  3)
+    clear
+    install_hysteria2_gecko_v292
+    read -rp "Press Enter to return to menu..."
+    ;;
+  4)
+    clear
+    apply_hy2_network_and_limits_optimize
+    read -rp "Press Enter to return to menu..."
+    ;;
+  5)
+    show_hysteria2_gecko_link
+    read -rp "Press Enter to return to menu..."
+    ;;
+  6)
+    show_hysteria2_gecko_status
+    read -rp "Press Enter to return to menu..."
+    ;;
+  7)
+    restart_hysteria2_gecko
+    read -rp "Press Enter to return to menu..."
+    ;;
+  8)
+    stop_hysteria2_gecko
+    read -rp "Press Enter to return to menu..."
+    ;;
+  9)
+    start_hysteria2_gecko
+    read -rp "Press Enter to return to menu..."
+    ;;
+  10)
+    uninstall_hysteria2_gecko
+    read -rp "Press Enter to return to menu..."
+    ;;
+  0)
+    clear
+    echo "Exiting."
+    exit 0
+    ;;
+  *)
+    echo "Invalid choice. Please select a valid option."
+    ;;
+  esac
+done
