@@ -907,6 +907,16 @@ install_iran_udp_gecko_relay_from_link() {
   fi
 
   systemctl stop hysteria2-gecko-udp-relay.service >/dev/null 2>&1 || true
+
+  if command -v ss >/dev/null 2>&1; then
+    if ss -lunp 2>/dev/null | grep -q ":$IRAN_INPUT_PORT "; then
+      echo "UDP port $IRAN_INPUT_PORT seems already in use."
+      echo "Choose another Iran input port or stop the service using this port."
+      ss -lunp | grep ":$IRAN_INPUT_PORT " || true
+      return 1
+    fi
+  fi
+
   mkdir -p "$RELAY_DIR"
 
   cat > "$RELAY_SERVICE" <<EOF
@@ -917,7 +927,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/socat -T 600 UDP-LISTEN:$IRAN_INPUT_PORT,fork,reuseaddr UDP:$RELAY_KHAREJ_SERVER:$RELAY_KHAREJ_PORT
+ExecStart=/usr/bin/socat -d -d -T 600 UDP4-RECVFROM:$IRAN_INPUT_PORT,fork,reuseaddr UDP4-SENDTO:$RELAY_KHAREJ_SERVER:$RELAY_KHAREJ_PORT
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -1010,10 +1020,18 @@ show_gecko_relay_status() {
   echo "======================================================="
   echo
   echo "[Kharej Main Hysteria2 Gecko Server]"
-  systemctl status hysteria2-gecko-main.service --no-pager 2>/dev/null || echo "hysteria2-gecko-main.service not installed."
+  if systemctl list-unit-files | grep -q '^hysteria2-gecko-main.service'; then
+    systemctl status hysteria2-gecko-main.service --no-pager || true
+  else
+    echo "hysteria2-gecko-main.service not installed on this server."
+  fi
   echo
   echo "[Iran UDP Relay]"
-  systemctl status hysteria2-gecko-udp-relay.service --no-pager 2>/dev/null || echo "hysteria2-gecko-udp-relay.service not installed."
+  if systemctl list-unit-files | grep -q '^hysteria2-gecko-udp-relay.service'; then
+    systemctl status hysteria2-gecko-udp-relay.service --no-pager || true
+  else
+    echo "hysteria2-gecko-udp-relay.service not installed on this server."
+  fi
 }
 
 restart_gecko_relay_services() {
