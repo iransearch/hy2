@@ -862,12 +862,11 @@ EOF
 install_iran_udp_gecko_relay_from_link() {
   clear
   echo "======================================================="
-  echo " Install Iran UDP Relay for Hysteria2 Gecko"
+  echo " Install Iran NFTables UDP Relay for Hysteria2 Gecko"
   echo "======================================================="
+  echo "Ubuntu optimized mode: nftables DNAT + masquerade + conntrack tuning"
   echo "Iran server does NOT terminate Hysteria."
-  echo "It only forwards UDP packets to Kharej."
-  echo "Client -> Iran is Gecko. Iran -> Kharej is the same Gecko traffic."
-  echo "No full-system tunnel, no TUN, no default route change."
+  echo "Only one UDP input port is forwarded. No TUN, no full-system tunnel."
   echo "======================================================="
 
   if [ "$(id -u)" -ne 0 ]; then
@@ -877,17 +876,31 @@ install_iran_udp_gecko_relay_from_link() {
 
   RELAY_DIR="/etc/hysteria2-gecko-udp-relay"
   RELAY_SERVICE="/etc/systemd/system/hysteria2-gecko-udp-relay.service"
+  RELAY_ENV="$RELAY_DIR/relay.env"
+  NFT_CONF="/etc/nftables.d/hy2-gecko-relay.nft"
+  RELAY_APPLY="/usr/local/sbin/hy2-gecko-relay-apply.sh"
+  RELAY_REMOVE="/usr/local/sbin/hy2-gecko-relay-remove.sh"
+  SYSCTL_CONF="/etc/sysctl.d/99-hy2-gecko-relay-optimize.conf"
 
   if [ -f "$RELAY_SERVICE" ] || [ -d "$RELAY_DIR" ]; then
     echo "Iran UDP relay already seems installed."
     read -rp "Reinstall and overwrite relay config? [y/N]: " REINSTALL_IRAN_RELAY
     case "$REINSTALL_IRAN_RELAY" in
-      y|Y|yes|YES|Yes) ;;
+      y|Y|yes|YES|Yes)
+        systemctl disable --now hysteria2-gecko-udp-relay.service >/dev/null 2>&1 || true
+        [ -x "$RELAY_REMOVE" ] && "$RELAY_REMOVE" >/dev/null 2>&1 || true
+        ;;
       *) echo "Cancelled."; return 0 ;;
     esac
   fi
 
-  install_socat_dep_global
+  if command -v apt >/dev/null 2>&1; then
+    apt update -y
+    apt install -y nftables curl python3 ca-certificates conntrack iproute2
+  else
+    echo "This optimized relay mode is prepared for Ubuntu/Debian apt systems."
+    return 1
+  fi
 
   read -rp "Paste hy2relay:// link from Kharej: " RELAY_LINK_INPUT
   parse_hy2_relay_link_to_env_global "$RELAY_LINK_INPUT" || return 1
@@ -906,31 +919,118 @@ install_iran_udp_gecko_relay_from_link() {
     return 1
   fi
 
-  systemctl stop hysteria2-gecko-udp-relay.service >/dev/null 2>&1 || true
+  DEFAULT_IFACE="$(ip route get "$RELAY_KHAREJ_SERVER" 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')"
+  DEFAULT_IFACE="${DEFAULT_IFACE:-$(ip route | awk '/default/ {print $5; exit}')}"
+  read -rp "Iran outgoing interface [$DEFAULT_IFACE]: " RELAY_IFACE
+  RELAY_IFACE="${RELAY_IFACE:-$DEFAULT_IFACE}"
 
-  if command -v ss >/dev/null 2>&1; then
-    if ss -lunp 2>/dev/null | grep -q ":$IRAN_INPUT_PORT "; then
-      echo "UDP port $IRAN_INPUT_PORT seems already in use."
-      echo "Choose another Iran input port or stop the service using this port."
-      ss -lunp | grep ":$IRAN_INPUT_PORT " || true
-      return 1
-    fi
+  if [ -z "$RELAY_IFACE" ]; then
+    echo "Could not detect outgoing interface."
+    return 1
   fi
 
-  mkdir -p "$RELAY_DIR"
+  read -rp "Apply UDP/conntrack performance tuning? [Y/n]: " APPLY_TUNE
+  APPLY_TUNE="${APPLY_TUNE:-Y}"
+
+  mkdir -p "$RELAY_DIR" /etc/nftables.d
+
+  cat > "$RELAY_ENV" <<EOF
+IRAN_INPUT_PORT="$IRAN_INPUT_PORT"
+KHAREJ_IP="$RELAY_KHAREJ_SERVER"
+KHAREJ_PORT="$RELAY_KHAREJ_PORT"
+RELAY_IFACE="$RELAY_IFACE"
+NFT_CONF="$NFT_CONF"
+EOF
+
+  cat > "$NFT_CONF" <<EOF
+table inet hy2_gecko_relay {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    iifname "$RELAY_IFACE" udp dport $IRAN_INPUT_PORT dnat ip to $RELAY_KHAREJ_SERVER:$RELAY_KHAREJ_PORT
+  }
+
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "$RELAY_IFACE" ip daddr $RELAY_KHAREJ_SERVER udp dport $RELAY_KHAREJ_PORT masquerade
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    ip daddr $RELAY_KHAREJ_SERVER udp dport $RELAY_KHAREJ_PORT accept
+    ip saddr $RELAY_KHAREJ_SERVER udp sport $RELAY_KHAREJ_PORT accept
+  }
+}
+EOF
+
+  cat > "$RELAY_APPLY" <<'EOF'
+#!/usr/bin/env bash
+set -e
+. /etc/hysteria2-gecko-udp-relay/relay.env
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+nft delete table inet hy2_gecko_relay >/dev/null 2>&1 || true
+nft -f "$NFT_CONF"
+EOF
+  chmod +x "$RELAY_APPLY"
+
+  cat > "$RELAY_REMOVE" <<'EOF'
+#!/usr/bin/env bash
+set +e
+nft delete table inet hy2_gecko_relay >/dev/null 2>&1 || true
+EOF
+  chmod +x "$RELAY_REMOVE"
+
+  if [[ "$APPLY_TUNE" =~ ^[Yy] ]]; then
+    cat > "$SYSCTL_CONF" <<'EOF_SYSCTL'
+# Hysteria2 Gecko UDP relay tuning
+net.ipv4.ip_forward = 1
+
+# UDP/QUIC buffers
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.rmem_default = 8388608
+net.core.wmem_default = 8388608
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+
+# Queue/backlog
+net.core.netdev_max_backlog = 65536
+net.core.somaxconn = 65535
+
+# Conntrack for UDP relay
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_udp_timeout = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 180
+
+# Avoid strict reverse-path filtering breaking NAT/relay on some VPS networks
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+
+# General
+net.ipv4.ip_local_port_range = 1024 65535
+EOF_SYSCTL
+
+    modprobe nf_conntrack >/dev/null 2>&1 || true
+    sysctl --system >/dev/null 2>&1 || true
+  else
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  fi
+
+  systemctl enable --now nftables >/dev/null 2>&1 || true
 
   cat > "$RELAY_SERVICE" <<EOF
 [Unit]
-Description=Iran UDP Relay to Kharej Hysteria2 Gecko Server
-After=network-online.target
-Wants=network-online.target
+Description=Iran NFTables UDP Relay to Kharej Hysteria2 Gecko Server
+After=network-online.target nftables.service
+Wants=network-online.target nftables.service
 
 [Service]
-Type=simple
-ExecStart=/usr/bin/socat -d -d -T 600 UDP4-RECVFROM:$IRAN_INPUT_PORT,fork,reuseaddr UDP4-SENDTO:$RELAY_KHAREJ_SERVER:$RELAY_KHAREJ_PORT
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=$RELAY_ENV
+ExecStart=$RELAY_APPLY
+ExecStop=$RELAY_REMOVE
 
 [Install]
 WantedBy=multi-user.target
@@ -938,16 +1038,16 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now hysteria2-gecko-udp-relay.service
-  systemctl restart hysteria2-gecko-udp-relay.service
+
+  # Persist custom nft include if not already referenced
+  if [ -f /etc/nftables.conf ] && ! grep -q 'include "/etc/nftables.d/\*.nft"' /etc/nftables.conf; then
+    cp -a /etc/nftables.conf "/etc/nftables.conf.bak.$(date +%Y%m%d-%H%M%S)" || true
+    printf '\ninclude "/etc/nftables.d/*.nft"\n' >> /etc/nftables.conf
+  fi
 
   if command -v ufw >/dev/null 2>&1; then
     ufw allow "$IRAN_INPUT_PORT/udp" >/dev/null 2>&1 || true
-  fi
-  if command -v csf >/dev/null 2>&1; then
-    if ! grep -q "^UDP_IN.*$IRAN_INPUT_PORT" /etc/csf/csf.conf 2>/dev/null; then
-      sed -i "s/^UDP_IN = \"\(.*\)\"/UDP_IN = \"\1,$IRAN_INPUT_PORT\"/" /etc/csf/csf.conf || true
-      csf -r >/dev/null 2>&1 || true
-    fi
+    ufw route allow proto udp to "$RELAY_KHAREJ_SERVER" port "$RELAY_KHAREJ_PORT" >/dev/null 2>&1 || true
   fi
 
   IRAN_IP="$(curl -4fsSL --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
@@ -955,12 +1055,16 @@ EOF
   FINAL_CLIENT_LINK="$(make_hy2_client_link_global "$IRAN_IP" "$IRAN_INPUT_PORT" "$RELAY_AUTH" "$RELAY_OBFS_PASSWORD" "$RELAY_SNI" "$FINAL_REMARK")"
 
   cat > "$RELAY_DIR/relay-info.txt" <<EOF
+Relay Type: nftables DNAT UDP optimized
 Kharej Hysteria Gecko Server: $RELAY_KHAREJ_SERVER:$RELAY_KHAREJ_PORT
 Iran UDP Listen Port: $IRAN_INPUT_PORT
+Iran Interface: $RELAY_IFACE
 Auth Password: $RELAY_AUTH
 Gecko Obfs Password: $RELAY_OBFS_PASSWORD
 SNI: $RELAY_SNI
 Remark: $FINAL_REMARK
+NFT Config: $NFT_CONF
+Sysctl Config: $SYSCTL_CONF
 
 Client link through Iran:
 $FINAL_CLIENT_LINK
@@ -975,17 +1079,19 @@ EOF
 
   echo
   echo "======================================================="
-  echo "Iran UDP Gecko relay installed."
+  echo "Iran NFTables UDP Gecko relay installed."
   echo "Users should connect to IRAN, not Kharej:"
   echo "-------------------------------------------------------"
   echo "$FINAL_CLIENT_LINK"
   echo "-------------------------------------------------------"
   echo "Meaning:"
   echo "  Client Address:     $IRAN_IP"
-  echo "  Client Port:        $IRAN_INPUT_PORT"
-  echo "  Auth/Gecko/SNI:     Same as Kharej server"
+  echo "  Client UDP Port:    $IRAN_INPUT_PORT"
   echo "  Backend Kharej:     $RELAY_KHAREJ_SERVER:$RELAY_KHAREJ_PORT"
-  echo "Saved: $RELAY_DIR/client-link-through-iran.txt"
+  echo "  Relay Interface:    $RELAY_IFACE"
+  echo "  Relay Type:         nftables DNAT + masquerade"
+  echo "======================================================="
+  echo "Recommended next step on Kharej: run Optimize menu option 4 once."
   echo "======================================================="
 }
 
@@ -1020,18 +1126,10 @@ show_gecko_relay_status() {
   echo "======================================================="
   echo
   echo "[Kharej Main Hysteria2 Gecko Server]"
-  if systemctl list-unit-files | grep -q '^hysteria2-gecko-main.service'; then
-    systemctl status hysteria2-gecko-main.service --no-pager || true
-  else
-    echo "hysteria2-gecko-main.service not installed on this server."
-  fi
+  systemctl status hysteria2-gecko-main.service --no-pager 2>/dev/null || echo "hysteria2-gecko-main.service not installed."
   echo
   echo "[Iran UDP Relay]"
-  if systemctl list-unit-files | grep -q '^hysteria2-gecko-udp-relay.service'; then
-    systemctl status hysteria2-gecko-udp-relay.service --no-pager || true
-  else
-    echo "hysteria2-gecko-udp-relay.service not installed on this server."
-  fi
+  systemctl status hysteria2-gecko-udp-relay.service --no-pager 2>/dev/null || echo "hysteria2-gecko-udp-relay.service not installed."
 }
 
 restart_gecko_relay_services() {
@@ -1062,6 +1160,9 @@ uninstall_gecko_relay_services() {
     y|Y|yes|YES|Yes)
       systemctl disable --now hysteria2-gecko-main.service >/dev/null 2>&1 || true
       systemctl disable --now hysteria2-gecko-udp-relay.service >/dev/null 2>&1 || true
+      [ -x /usr/local/sbin/hy2-gecko-relay-remove.sh ] && /usr/local/sbin/hy2-gecko-relay-remove.sh >/dev/null 2>&1 || true
+      rm -f /usr/local/sbin/hy2-gecko-relay-apply.sh /usr/local/sbin/hy2-gecko-relay-remove.sh
+      rm -f /etc/nftables.d/hy2-gecko-relay.nft /etc/sysctl.d/99-hy2-gecko-relay-optimize.conf
       rm -f /etc/systemd/system/hysteria2-gecko-main.service
       rm -f /etc/systemd/system/hysteria2-gecko-udp-relay.service
       rm -rf /etc/hysteria2-gecko-main
@@ -1082,7 +1183,7 @@ hysteria2_gecko_relay_menu() {
     echo " Hysteria2 Gecko Two-Server Relay Menu"
     echo "======================================================="
     echo "Architecture:"
-    echo "  Client -> Iran UDP Relay -> Kharej Hysteria2 Gecko Server"
+    echo "  Client -> Iran NFTables UDP Relay -> Kharej Hysteria2 Gecko Server"
     echo
     echo " 1) Kharej: Install Main Hysteria2 Gecko Server + Generate Relay Link"
     echo " 2) Kharej: Show Relay Link"
@@ -1108,6 +1209,227 @@ hysteria2_gecko_relay_menu() {
       6) restart_gecko_relay_services; read -rp "Press Enter to return to relay menu..." ;;
       7) stop_gecko_relay_services; read -rp "Press Enter to return to relay menu..." ;;
       8) uninstall_gecko_relay_services; read -rp "Press Enter to return to relay menu..." ;;
+      0) return ;;
+      *) echo "Invalid choice."; sleep 1 ;;
+    esac
+  done
+}
+
+
+# =======================================================
+# Hysteria2 Gecko Port Hop - Kharej only
+# =======================================================
+urlencode_hy2_porthop() {
+  python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+extract_hy2_server_config_values_porthop() {
+  python3 <<'PY'
+import os, re
+files=["/etc/hysteria2-gecko-main/server.yaml","/etc/hysteria2/server.yaml"]
+cfg=next((p for p in files if os.path.exists(p)),"")
+if not cfg: raise SystemExit(1)
+text=open(cfg,encoding="utf-8",errors="ignore").read()
+def sh(s): return "'"+str(s).replace("'","'\"'\"'")+"'"
+def top(k):
+    m=re.search(r'(?m)^\\s*'+re.escape(k)+r'\\s*:\\s*(.+?)\\s*$',text)
+    if not m: return ""
+    return m.group(1).split('#',1)[0].strip().strip('"').strip("'")
+listen=top('listen'); port=''
+m=re.search(r':(\\d+)',listen)
+if m: port=m.group(1)
+auth=''; obfs=''; sni=''
+am=re.search(r'(?ms)^\\s*auth\\s*:\\s*\\n(?P<body>(?:^[ \\t]+.*\\n?)+?)(?=^\\S|\\Z)',text)
+if am:
+    mm=re.search(r'(?m)^\\s+password\\s*:\\s*(.+?)\\s*$',am.group('body'))
+    if mm: auth=mm.group(1).split('#',1)[0].strip().strip('"').strip("'")
+om=re.search(r'(?ms)^\\s*obfs\\s*:\\s*\\n(?P<body>(?:^[ \\t]+.*\\n?)+?)(?=^\\S|\\Z)',text)
+if om:
+    mm=re.search(r'(?m)^\\s+password\\s*:\\s*(.+?)\\s*$',om.group('body'))
+    if mm: obfs=mm.group(1).split('#',1)[0].strip().strip('"').strip("'")
+tm=re.search(r'(?ms)^\\s*tls\\s*:\\s*\\n(?P<body>(?:^[ \\t]+.*\\n?)+?)(?=^\\S|\\Z)',text)
+if tm:
+    mm=re.search(r'(?m)^\\s+sni\\s*:\\s*(.+?)\\s*$',tm.group('body'))
+    if mm: sni=mm.group(1).split('#',1)[0].strip().strip('"').strip("'")
+print('PH_CONFIG_FILE='+sh(cfg)); print('PH_MAIN_PORT='+sh(port)); print('PH_AUTH='+sh(auth)); print('PH_OBFS_PASS='+sh(obfs)); print('PH_SNI='+sh(sni))
+PY
+}
+
+extract_hy2_link_values_porthop() {
+  python3 <<'PY'
+import os,re,urllib.parse
+files=["/etc/hysteria2-gecko-main/direct-client-link.txt","/etc/hysteria2/client-link.txt","/etc/hysteria2-gecko-main/server-info.txt","/etc/hysteria2-gecko-main/relay-info.txt"]
+link=''
+for p in files:
+    if os.path.exists(p):
+        m=re.search(r'hy2://[^\\s]+',open(p,encoding='utf-8',errors='ignore').read())
+        if m: link=m.group(0); break
+if not link: raise SystemExit(1)
+def sh(s): return "'"+str(s).replace("'","'\"'\"'")+"'"
+try:
+    rest=link[6:]; before, after=rest.split('?',1); auth, hostport=before.split('@',1)
+    auth=urllib.parse.unquote(auth)
+    if '#' in after: query, remark=after.split('#',1); remark=urllib.parse.unquote(remark)
+    else: query, remark=after,''
+    qs=urllib.parse.parse_qs(query)
+    server, port=hostport.rsplit(':',1)
+    print('PH_SERVER='+sh(server)); print('PH_MAIN_PORT='+sh(port)); print('PH_AUTH='+sh(auth)); print('PH_SNI='+sh(qs.get('sni',[''])[0])); print('PH_OBFS_PASS='+sh(qs.get('obfs-password',[''])[0])); print('PH_REMARK='+sh(remark or 'HY2'))
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+detect_hy2_gecko_values_porthop() {
+  PH_CONFIG_FILE=""; PH_SERVER=""; PH_MAIN_PORT=""; PH_AUTH=""; PH_OBFS_PASS=""; PH_SNI=""; PH_REMARK="HY2"
+  if extract_hy2_server_config_values_porthop >/tmp/hy2_porthop_cfg.env 2>/dev/null; then . /tmp/hy2_porthop_cfg.env; fi
+  if extract_hy2_link_values_porthop >/tmp/hy2_porthop_link.env 2>/dev/null; then . /tmp/hy2_porthop_link.env; fi
+  [ -n "$PH_SERVER" ] || PH_SERVER="$(curl -4fsSL --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+  [ -n "$PH_SNI" ] || PH_SNI="www.google.com"
+  [ -n "$PH_REMARK" ] || PH_REMARK="HY2"
+  export PH_CONFIG_FILE PH_SERVER PH_MAIN_PORT PH_AUTH PH_OBFS_PASS PH_SNI PH_REMARK
+}
+
+validate_port_hop_values() {
+  [ -n "$PH_MAIN_PORT" ] && [[ "$PH_MAIN_PORT" =~ ^[0-9]+$ ]] || { echo "Could not detect Main Hysteria Port."; return 1; }
+  [ -n "$PH_AUTH" ] || { echo "Could not detect Auth password."; return 1; }
+  [ -n "$PH_OBFS_PASS" ] || { echo "Could not detect Gecko obfs password."; return 1; }
+  [ -n "$PH_SNI" ] || { echo "Could not detect SNI."; return 1; }
+}
+
+make_gecko_mport_link_porthop() {
+  EN_AUTH="$(urlencode_hy2_porthop "$PH_AUTH")"; EN_SNI="$(urlencode_hy2_porthop "$PH_SNI")"; EN_OBFS="$(urlencode_hy2_porthop "$PH_OBFS_PASS")"; EN_REMARK="$(urlencode_hy2_porthop "$PH_REMARK")"
+  echo "hy2://$EN_AUTH@$PH_SERVER:$PH_MAIN_PORT?sni=$EN_SNI&insecure=1&allowInsecure=1&obfs=gecko&obfs-password=$EN_OBFS&mport=$PH_HOP_START-$PH_HOP_END#$EN_REMARK"
+}
+
+enable_hysteria2_gecko_port_hop() {
+  clear
+  echo "======================================================="
+  echo " Enable Hysteria2 Gecko Port Hop - Kharej only"
+  echo "======================================================="
+  echo "This is NOT tunnel/relay mode. It redirects UDP hop range to main local Hysteria port."
+  echo "======================================================="
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
+  detect_hy2_gecko_values_porthop
+  validate_port_hop_values || { echo "Auto-detection failed. Install Gecko server first or ensure client-link exists."; return 1; }
+  echo "Detected: Server=$PH_SERVER MainPort=$PH_MAIN_PORT Obfs=gecko SNI=$PH_SNI Remark=$PH_REMARK"
+  read -rp "Hop range start [30000]: " PH_HOP_START; PH_HOP_START="${PH_HOP_START:-30000}"
+  read -rp "Hop range end [45000]: " PH_HOP_END; PH_HOP_END="${PH_HOP_END:-45000}"
+  if ! [[ "$PH_HOP_START" =~ ^[0-9]+$ ]] || ! [[ "$PH_HOP_END" =~ ^[0-9]+$ ]] || [ "$PH_HOP_START" -lt 1 ] || [ "$PH_HOP_END" -gt 65535 ] || [ "$PH_HOP_START" -gt "$PH_HOP_END" ]; then echo "Invalid port range."; return 1; fi
+  if [ "$PH_MAIN_PORT" -ge "$PH_HOP_START" ] && [ "$PH_MAIN_PORT" -le "$PH_HOP_END" ]; then echo "Main port must not be inside hop range."; return 1; fi
+  command -v nft >/dev/null 2>&1 || { apt update -y && apt install -y nftables curl python3 ca-certificates; }
+  mkdir -p /etc/nftables.d /etc/hysteria2-gecko-porthop
+  cat > /etc/hysteria2-gecko-porthop/porthop.env <<EOF
+PH_MAIN_PORT="$PH_MAIN_PORT"
+PH_HOP_START="$PH_HOP_START"
+PH_HOP_END="$PH_HOP_END"
+PH_SERVER="$PH_SERVER"
+PH_SNI="$PH_SNI"
+PH_REMARK="$PH_REMARK"
+EOF
+  cat > /etc/nftables.d/hy2-gecko-porthop.nft <<EOF
+table inet hy2_gecko_porthop {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    udp dport $PH_HOP_START-$PH_HOP_END redirect to :$PH_MAIN_PORT
+  }
+}
+EOF
+  cat > /usr/local/sbin/hy2-gecko-porthop-apply.sh <<'EOF'
+#!/usr/bin/env bash
+set -e
+nft delete table inet hy2_gecko_porthop >/dev/null 2>&1 || true
+nft -f /etc/nftables.d/hy2-gecko-porthop.nft
+EOF
+  chmod +x /usr/local/sbin/hy2-gecko-porthop-apply.sh
+  cat > /usr/local/sbin/hy2-gecko-porthop-remove.sh <<'EOF'
+#!/usr/bin/env bash
+set +e
+nft delete table inet hy2_gecko_porthop >/dev/null 2>&1 || true
+EOF
+  chmod +x /usr/local/sbin/hy2-gecko-porthop-remove.sh
+  cat > /etc/systemd/system/hysteria2-gecko-porthop.service <<'EOF'
+[Unit]
+Description=Hysteria2 Gecko Port Hop NFT Redirect
+After=network-online.target nftables.service
+Wants=network-online.target nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/hy2-gecko-porthop-apply.sh
+ExecStop=/usr/local/sbin/hy2-gecko-porthop-remove.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl enable --now nftables >/dev/null 2>&1 || true
+  if [ -f /etc/nftables.conf ] && ! grep -q 'include "/etc/nftables.d/\*.nft"' /etc/nftables.conf; then cp -a /etc/nftables.conf "/etc/nftables.conf.bak.$(date +%Y%m%d-%H%M%S)" || true; printf '\ninclude "/etc/nftables.d/*.nft"\n' >> /etc/nftables.conf; fi
+  systemctl daemon-reload; systemctl enable --now hysteria2-gecko-porthop.service; systemctl restart hysteria2-gecko-porthop.service
+  if command -v ufw >/dev/null 2>&1; then ufw allow "$PH_MAIN_PORT/udp" >/dev/null 2>&1 || true; ufw allow "$PH_HOP_START:$PH_HOP_END/udp" >/dev/null 2>&1 || true; fi
+  PH_LINK="$(make_gecko_mport_link_porthop)"
+  echo "$PH_LINK" > /etc/hysteria2-gecko-porthop/mport-link.txt
+  cat > /etc/hysteria2-gecko-porthop/info.txt <<EOF
+Main Hysteria Port: $PH_MAIN_PORT
+Hop Range: $PH_HOP_START-$PH_HOP_END
+Server IP: $PH_SERVER
+SNI: $PH_SNI
+Remark: $PH_REMARK
+Obfs: gecko
+NFT Config: /etc/nftables.d/hy2-gecko-porthop.nft
+
+mport Link:
+$PH_LINK
+EOF
+  echo; echo "======================================================="; echo "Gecko Port Hop enabled."; echo "UDP $PH_HOP_START-$PH_HOP_END -> local UDP $PH_MAIN_PORT"; echo; echo "mport Link:"; echo "$PH_LINK"; echo "======================================================="
+}
+
+disable_hysteria2_gecko_port_hop() {
+  clear; echo "Disabling Hysteria2 Gecko Port Hop..."
+  systemctl disable --now hysteria2-gecko-porthop.service >/dev/null 2>&1 || true
+  [ -x /usr/local/sbin/hy2-gecko-porthop-remove.sh ] && /usr/local/sbin/hy2-gecko-porthop-remove.sh >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/hysteria2-gecko-porthop.service /usr/local/sbin/hy2-gecko-porthop-apply.sh /usr/local/sbin/hy2-gecko-porthop-remove.sh /etc/nftables.d/hy2-gecko-porthop.nft
+  rm -rf /etc/hysteria2-gecko-porthop
+  systemctl daemon-reload
+  echo "Gecko Port Hop disabled."
+}
+
+show_hysteria2_gecko_port_hop() {
+  clear; echo "======================================================="; echo " Hysteria2 Gecko Port Hop Status"; echo "======================================================="
+  systemctl status hysteria2-gecko-porthop.service --no-pager 2>/dev/null || echo "hysteria2-gecko-porthop.service not installed."
+  echo; echo "[NFT rules]"; nft list table inet hy2_gecko_porthop 2>/dev/null || echo "No hy2_gecko_porthop nft table."
+  echo; echo "[Saved info]"; [ -f /etc/hysteria2-gecko-porthop/info.txt ] && cat /etc/hysteria2-gecko-porthop/info.txt || echo "No saved info."
+}
+
+generate_hysteria2_gecko_mport_link() {
+  clear; echo "======================================================="; echo " Generate Hysteria2 Gecko mport Link"; echo "======================================================="
+  detect_hy2_gecko_values_porthop
+  validate_port_hop_values || return 1
+  if [ -f /etc/hysteria2-gecko-porthop/porthop.env ]; then . /etc/hysteria2-gecko-porthop/porthop.env; else read -rp "Hop range start [30000]: " PH_HOP_START; PH_HOP_START="${PH_HOP_START:-30000}"; read -rp "Hop range end [45000]: " PH_HOP_END; PH_HOP_END="${PH_HOP_END:-45000}"; fi
+  PH_LINK="$(make_gecko_mport_link_porthop)"
+  echo "$PH_LINK"
+  mkdir -p /etc/hysteria2-gecko-porthop; echo "$PH_LINK" > /etc/hysteria2-gecko-porthop/mport-link.txt
+}
+
+hysteria2_gecko_porthop_menu() {
+  while true; do
+    clear
+    echo "======================================================="
+    echo " Hysteria2 Gecko Port Hop Menu - Kharej only"
+    echo "======================================================="
+    echo " 1) Enable Gecko Port Hop"
+    echo " 2) Disable Gecko Port Hop"
+    echo " 3) Show Port Hop Rules/Status"
+    echo " 4) Generate Gecko mport Link"
+    echo " 0) Back"
+    echo "======================================================="
+    echo "Auto-detects Main Port/Auth/Gecko Password/SNI/Remark. Only asks for Hop Range."
+    echo "======================================================="
+    read -rp "Choose: " PH_CHOICE
+    case "$PH_CHOICE" in
+      1) enable_hysteria2_gecko_port_hop; read -rp "Press Enter to return to Port Hop menu..." ;;
+      2) disable_hysteria2_gecko_port_hop; read -rp "Press Enter to return to Port Hop menu..." ;;
+      3) show_hysteria2_gecko_port_hop; read -rp "Press Enter to return to Port Hop menu..." ;;
+      4) generate_hysteria2_gecko_mport_link; read -rp "Press Enter to return to Port Hop menu..." ;;
       0) return ;;
       *) echo "Invalid choice."; sleep 1 ;;
     esac
@@ -1165,6 +1487,7 @@ while true; do
   echo -e "3)  \e[96mInstall Hysteria2 v2.9.2 + Gecko + Masquerade\e[0m"
   echo -e "4)  \e[92mApply Optimize 10 + 12 (Network + System Limits)\e[0m"
   echo -e "5)  \e[96mGecko Two-Server Relay Menu (Client -> Iran -> Kharej)\e[0m"
+  echo -e "6)  \e[96mHysteria2 Gecko Port Hop Menu (Kharej only)\e[0m"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -1194,6 +1517,10 @@ while true; do
   5)
     clear
     hysteria2_gecko_relay_menu
+    ;;
+  6)
+    clear
+    hysteria2_gecko_porthop_menu
     ;;
   0)
     clear
