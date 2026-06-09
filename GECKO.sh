@@ -1225,57 +1225,183 @@ urlencode_hy2_porthop() {
 
 extract_hy2_server_config_values_porthop() {
   python3 <<'PY'
-import os, re
-files=["/etc/hysteria2-gecko-main/server.yaml","/etc/hysteria2/server.yaml"]
-cfg=next((p for p in files if os.path.exists(p)),"")
-if not cfg: raise SystemExit(1)
-text=open(cfg,encoding="utf-8",errors="ignore").read()
-def sh(s): return "'"+str(s).replace("'","'\"'\"'")+"'"
-def top(k):
-    m=re.search(r'(?m)^\\s*'+re.escape(k)+r'\\s*:\\s*(.+?)\\s*$',text)
-    if not m: return ""
-    return m.group(1).split('#',1)[0].strip().strip('"').strip("'")
-listen=top('listen'); port=''
-m=re.search(r':(\\d+)',listen)
-if m: port=m.group(1)
-auth=''; obfs=''; sni=''
-am=re.search(r'(?ms)^\\s*auth\\s*:\\s*\\n(?P<body>(?:^[ \\t]+.*\\n?)+?)(?=^\\S|\\Z)',text)
-if am:
-    mm=re.search(r'(?m)^\\s+password\\s*:\\s*(.+?)\\s*$',am.group('body'))
-    if mm: auth=mm.group(1).split('#',1)[0].strip().strip('"').strip("'")
-om=re.search(r'(?ms)^\\s*obfs\\s*:\\s*\\n(?P<body>(?:^[ \\t]+.*\\n?)+?)(?=^\\S|\\Z)',text)
-if om:
-    mm=re.search(r'(?m)^\\s+password\\s*:\\s*(.+?)\\s*$',om.group('body'))
-    if mm: obfs=mm.group(1).split('#',1)[0].strip().strip('"').strip("'")
-tm=re.search(r'(?ms)^\\s*tls\\s*:\\s*\\n(?P<body>(?:^[ \\t]+.*\\n?)+?)(?=^\\S|\\Z)',text)
-if tm:
-    mm=re.search(r'(?m)^\\s+sni\\s*:\\s*(.+?)\\s*$',tm.group('body'))
-    if mm: sni=mm.group(1).split('#',1)[0].strip().strip('"').strip("'")
-print('PH_CONFIG_FILE='+sh(cfg)); print('PH_MAIN_PORT='+sh(port)); print('PH_AUTH='+sh(auth)); print('PH_OBFS_PASS='+sh(obfs)); print('PH_SNI='+sh(sni))
+import os, re, sys, subprocess
+
+files = [
+    "/etc/hysteria2-gecko-main/server.yaml",
+    "/etc/hysteria2/server.yaml",
+    "/etc/hysteria2-gecko-tunnel-server/server.yaml",
+]
+cfg = next((p for p in files if os.path.exists(p)), "")
+if not cfg:
+    raise SystemExit(1)
+
+text = open(cfg, encoding="utf-8", errors="ignore").read()
+
+def sh(s):
+    return "'" + str(s).replace("'", "'\"'\"'") + "'"
+
+def clean(v):
+    v = (v or "").strip()
+    if "#" in v:
+        v = v.split("#", 1)[0].strip()
+    if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+        v = v[1:-1]
+    return v.strip()
+
+def top_value(key):
+    m = re.search(r'(?m)^\s*' + re.escape(key) + r'\s*:\s*(.+?)\s*$', text)
+    return clean(m.group(1)) if m else ""
+
+listen = top_value("listen")
+port = ""
+m = re.search(r':\s*(\d+)', listen)
+if m:
+    port = m.group(1)
+
+# Auth password: prefer password inside auth block; fallback to first password in file
+auth = ""
+m = re.search(r'(?ms)^\s*auth\s*:\s*\n(?P<body>.*?)(?=^\S|\Z)', text)
+if m:
+    mm = re.search(r'(?m)^\s+password\s*:\s*(.+?)\s*$', m.group("body"))
+    if mm:
+        auth = clean(mm.group(1))
+
+all_passwords = [clean(x) for x in re.findall(r'(?m)^\s*password\s*:\s*(.+?)\s*$', text)]
+if not auth and all_passwords:
+    auth = all_passwords[0]
+
+# Gecko obfs password:
+# 1) Prefer password in obfs/gecko area before quic/masquerade/etc.
+obfs = ""
+m = re.search(r'(?ms)^\s*obfs\s*:\s*\n(?P<body>.*?)(?=^(?:quic|bandwidth|ignoreClientBandwidth|disableUDP|masquerade|tls|auth|listen)\s*:|\Z)', text)
+if m:
+    body = m.group("body")
+    # password may be under gecko/password or directly under obfs in some builds
+    mm = re.search(r'(?m)^\s*password\s*:\s*(.+?)\s*$', body)
+    if mm:
+        obfs = clean(mm.group(1))
+
+# 2) If there are two password keys, usually auth is first and obfs is second
+if not obfs and len(all_passwords) >= 2:
+    obfs = all_passwords[1]
+
+# 3) Some files may include obfs-password in comments/link text
+if not obfs:
+    mm = re.search(r'obfs-password=([^&#\s]+)', text)
+    if mm:
+        import urllib.parse
+        obfs = urllib.parse.unquote(mm.group(1))
+
+# SNI:
+sni = ""
+m = re.search(r'(?ms)^\s*tls\s*:\s*\n(?P<body>.*?)(?=^(?:auth|obfs|quic|bandwidth|masquerade|listen)\s*:|\Z)', text)
+if m:
+    mm = re.search(r'(?m)^\s*sni\s*:\s*(.+?)\s*$', m.group("body"))
+    if mm:
+        sni = clean(mm.group(1))
+
+# If sni not explicitly in yaml, try reading CN from cert file
+if not sni:
+    for cert in ["/etc/hysteria2-gecko-main/server.crt", "/etc/hysteria2/server.crt", "/etc/hysteria2-gecko-tunnel-server/server.crt"]:
+        if os.path.exists(cert):
+            try:
+                out = subprocess.check_output(["openssl", "x509", "-noout", "-subject", "-in", cert], text=True, stderr=subprocess.DEVNULL)
+                mm = re.search(r'CN\s*=\s*([^,\n/]+)', out)
+                if mm:
+                    sni = clean(mm.group(1))
+                    break
+            except Exception:
+                pass
+
+print("PH_CONFIG_FILE=" + sh(cfg))
+print("PH_MAIN_PORT=" + sh(port))
+print("PH_AUTH=" + sh(auth))
+print("PH_OBFS_PASS=" + sh(obfs))
+print("PH_SNI=" + sh(sni))
 PY
 }
 
 extract_hy2_link_values_porthop() {
   python3 <<'PY'
-import os,re,urllib.parse
-files=["/etc/hysteria2-gecko-main/direct-client-link.txt","/etc/hysteria2/client-link.txt","/etc/hysteria2-gecko-main/server-info.txt","/etc/hysteria2-gecko-main/relay-info.txt"]
-link=''
+import os, re, urllib.parse, sys
+
+files = [
+    "/etc/hysteria2-gecko-main/direct-client-link.txt",
+    "/etc/hysteria2/client-link.txt",
+    "/etc/hysteria2-gecko-main/server-info.txt",
+    "/etc/hysteria2-gecko-main/relay-info.txt",
+    "/etc/hysteria2-gecko-tunnel-server/tunnel-server-info.txt",
+    "/etc/hysteria2-gecko-tunnel-server/tunnel-link.txt",
+    "/etc/hysteria2-gecko-porthop/mport-link.txt",
+    "/etc/hysteria2-gecko-porthop/info.txt",
+]
+
+def sh(s):
+    return "'" + str(s).replace("'", "'\"'\"'") + "'"
+
+def clean(s):
+    s = (s or "").strip()
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        s = s[1:-1]
+    return s.strip()
+
+combined = ""
 for p in files:
     if os.path.exists(p):
-        m=re.search(r'hy2://[^\\s]+',open(p,encoding='utf-8',errors='ignore').read())
-        if m: link=m.group(0); break
-if not link: raise SystemExit(1)
-def sh(s): return "'"+str(s).replace("'","'\"'\"'")+"'"
-try:
-    rest=link[6:]; before, after=rest.split('?',1); auth, hostport=before.split('@',1)
-    auth=urllib.parse.unquote(auth)
-    if '#' in after: query, remark=after.split('#',1); remark=urllib.parse.unquote(remark)
-    else: query, remark=after,''
-    qs=urllib.parse.parse_qs(query)
-    server, port=hostport.rsplit(':',1)
-    print('PH_SERVER='+sh(server)); print('PH_MAIN_PORT='+sh(port)); print('PH_AUTH='+sh(auth)); print('PH_SNI='+sh(qs.get('sni',[''])[0])); print('PH_OBFS_PASS='+sh(qs.get('obfs-password',[''])[0])); print('PH_REMARK='+sh(remark or 'HY2'))
-except Exception:
+        combined += "\n" + open(p, encoding="utf-8", errors="ignore").read()
+
+link = ""
+m = re.search(r'hy2://[^\s]+', combined)
+if m:
+    link = m.group(0).strip()
+
+if link:
+    try:
+        rest = link[len("hy2://"):]
+        before, after = rest.split("?", 1)
+        auth, hostport = before.split("@", 1)
+        auth = urllib.parse.unquote(auth)
+        if "#" in after:
+            query, remark = after.split("#", 1)
+            remark = urllib.parse.unquote(remark)
+        else:
+            query, remark = after, ""
+        qs = urllib.parse.parse_qs(query)
+        server, port = hostport.rsplit(":", 1)
+        # if port is a range in a previous mport link, main port is still before ? not mport; keep as-is if numeric only
+        print("PH_SERVER=" + sh(server))
+        print("PH_MAIN_PORT=" + sh(port))
+        print("PH_AUTH=" + sh(auth))
+        print("PH_SNI=" + sh(qs.get("sni", [""])[0]))
+        print("PH_OBFS_PASS=" + sh(qs.get("obfs-password", [""])[0]))
+        print("PH_REMARK=" + sh(remark or "HY2"))
+        raise SystemExit(0)
+    except Exception:
+        pass
+
+# Fallback: parse server-info style labels
+labels = {
+    "PH_SERVER": [r'Kharej Server IP:\s*(\S+)', r'Outside Server IP:\s*(\S+)', r'Server IP:\s*(\S+)'],
+    "PH_MAIN_PORT": [r'Hysteria UDP Port:\s*(\d+)', r'Main Hysteria Port:\s*(\d+)'],
+    "PH_AUTH": [r'Auth Password:\s*(\S+)'],
+    "PH_OBFS_PASS": [r'Gecko Obfs Password:\s*(\S+)', r'Obfs Password:\s*(\S+)', r'Gecko Password:\s*(\S+)'],
+    "PH_SNI": [r'SNI:\s*(\S+)'],
+    "PH_REMARK": [r'Remark:\s*(.+)'],
+}
+found = {}
+for k, pats in labels.items():
+    for pat in pats:
+        mm = re.search(pat, combined)
+        if mm:
+            found[k] = clean(mm.group(1))
+            break
+
+if not found:
     raise SystemExit(1)
+
+for k in ["PH_SERVER", "PH_MAIN_PORT", "PH_AUTH", "PH_SNI", "PH_OBFS_PASS", "PH_REMARK"]:
+    print(k + "=" + sh(found.get(k, "")))
 PY
 }
 
@@ -1310,7 +1436,16 @@ enable_hysteria2_gecko_port_hop() {
   echo "======================================================="
   [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
   detect_hy2_gecko_values_porthop
-  validate_port_hop_values || { echo "Auto-detection failed. Install Gecko server first or ensure client-link exists."; return 1; }
+  if ! validate_port_hop_values; then
+    echo
+    echo "Auto-detection was incomplete. Please enter only missing values."
+    [ -n "$PH_MAIN_PORT" ] || read -rp "Main Hysteria Port: " PH_MAIN_PORT
+    [ -n "$PH_AUTH" ] || read -rp "Auth password: " PH_AUTH
+    [ -n "$PH_OBFS_PASS" ] || read -rp "Gecko obfs password: " PH_OBFS_PASS
+    [ -n "$PH_SNI" ] || read -rp "SNI [www.google.com]: " PH_SNI
+    PH_SNI="${PH_SNI:-www.google.com}"
+    validate_port_hop_values || { echo "Required values are still missing."; return 1; }
+  fi
   echo "Detected: Server=$PH_SERVER MainPort=$PH_MAIN_PORT Obfs=gecko SNI=$PH_SNI Remark=$PH_REMARK"
   read -rp "Hop range start [30000]: " PH_HOP_START; PH_HOP_START="${PH_HOP_START:-30000}"
   read -rp "Hop range end [45000]: " PH_HOP_END; PH_HOP_END="${PH_HOP_END:-45000}"
@@ -1403,7 +1538,16 @@ show_hysteria2_gecko_port_hop() {
 generate_hysteria2_gecko_mport_link() {
   clear; echo "======================================================="; echo " Generate Hysteria2 Gecko mport Link"; echo "======================================================="
   detect_hy2_gecko_values_porthop
-  validate_port_hop_values || return 1
+  if ! validate_port_hop_values; then
+    echo
+    echo "Auto-detection was incomplete. Please enter only missing values."
+    [ -n "$PH_MAIN_PORT" ] || read -rp "Main Hysteria Port: " PH_MAIN_PORT
+    [ -n "$PH_AUTH" ] || read -rp "Auth password: " PH_AUTH
+    [ -n "$PH_OBFS_PASS" ] || read -rp "Gecko obfs password: " PH_OBFS_PASS
+    [ -n "$PH_SNI" ] || read -rp "SNI [www.google.com]: " PH_SNI
+    PH_SNI="${PH_SNI:-www.google.com}"
+    validate_port_hop_values || return 1
+  fi
   if [ -f /etc/hysteria2-gecko-porthop/porthop.env ]; then . /etc/hysteria2-gecko-porthop/porthop.env; else read -rp "Hop range start [30000]: " PH_HOP_START; PH_HOP_START="${PH_HOP_START:-30000}"; read -rp "Hop range end [45000]: " PH_HOP_END; PH_HOP_END="${PH_HOP_END:-45000}"; fi
   PH_LINK="$(make_gecko_mport_link_porthop)"
   echo "$PH_LINK"
