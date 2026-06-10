@@ -985,7 +985,8 @@ suffix:googleapis.com
 suffix:apple.com
 suffix:icloud.com
 suffix:cdn-apple.com
-keyword:showip
+suffix:showip.net
+showip.net
 EOF
 }
 
