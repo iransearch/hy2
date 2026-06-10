@@ -918,6 +918,7 @@ uninstall_gecko_relay_services() {
 GECKO_WARP_DEFAULT_PORT="40000"
 GECKO_WARP_REAL_CONFIG="/etc/hysteria2-gecko-app-relay/real-gecko/server.yaml"
 GECKO_WARP_REAL_SERVICE="hysteria2-gecko-real.service"
+GECKO_WARP_ROUTES_FILE="/etc/hysteria2-gecko-app-relay/warp-routes.txt"
 
 gecko_warp_require_kharej_config() {
   [ -f "$GECKO_WARP_REAL_CONFIG" ] || {
@@ -972,16 +973,58 @@ p.write_text(text.rstrip() + '\n', encoding='utf-8')
 INNERPY
 }
 
+write_default_gecko_warp_routes() {
+  mkdir -p "$(dirname "$GECKO_WARP_ROUTES_FILE")"
+  cat > "$GECKO_WARP_ROUTES_FILE" <<'EOF'
+geosite:google
+geosite:apple
+geosite:openai
+suffix:google.com
+suffix:gstatic.com
+suffix:googleapis.com
+suffix:apple.com
+suffix:icloud.com
+suffix:cdn-apple.com
+keyword:showip
+EOF
+}
+
+build_gecko_warp_acl_rules() {
+  [ -f "$GECKO_WARP_ROUTES_FILE" ] || write_default_gecko_warp_routes
+  while IFS= read -r RULE; do
+    RULE="$(echo "$RULE" | sed 's/#.*$//' | xargs)"
+    [ -z "$RULE" ] && continue
+    echo "    - warp($RULE)"
+  done < "$GECKO_WARP_ROUTES_FILE"
+  echo "    - direct(all)"
+}
+
+show_default_gecko_warp_routes() {
+  [ -f "$GECKO_WARP_ROUTES_FILE" ] || write_default_gecko_warp_routes
+  cat "$GECKO_WARP_ROUTES_FILE"
+}
+
 enable_gecko_real_outbound_via_warp() {
   clear
   echo "======================================================="
-  echo " Enable Real Gecko Outbound via WARP Proxy - Kharej only"
+  echo " Enable SELECTIVE Real Gecko Outbound via WARP Proxy"
   echo "======================================================="
-  echo "Only hysteria2-gecko-real.service will be patched."
+  echo "Only selected domains/rules will use WARP."
+  echo "Everything else will use DIRECT outbound."
   echo "Iran<->Kharej outer relay routing will NOT be changed."
   echo "======================================================="
   [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
   gecko_warp_require_kharej_config || return 1
+
+  write_default_gecko_warp_routes
+
+  echo
+  echo "Selective WARP route list:"
+  echo "-------------------------------------------------------"
+  show_default_gecko_warp_routes
+  echo "-------------------------------------------------------"
+  echo "These routes will be converted to warp(rule), then direct(all)."
+  echo
 
   DETECTED_PORT="$(gecko_warp_detect_proxy_port)"
   read -rp "Local WARP SOCKS5 proxy port [$DETECTED_PORT]: " WARP_PROXY_PORT
@@ -999,7 +1042,7 @@ enable_gecko_real_outbound_via_warp() {
       grep -E '^(ip|colo|warp)=' /tmp/gecko-warp-trace.txt || true
     else
       echo "WARNING: SOCKS5 proxy test failed."
-      echo "You can still enable it, but Hysteria outbound may fail until WARP Proxy is working."
+      echo "You can still enable it, but selected Hysteria outbound may fail until WARP Proxy is working."
       [ -s /tmp/gecko-warp-curl.err ] && cat /tmp/gecko-warp-curl.err
       read -rp "Continue anyway? [y/N]: " CONT_WARP
       case "$CONT_WARP" in y|Y|yes|YES|Yes) ;; *) echo "Cancelled."; return 1 ;; esac
@@ -1007,39 +1050,43 @@ enable_gecko_real_outbound_via_warp() {
   fi
 
   TS="$(date +%Y%m%d-%H%M%S)"
-  cp -a "$GECKO_WARP_REAL_CONFIG" "$GECKO_WARP_REAL_CONFIG.bak-before-warp-$TS"
+  cp -a "$GECKO_WARP_REAL_CONFIG" "$GECKO_WARP_REAL_CONFIG.bak-before-selective-warp-$TS"
   remove_gecko_warp_block_from_config "$GECKO_WARP_REAL_CONFIG"
 
   if grep -Eq '^[[:space:]]*(outbounds|acl):[[:space:]]*$' "$GECKO_WARP_REAL_CONFIG"; then
     echo
     echo "WARNING: Existing top-level outbounds/acl detected in real Gecko config."
     echo "To avoid duplicate YAML keys, this automatic patch will not continue."
-    echo "Backup saved: $GECKO_WARP_REAL_CONFIG.bak-before-warp-$TS"
+    echo "Backup saved: $GECKO_WARP_REAL_CONFIG.bak-before-selective-warp-$TS"
     return 1
   fi
 
-  cat >> "$GECKO_WARP_REAL_CONFIG" <<EOF
-
-# BEGIN GECKO WARP PROXY OUTBOUND
-outbounds:
-  - name: warp
-    type: socks5
-    socks5:
-      addr: $WARP_PROXY_ADDR
-
-acl:
-  inline:
-    - warp(all)
-# END GECKO WARP PROXY OUTBOUND
-EOF
+  {
+    echo
+    echo "# BEGIN GECKO WARP PROXY OUTBOUND"
+    echo "outbounds:"
+    echo "  - name: direct"
+    echo "    type: direct"
+    echo
+    echo "  - name: warp"
+    echo "    type: socks5"
+    echo "    socks5:"
+    echo "      addr: $WARP_PROXY_ADDR"
+    echo
+    echo "acl:"
+    echo "  inline:"
+    build_gecko_warp_acl_rules
+    echo "# END GECKO WARP PROXY OUTBOUND"
+  } >> "$GECKO_WARP_REAL_CONFIG"
 
   systemctl restart "$GECKO_WARP_REAL_SERVICE"
   sleep 1
   echo
   systemctl status "$GECKO_WARP_REAL_SERVICE" --no-pager || true
   echo
-  echo "WARP outbound enabled for Real Gecko server."
-  echo "Backup: $GECKO_WARP_REAL_CONFIG.bak-before-warp-$TS"
+  echo "Selective WARP outbound enabled for Real Gecko server."
+  echo "Only rules in $GECKO_WARP_ROUTES_FILE use WARP; everything else is direct."
+  echo "Backup: $GECKO_WARP_REAL_CONFIG.bak-before-selective-warp-$TS"
 }
 
 disable_gecko_real_outbound_via_warp() {
@@ -1076,6 +1123,13 @@ show_gecko_warp_status() {
     echo "Config not found: $GECKO_WARP_REAL_CONFIG"
   fi
   echo
+  echo "[Selective WARP routes]"
+  if [ -f "$GECKO_WARP_ROUTES_FILE" ]; then
+    cat "$GECKO_WARP_ROUTES_FILE"
+  else
+    echo "Routes file not created yet: $GECKO_WARP_ROUTES_FILE"
+  fi
+  echo
   echo "[Listening proxy candidates]"
   ss -lntup 2>/dev/null | grep -E ':(40000|40001|1080|8086|8080)\b' || echo "No common local proxy port found."
   echo
@@ -1103,6 +1157,32 @@ test_gecko_warp_proxy() {
   curl --socks5 "$WARP_PROXY_ADDR" --max-time 15 -fsSL https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(ip|colo|warp)=' || echo "WARP SOCKS5 trace failed. Check fscarmen WARP Proxy mode."
 }
 
+edit_gecko_warp_routes() {
+  clear
+  echo "======================================================="
+  echo " Edit SELECTIVE WARP route list"
+  echo "======================================================="
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
+  write_default_gecko_warp_routes
+  echo "Routes file: $GECKO_WARP_ROUTES_FILE"
+  echo
+  echo "Current routes:"
+  echo "-------------------------------------------------------"
+  cat "$GECKO_WARP_ROUTES_FILE"
+  echo "-------------------------------------------------------"
+  echo
+  read -rp "Open editor now? [Y/n]: " EDIT_ROUTES
+  EDIT_ROUTES="${EDIT_ROUTES:-Y}"
+  case "$EDIT_ROUTES" in
+    y|Y|yes|YES|Yes)
+      "${EDITOR:-nano}" "$GECKO_WARP_ROUTES_FILE"
+      ;;
+    *) return 0 ;;
+  esac
+  echo
+  echo "To apply changes, run: Enable SELECTIVE Real Gecko outbound via local WARP SOCKS5"
+}
+
 gecko_warp_proxy_menu() {
   while true; do
     clear
@@ -1113,19 +1193,21 @@ gecko_warp_proxy_menu() {
     echo "This does NOT change server default route and does NOT touch Iran<->Kharej outer relay."
     echo
     echo " 1) Install Cloudflare WARP Proxy using fscarmen script"
-    echo " 2) Enable Real Gecko outbound via local WARP SOCKS5"
-    echo " 3) Disable Real Gecko outbound via WARP"
-    echo " 4) Show WARP/Gecko status"
-    echo " 5) Test local WARP SOCKS5 proxy"
+    echo " 2) Enable SELECTIVE Real Gecko outbound via local WARP SOCKS5"
+    echo " 3) Edit selective WARP route list"
+    echo " 4) Disable Real Gecko outbound via WARP"
+    echo " 5) Show WARP/Gecko status"
+    echo " 6) Test local WARP SOCKS5 proxy"
     echo " 0) Back"
     echo "======================================================="
     read -rp "Choose: " WARP_CHOICE
     case "$WARP_CHOICE" in
       1) install_cloudflare_warp_proxy_fscarmen_gecko; read -rp "Press Enter to return to WARP menu..." ;;
       2) enable_gecko_real_outbound_via_warp; read -rp "Press Enter to return to WARP menu..." ;;
-      3) disable_gecko_real_outbound_via_warp; read -rp "Press Enter to return to WARP menu..." ;;
-      4) show_gecko_warp_status; read -rp "Press Enter to return to WARP menu..." ;;
-      5) test_gecko_warp_proxy; read -rp "Press Enter to return to WARP menu..." ;;
+      3) edit_gecko_warp_routes; read -rp "Press Enter to return to WARP menu..." ;;
+      4) disable_gecko_real_outbound_via_warp; read -rp "Press Enter to return to WARP menu..." ;;
+      5) show_gecko_warp_status; read -rp "Press Enter to return to WARP menu..." ;;
+      6) test_gecko_warp_proxy; read -rp "Press Enter to return to WARP menu..." ;;
       0) return ;;
       *) echo "Invalid choice."; sleep 1 ;;
     esac
