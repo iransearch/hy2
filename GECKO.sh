@@ -423,7 +423,8 @@ quic:
   maxStreamReceiveWindow: 8388608
   initConnReceiveWindow: 20971520
   maxConnReceiveWindow: 20971520
-  maxIdleTimeout: 30s
+  maxIdleTimeout: 60s
+  keepAlivePeriod: 10s
   maxIncomingStreams: 1024
   disablePathMTUDiscovery: false
 EOF
@@ -697,6 +698,7 @@ quic:
   initConnReceiveWindow: 20971520
   maxConnReceiveWindow: 20971520
   maxIdleTimeout: 60s
+  keepAlivePeriod: 10s
   maxIncomingStreams: 1024
   disablePathMTUDiscovery: true
 EOF
@@ -725,6 +727,7 @@ quic:
   initConnReceiveWindow: 20971520
   maxConnReceiveWindow: 20971520
   maxIdleTimeout: 60s
+  keepAlivePeriod: 10s
   maxIncomingStreams: 1024
   disablePathMTUDiscovery: true
 
@@ -987,6 +990,7 @@ suffix:apple.com
 suffix:icloud.com
 suffix:cdn-apple.com
 suffix:showip.net
+*.showip.net
 showip.net
 EOF
 }
@@ -1019,6 +1023,11 @@ enable_gecko_real_outbound_via_warp() {
   gecko_warp_require_kharej_config || return 1
 
   write_default_gecko_warp_routes
+  # Upgrade route files created by older versions.
+  sed -i '/^keyword:showip$/d;/^geosite:youtube$/d' "$GECKO_WARP_ROUTES_FILE" 2>/dev/null || true
+  grep -qxF 'suffix:showip.net' "$GECKO_WARP_ROUTES_FILE" 2>/dev/null || echo 'suffix:showip.net' >> "$GECKO_WARP_ROUTES_FILE"
+  grep -qxF '*.showip.net' "$GECKO_WARP_ROUTES_FILE" 2>/dev/null || echo '*.showip.net' >> "$GECKO_WARP_ROUTES_FILE"
+  grep -qxF 'showip.net' "$GECKO_WARP_ROUTES_FILE" 2>/dev/null || echo 'showip.net' >> "$GECKO_WARP_ROUTES_FILE"
 
   echo
   echo "Selective WARP route list:"
@@ -1630,6 +1639,77 @@ hysteria2_gecko_porthop_menu() {
     esac
   done
 }
+
+
+patch_existing_gecko_quic_keepalive() {
+  clear
+  echo "======================================================="
+  echo " Patch Existing GECKO/Hysteria QUIC KeepAlive"
+  echo "======================================================="
+  echo "This updates existing local config files:"
+  echo "  maxIdleTimeout: 60s"
+  echo "  keepAlivePeriod: 10s"
+  echo "======================================================="
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
+
+  python3 <<'PY'
+from pathlib import Path
+import re, shutil, datetime
+
+paths = [
+    Path("/etc/hysteria2/server.yaml"),
+    Path("/etc/hysteria2-gecko-main/server.yaml"),
+    Path("/etc/hysteria2-gecko-app-relay-client/client.yaml"),
+    Path("/etc/hysteria2-gecko-app-relay/outer-server/server.yaml"),
+    Path("/etc/hysteria2-gecko-app-relay/real-gecko/server.yaml"),
+]
+ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+changed = []
+
+def ensure_quic(text: str) -> str:
+    if re.search(r'(?m)^quic:\s*$', text):
+        text = re.sub(r'(?m)^(\s*)maxIdleTimeout:\s*\S+\s*$', r'\1maxIdleTimeout: 60s', text)
+        if not re.search(r'(?m)^\s*maxIdleTimeout:\s*', text):
+            text = re.sub(r'(?m)^quic:\s*$', 'quic:\n  maxIdleTimeout: 60s', text, count=1)
+        if not re.search(r'(?m)^\s*keepAlivePeriod:\s*', text):
+            text = re.sub(r'(?m)^(\s*maxIdleTimeout:\s*60s\s*)$', r'\1\n  keepAlivePeriod: 10s', text, count=1)
+    else:
+        text = text.rstrip() + "\n\nquic:\n  maxIdleTimeout: 60s\n  keepAlivePeriod: 10s\n"
+    return text
+
+for p in paths:
+    if not p.exists():
+        continue
+    old = p.read_text(encoding="utf-8", errors="ignore")
+    new = ensure_quic(old)
+    if new != old:
+        backup = p.with_suffix(p.suffix + f".bak-quic-{ts}")
+        shutil.copy2(p, backup)
+        p.write_text(new, encoding="utf-8")
+        changed.append((str(p), str(backup)))
+
+if changed:
+    print("Updated config files:")
+    for p, b in changed:
+        print(f"  {p}")
+        print(f"    backup: {b}")
+else:
+    print("No changes needed or no known GECKO/Hysteria config found.")
+PY
+
+  echo
+  echo "Restarting known services if present..."
+  for SVC in hysteria2-gecko hysteria2 hysteria2-gecko-app-relay-client hysteria2-gecko-app-relay-server hysteria2-gecko-real; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${SVC}.service"; then
+      systemctl restart "$SVC" 2>/dev/null || true
+    fi
+  done
+
+  echo
+  echo "Current service status:"
+  systemctl --no-pager --type=service | grep -Ei 'hysteria|gecko' || true
+}
+
 
 while true; do
   echo "
