@@ -969,6 +969,7 @@ import sys, re, pathlib
 p = pathlib.Path(sys.argv[1])
 text = p.read_text(encoding='utf-8', errors='ignore')
 text = re.sub(r'\n?# BEGIN GECKO WARP PROXY OUTBOUND\n.*?\n# END GECKO WARP PROXY OUTBOUND\n?', '\n', text, flags=re.S)
+text = re.sub(r'\n?# BEGIN GECKO WARP SNI SNIFF\n.*?\n# END GECKO WARP SNI SNIFF\n?', '\n', text, flags=re.S)
 p.write_text(text.rstrip() + '\n', encoding='utf-8')
 INNERPY
 }
@@ -1010,7 +1011,7 @@ enable_gecko_real_outbound_via_warp() {
   echo "======================================================="
   echo " Enable SELECTIVE Real Gecko Outbound via WARP Proxy"
   echo "======================================================="
-  echo "Only selected domains/rules will use WARP."
+  echo "Only selected domains/rules will use WARP. SNI/Host sniffing will be enabled for domain matching."
   echo "Everything else will use DIRECT outbound."
   echo "Iran<->Kharej outer relay routing will NOT be changed."
   echo "======================================================="
@@ -1054,15 +1055,24 @@ enable_gecko_real_outbound_via_warp() {
   cp -a "$GECKO_WARP_REAL_CONFIG" "$GECKO_WARP_REAL_CONFIG.bak-before-selective-warp-$TS"
   remove_gecko_warp_block_from_config "$GECKO_WARP_REAL_CONFIG"
 
-  if grep -Eq '^[[:space:]]*(outbounds|acl):[[:space:]]*$' "$GECKO_WARP_REAL_CONFIG"; then
+  if grep -Eq '^[[:space:]]*(outbounds|acl|sniff):[[:space:]]*$' "$GECKO_WARP_REAL_CONFIG"; then
     echo
-    echo "WARNING: Existing top-level outbounds/acl detected in real Gecko config."
+    echo "WARNING: Existing top-level outbounds/acl/sniff detected in real Gecko config."
     echo "To avoid duplicate YAML keys, this automatic patch will not continue."
     echo "Backup saved: $GECKO_WARP_REAL_CONFIG.bak-before-selective-warp-$TS"
     return 1
   fi
 
   {
+    echo
+    echo "# BEGIN GECKO WARP SNI SNIFF"
+    echo "sniff:"
+    echo "  enable: true"
+    echo "  timeout: 2s"
+    echo "  rewriteDomain: true"
+    echo "  tcpPorts: 80,443"
+    echo "  udpPorts: 443"
+    echo "# END GECKO WARP SNI SNIFF"
     echo
     echo "# BEGIN GECKO WARP PROXY OUTBOUND"
     echo "outbounds:"
@@ -1086,7 +1096,7 @@ enable_gecko_real_outbound_via_warp() {
   systemctl status "$GECKO_WARP_REAL_SERVICE" --no-pager || true
   echo
   echo "Selective WARP outbound enabled for Real Gecko server."
-  echo "Only rules in $GECKO_WARP_ROUTES_FILE use WARP; everything else is direct."
+  echo "Only rules in $GECKO_WARP_ROUTES_FILE use WARP; everything else is direct. Sniffing is enabled for TUN/IP-only clients."
   echo "Backup: $GECKO_WARP_REAL_CONFIG.bak-before-selective-warp-$TS"
 }
 
@@ -1116,6 +1126,7 @@ show_gecko_warp_status() {
   if [ -f "$GECKO_WARP_REAL_CONFIG" ]; then
     if grep -q "BEGIN GECKO WARP PROXY OUTBOUND" "$GECKO_WARP_REAL_CONFIG"; then
       echo "WARP outbound block: ENABLED"
+      sed -n '/BEGIN GECKO WARP SNI SNIFF/,/END GECKO WARP SNI SNIFF/p' "$GECKO_WARP_REAL_CONFIG"
       sed -n '/BEGIN GECKO WARP PROXY OUTBOUND/,/END GECKO WARP PROXY OUTBOUND/p' "$GECKO_WARP_REAL_CONFIG"
     else
       echo "WARP outbound block: DISABLED"
