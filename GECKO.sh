@@ -653,7 +653,7 @@ install_kharej_main_hysteria_gecko_with_relay_link() {
   if ! [[ "$REAL_PORT" =~ ^[0-9]+$ ]] || [ "$REAL_PORT" -lt 1 ] || [ "$REAL_PORT" -gt 65535 ]; then echo "Invalid real port."; return 1; fi
   read -rp "Bind real Gecko only to 127.0.0.1? [Y/n]: " LOCAL_ONLY; LOCAL_ONLY="${LOCAL_ONLY:-Y}"
   if [[ "$LOCAL_ONLY" =~ ^[Nn] ]]; then REAL_LISTEN=":$REAL_PORT"; REAL_PUBLIC="yes"; else REAL_LISTEN="127.0.0.1:$REAL_PORT"; REAL_PUBLIC="no"; fi
-  read -rp "Outer relay listen port/range between Iran and Kharej [15000-25000]: " OUTER_LISTEN; OUTER_LISTEN="${OUTER_LISTEN:-15000-25000}"
+  read -rp "Outer relay listen port between Iran and Kharej [443]: " OUTER_LISTEN; OUTER_LISTEN="${OUTER_LISTEN:-443}"
   validate_port_or_range_hy2_global "$OUTER_LISTEN" || { echo "Invalid outer relay port/range. Example: 443 or 15000-25000"; return 1; }
   DEFAULT_CLIENT_AUTH="$(openssl rand -hex 16)"; DEFAULT_CLIENT_OBFS="$(openssl rand -base64 18 | tr -d '=+/')"; DEFAULT_OUTER_AUTH="$(openssl rand -hex 16)"; DEFAULT_OUTER_OBFS="$(openssl rand -base64 18 | tr -d '=+/')"
   echo; echo "User-facing Gecko credentials. These go inside the final client link."
@@ -814,7 +814,6 @@ install_iran_udp_gecko_relay_from_link() {
   echo; echo "Parsed App Relay link:"; echo "  Kharej outer server: $RELAY_KHAREJ_SERVER:$RELAY_OUTER_LISTEN"; echo "  Kharej real Gecko:   127.0.0.1:$RELAY_REAL_PORT"; echo "  Iran user port:      $RELAY_USER_PORT"; echo "  Final client obfs:   gecko"; echo
   read -rp "Iran public UDP port for users [$RELAY_USER_PORT]: " IRAN_INPUT_PORT; IRAN_INPUT_PORT="${IRAN_INPUT_PORT:-$RELAY_USER_PORT}"
   if ! [[ "$IRAN_INPUT_PORT" =~ ^[0-9]+$ ]] || [ "$IRAN_INPUT_PORT" -lt 1 ] || [ "$IRAN_INPUT_PORT" -gt 65535 ]; then echo "Invalid Iran user port."; return 1; fi
-  read -rp "Outer hop interval for Iran->Kharej [30s]: " HOP_INTERVAL; HOP_INTERVAL="${HOP_INTERVAL:-30s}"
   read -rp "UDP forwarding timeout [60s]: " UDP_TIMEOUT; UDP_TIMEOUT="${UDP_TIMEOUT:-60s}"
   OUTER_SERVER_ADDR="$RELAY_KHAREJ_SERVER:$RELAY_OUTER_LISTEN"; OUTER_AUTH_YAML="$(yaml_quote_hy2_global "$RELAY_OUTER_AUTH")"; OUTER_OBFS_YAML="$(yaml_quote_hy2_global "$RELAY_OUTER_OBFS_PASSWORD")"; OUTER_SNI_YAML="$(yaml_quote_hy2_global "$RELAY_OUTER_SNI")"; OUTER_SERVER_YAML="$(yaml_quote_hy2_global "$OUTER_SERVER_ADDR")"
   mkdir -p "$RELAY_DIR"
@@ -833,11 +832,6 @@ obfs:
     password: $OUTER_OBFS_YAML
     minPacketSize: 512
     maxPacketSize: 1200
-
-transport:
-  type: udp
-  udp:
-    hopInterval: $HOP_INTERVAL
 
 quic:
   initStreamReceiveWindow: 8388608
@@ -881,7 +875,6 @@ Iran IP: $IRAN_IP
 Iran User UDP Port: $IRAN_INPUT_PORT
 Kharej Outer Server: $RELAY_KHAREJ_SERVER:$RELAY_OUTER_LISTEN
 Kharej Real Gecko Remote: 127.0.0.1:$RELAY_REAL_PORT
-Outer Hop Interval: $HOP_INTERVAL
 UDP Forwarding Timeout: $UDP_TIMEOUT
 Final Client SNI: $RELAY_CLIENT_SNI
 Final Remark: $FINAL_REMARK
