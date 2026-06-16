@@ -912,16 +912,35 @@ uninstall_gecko_relay_services() {
 # =======================================================
 
 GECKO_WARP_DEFAULT_PORT="40000"
-GECKO_WARP_REAL_CONFIG="/etc/hysteria2-gecko-app-relay/real-gecko/server.yaml"
-GECKO_WARP_REAL_SERVICE="hysteria2-gecko-real.service"
 GECKO_WARP_ROUTES_FILE="/etc/hysteria2-gecko-app-relay/warp-routes.txt"
 
+# Auto-detect which Gecko config/service is installed
+gecko_warp_detect_config_and_service() {
+  if [ -f "/etc/hysteria2-gecko-app-relay/real-gecko/server.yaml" ]; then
+    GECKO_WARP_REAL_CONFIG="/etc/hysteria2-gecko-app-relay/real-gecko/server.yaml"
+    GECKO_WARP_REAL_SERVICE="hysteria2-gecko-real.service"
+  elif [ -f "/etc/hysteria2/server.yaml" ]; then
+    GECKO_WARP_REAL_CONFIG="/etc/hysteria2/server.yaml"
+    GECKO_WARP_REAL_SERVICE="hysteria2-gecko.service"
+    # Use a shared routes file location for standalone installs
+    GECKO_WARP_ROUTES_FILE="/etc/hysteria2/warp-routes.txt"
+  else
+    GECKO_WARP_REAL_CONFIG=""
+    GECKO_WARP_REAL_SERVICE=""
+  fi
+}
+
 gecko_warp_require_kharej_config() {
-  [ -f "$GECKO_WARP_REAL_CONFIG" ] || {
-    echo "Real Gecko config not found: $GECKO_WARP_REAL_CONFIG"
-    echo "Install GECKO App Relay Exit on Kharej first."
+  gecko_warp_detect_config_and_service
+  [ -n "$GECKO_WARP_REAL_CONFIG" ] && [ -f "$GECKO_WARP_REAL_CONFIG" ] || {
+    echo "No Gecko config found. Expected one of:"
+    echo "  /etc/hysteria2-gecko-app-relay/real-gecko/server.yaml  (App Relay mode)"
+    echo "  /etc/hysteria2/server.yaml                              (Standalone Gecko)"
+    echo "Install Hysteria2 Gecko first (menu option 3 or 5)."
     return 1
   }
+  echo "Using config : $GECKO_WARP_REAL_CONFIG"
+  echo "Using service: $GECKO_WARP_REAL_SERVICE"
 }
 
 gecko_warp_detect_proxy_port() {
@@ -971,6 +990,7 @@ INNERPY
 }
 
 write_default_gecko_warp_routes() {
+  gecko_warp_detect_config_and_service
   mkdir -p "$(dirname "$GECKO_WARP_ROUTES_FILE")"
   cat > "$GECKO_WARP_ROUTES_FILE" <<'EOF'
 geosite:google
@@ -1010,10 +1030,10 @@ enable_gecko_real_outbound_via_warp() {
   echo "======================================================="
   echo "Only selected domains/rules will use WARP. SNI/Host sniffing will be enabled for domain matching."
   echo "Everything else will use DIRECT outbound."
-  echo "Iran<->Kharej outer relay routing will NOT be changed."
   echo "======================================================="
   [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
   gecko_warp_require_kharej_config || return 1
+  echo
 
   write_default_gecko_warp_routes
   # Upgrade route files created by older versions.
@@ -1121,8 +1141,9 @@ disable_gecko_real_outbound_via_warp() {
 show_gecko_warp_status() {
   clear
   echo "======================================================="
-  echo " GECKO WARP Proxy Status - Kharej only"
+  echo " GECKO WARP Proxy Status"
   echo "======================================================="
+  gecko_warp_detect_config_and_service
   echo
   echo "[Real Gecko config]"
   if [ -f "$GECKO_WARP_REAL_CONFIG" ]; then
@@ -1201,10 +1222,11 @@ gecko_warp_proxy_menu() {
   while true; do
     clear
     echo "======================================================="
-    echo " GECKO WARP Proxy Outbound Menu - Kharej only"
+    echo " GECKO WARP Proxy Outbound Menu"
     echo "======================================================="
-    echo "Purpose: Client -> Iran -> Kharej Real Gecko -> WARP Proxy -> Internet"
-    echo "This does NOT change server default route and does NOT touch Iran<->Kharej outer relay."
+    echo "Purpose: Client -> Gecko Server -> WARP Proxy -> Internet"
+    echo "Works with both Standalone Gecko (menu 3) and App Relay mode (menu 5)."
+    echo "Auto-detects your installed config and service."
     echo
     echo " 1) Install Cloudflare WARP Proxy using fscarmen script"
     echo " 2) Enable SELECTIVE Real Gecko outbound via local WARP SOCKS5"
@@ -1756,6 +1778,7 @@ while true; do
   echo -e "4)  \e[92mApply Optimize 10 + 12 (Network + System Limits)\e[0m"
   echo -e "5)  \e[96mGECKO App Relay Tunnel Menu (replaces old tunnel)\e[0m"
   echo -e "6)  \e[96mHysteria2 Gecko Port Hop Menu (Kharej only)\e[0m"
+  echo -e "7)  \e[93mGECKO WARP Proxy Outbound Menu\e[0m"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -1789,6 +1812,10 @@ while true; do
   6)
     clear
     hysteria2_gecko_porthop_menu
+    ;;
+  7)
+    clear
+    gecko_warp_proxy_menu
     ;;
   0)
     clear
