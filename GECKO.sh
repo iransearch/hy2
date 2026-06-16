@@ -488,6 +488,38 @@ EOF
 }
 
 
+
+
+uninstall_hysteria2_gecko_v292() {
+  clear
+  echo "======================================================="
+  echo " Uninstall Hysteria2 v2.9.2 + Gecko"
+  echo "======================================================="
+  echo "This will remove:"
+  echo "  - hysteria2-gecko.service"
+  echo "  - /usr/local/bin/hysteria"
+  echo "  - /etc/hysteria2/ (config, certs, links)"
+  echo "  - WARP routes file if present"
+  echo "======================================================="
+  read -rp "Are you sure? [y/N]: " CONFIRM_UNINSTALL
+  case "$CONFIRM_UNINSTALL" in
+    y|Y|yes|YES|Yes) ;;
+    *) echo "Cancelled."; return 0 ;;
+  esac
+
+  systemctl disable --now hysteria2-gecko.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/hysteria2-gecko.service
+  rm -f /etc/systemd/system/hysteria2-gecko.service.d/override.conf
+  rmdir /etc/systemd/system/hysteria2-gecko.service.d 2>/dev/null || true
+  rm -f /usr/local/bin/hysteria
+  rm -rf /etc/hysteria2
+  systemctl daemon-reload
+
+  echo
+  echo "Hysteria2 Gecko removed."
+  echo "======================================================="
+}
+
 detect_hysteria_arch_global() {
   case "$(uname -m)" in
     x86_64|amd64) echo "amd64" ;;
@@ -912,34 +944,16 @@ uninstall_gecko_relay_services() {
 # =======================================================
 
 GECKO_WARP_DEFAULT_PORT="40000"
+GECKO_WARP_REAL_CONFIG="/etc/hysteria2-gecko-app-relay/real-gecko/server.yaml"
+GECKO_WARP_REAL_SERVICE="hysteria2-gecko-real.service"
 GECKO_WARP_ROUTES_FILE="/etc/hysteria2-gecko-app-relay/warp-routes.txt"
 
-# Auto-detect which Gecko config/service is installed
-gecko_warp_detect_config_and_service() {
-  if [ -f "/etc/hysteria2-gecko-app-relay/real-gecko/server.yaml" ]; then
-    GECKO_WARP_REAL_CONFIG="/etc/hysteria2-gecko-app-relay/real-gecko/server.yaml"
-    GECKO_WARP_REAL_SERVICE="hysteria2-gecko-real.service"
-  elif [ -f "/etc/hysteria2/server.yaml" ]; then
-    GECKO_WARP_REAL_CONFIG="/etc/hysteria2/server.yaml"
-    GECKO_WARP_REAL_SERVICE="hysteria2-gecko.service"
-    GECKO_WARP_ROUTES_FILE="/etc/hysteria2/warp-routes.txt"
-  else
-    GECKO_WARP_REAL_CONFIG=""
-    GECKO_WARP_REAL_SERVICE=""
-  fi
-}
-
 gecko_warp_require_kharej_config() {
-  gecko_warp_detect_config_and_service
-  [ -n "$GECKO_WARP_REAL_CONFIG" ] && [ -f "$GECKO_WARP_REAL_CONFIG" ] || {
-    echo "No Gecko config found. Expected one of:"
-    echo "  /etc/hysteria2-gecko-app-relay/real-gecko/server.yaml  (App Relay mode)"
-    echo "  /etc/hysteria2/server.yaml                              (Standalone Gecko)"
-    echo "Install Hysteria2 Gecko first (menu option 3 or 5)."
+  [ -f "$GECKO_WARP_REAL_CONFIG" ] || {
+    echo "Real Gecko config not found: $GECKO_WARP_REAL_CONFIG"
+    echo "Install GECKO App Relay Exit on Kharej first."
     return 1
   }
-  echo "Using config : $GECKO_WARP_REAL_CONFIG"
-  echo "Using service: $GECKO_WARP_REAL_SERVICE"
 }
 
 gecko_warp_detect_proxy_port() {
@@ -989,21 +1003,17 @@ INNERPY
 }
 
 write_default_gecko_warp_routes() {
-  gecko_warp_detect_config_and_service
   mkdir -p "$(dirname "$GECKO_WARP_ROUTES_FILE")"
   cat > "$GECKO_WARP_ROUTES_FILE" <<'EOF'
+geosite:google
+geosite:apple
+geosite:openai
 suffix:google.com
 suffix:gstatic.com
 suffix:googleapis.com
-suffix:googleusercontent.com
-suffix:google-analytics.com
-suffix:generativelanguage.googleapis.com
-suffix:ai.google.dev
 suffix:apple.com
 suffix:icloud.com
 suffix:cdn-apple.com
-suffix:openai.com
-suffix:chatgpt.com
 suffix:showip.net
 *.showip.net
 showip.net
@@ -1032,6 +1042,7 @@ enable_gecko_real_outbound_via_warp() {
   echo "======================================================="
   echo "Only selected domains/rules will use WARP. SNI/Host sniffing will be enabled for domain matching."
   echo "Everything else will use DIRECT outbound."
+  echo "Iran<->Kharej outer relay routing will NOT be changed."
   echo "======================================================="
   [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
   gecko_warp_require_kharej_config || return 1
@@ -1142,9 +1153,8 @@ disable_gecko_real_outbound_via_warp() {
 show_gecko_warp_status() {
   clear
   echo "======================================================="
-  echo " GECKO WARP Proxy Status"
+  echo " GECKO WARP Proxy Status - Kharej only"
   echo "======================================================="
-  gecko_warp_detect_config_and_service
   echo
   echo "[Real Gecko config]"
   if [ -f "$GECKO_WARP_REAL_CONFIG" ]; then
@@ -1223,11 +1233,10 @@ gecko_warp_proxy_menu() {
   while true; do
     clear
     echo "======================================================="
-    echo " GECKO WARP Proxy Outbound Menu"
+    echo " GECKO WARP Proxy Outbound Menu - Kharej only"
     echo "======================================================="
-    echo "Purpose: Client -> Gecko Server -> WARP Proxy -> Internet"
-    echo "Works with both Standalone Gecko (menu 3) and App Relay mode (menu 5)."
-    echo "Auto-detects your installed config and service."
+    echo "Purpose: Client -> Iran -> Kharej Real Gecko -> WARP Proxy -> Internet"
+    echo "This does NOT change server default route and does NOT touch Iran<->Kharej outer relay."
     echo
     echo " 1) Install Cloudflare WARP Proxy using fscarmen script"
     echo " 2) Enable SELECTIVE Real Gecko outbound via local WARP SOCKS5"
@@ -1779,7 +1788,6 @@ while true; do
   echo -e "4)  \e[92mApply Optimize 10 + 12 (Network + System Limits)\e[0m"
   echo -e "5)  \e[96mGECKO App Relay Tunnel Menu (replaces old tunnel)\e[0m"
   echo -e "6)  \e[96mHysteria2 Gecko Port Hop Menu (Kharej only)\e[0m"
-  echo -e "7)  \e[93mGECKO WARP Proxy Outbound Menu\e[0m"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -1798,7 +1806,23 @@ while true; do
     ;;
   3)
     clear
-    install_hysteria2_gecko_v292
+    if [ -f /etc/systemd/system/hysteria2-gecko.service ] || [ -f /etc/hysteria2/server.yaml ]; then
+      echo "======================================================="
+      echo " Hysteria2 Gecko is already installed."
+      echo "======================================================="
+      echo " 1) Reinstall (overwrite)"
+      echo " 2) Uninstall"
+      echo " 0) Cancel"
+      echo "======================================================="
+      read -rp "Choose: " HY2_MANAGE_CHOICE
+      case "$HY2_MANAGE_CHOICE" in
+        1) install_hysteria2_gecko_v292 ;;
+        2) uninstall_hysteria2_gecko_v292 ;;
+        *) echo "Cancelled." ;;
+      esac
+    else
+      install_hysteria2_gecko_v292
+    fi
     read -rp "Press Enter to return to menu..."
     ;;
   4)
@@ -1813,10 +1837,6 @@ while true; do
   6)
     clear
     hysteria2_gecko_porthop_menu
-    ;;
-  7)
-    clear
-    gecko_warp_proxy_menu
     ;;
   0)
     clear
