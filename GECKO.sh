@@ -1805,8 +1805,8 @@ while true; do
     legacy
     ;;
   3)
-    clear
     if [ -f /etc/systemd/system/hysteria2-gecko.service ] || [ -f /etc/hysteria2/server.yaml ]; then
+      clear
       echo "======================================================="
       echo " Hysteria2 Gecko is already installed."
       echo "======================================================="
@@ -1816,11 +1816,12 @@ while true; do
       echo "======================================================="
       read -rp "Choose: " HY2_MANAGE_CHOICE
       case "$HY2_MANAGE_CHOICE" in
-        1) install_hysteria2_gecko_v292 ;;
-        2) uninstall_hysteria2_gecko_v292 ;;
+        1) clear; install_hysteria2_gecko_v292 ;;
+        2) clear; uninstall_hysteria2_gecko_v292 ;;
         *) echo "Cancelled." ;;
       esac
     else
+      clear
       install_hysteria2_gecko_v292
     fi
     read -rp "Press Enter to return to menu..."
