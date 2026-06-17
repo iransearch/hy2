@@ -597,6 +597,20 @@ json_get_hy2_global() {
   python3 -c 'import sys,json; print(json.loads(sys.stdin.read()).get(sys.argv[1], ""))' "$1"
 }
 
+validate_port_or_range_hy2_global() {
+  VALUE="$1"
+  if [[ "$VALUE" =~ ^[0-9]+$ ]]; then [ "$VALUE" -ge 1 ] && [ "$VALUE" -le 65535 ] && return 0; fi
+  if [[ "$VALUE" =~ ^([0-9]+)-([0-9]+)$ ]]; then A="${BASH_REMATCH[1]}"; B="${BASH_REMATCH[2]}"; [ "$A" -ge 1 ] && [ "$B" -le 65535 ] && [ "$A" -lt "$B" ] && return 0; fi
+  return 1
+}
+
+open_udp_firewall_hy2_global() {
+  P="$1"
+  if command -v ufw >/dev/null 2>&1; then
+    if [[ "$P" =~ ^([0-9]+)-([0-9]+)$ ]]; then ufw allow "${BASH_REMATCH[1]}:${BASH_REMATCH[2]}/udp" >/dev/null 2>&1 || true; else ufw allow "$P/udp" >/dev/null 2>&1 || true; fi
+  fi
+}
+
 # =======================================================
 # Hysteria2 Gecko Port Tunnel - one dedicated port per channel
 # Each tunnel = one Hysteria2 server on Kharej + one Hysteria2
