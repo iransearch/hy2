@@ -613,6 +613,682 @@ open_udp_firewall_hy2_global() {
 
 
 # =======================================================
+# GECKO Relay Tunnel
+# Hysteria2 + Gecko obfs tunnel between two servers.
+# Kharej (exit) = server side.  Iran (entry) = client side.
+# Each tunnel lives in: /etc/hysteria2-gtunnels/<name>/
+# Service per instance: hysteria2-gtunnel@<name>.service
+# =======================================================
+
+GTUN_DIR="/etc/hysteria2-gtunnels"
+GTUN_SVC_TEMPLATE="/etc/systemd/system/hysteria2-gtunnel@.service"
+GTUN_BIN="/usr/local/bin/hysteria"
+GTUN_TLS_DIR="/etc/hysteria2-gtunnels/tls"
+GECKO_MIN_PKT=512
+GECKO_MAX_PKT=1200
+
+# ---- helpers ----
+
+gtun_slug() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
+
+gtun_idir() { printf '%s/%s' "$GTUN_DIR" "$1"; }
+
+gtun_meta_set() { mkdir -p "$(gtun_idir "$1")"; echo "$3" > "$(gtun_idir "$1")/$2.meta"; }
+gtun_meta_get() { local f="$(gtun_idir "$1")/$2.meta"; [ -f "$f" ] && cat "$f" || echo ""; }
+
+gtun_instances() {
+  [ -d "$GTUN_DIR" ] || return 0
+  find "$GTUN_DIR" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null \
+    | grep -v '^tls$' | sort
+}
+
+gtun_svc() { printf 'hysteria2-gtunnel@%s.service' "$1"; }
+
+gtun_svc_state() {
+  systemctl is-active "$(gtun_svc "$1")" 2>/dev/null || echo "inactive"
+}
+
+gtun_yaml_quote() {
+  python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$1"
+}
+
+gtun_urlencode() {
+  python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+gtun_ensure_binary() {
+  if [ -x "$GTUN_BIN" ]; then return 0; fi
+  echo "Hysteria binary not found at $GTUN_BIN. Installing..."
+  local arch
+  case "$(uname -m)" in
+    x86_64|amd64)   arch="amd64" ;;
+    aarch64|arm64)  arch="arm64" ;;
+    armv7l|armv7)   arch="armv7" ;;
+    i386|i686)      arch="386"   ;;
+    *) echo "Unsupported architecture."; return 1 ;;
+  esac
+  command -v curl >/dev/null 2>&1 || { apt-get update -y && apt-get install -y curl; }
+  local url="https://github.com/apernet/hysteria/releases/download/app%2Fv2.9.2/hysteria-linux-${arch}"
+  local tmp; tmp="$(mktemp /tmp/hysteria-gtun.XXXXXX)"
+  if ! curl -fL --retry 3 --retry-delay 2 -o "$tmp" "$url"; then
+    rm -f "$tmp"; echo "Download failed."; return 1
+  fi
+  install -m 0755 "$tmp" "$GTUN_BIN.new"
+  mv -f "$GTUN_BIN.new" "$GTUN_BIN"
+  rm -f "$tmp"
+  echo "Hysteria installed."
+}
+
+gtun_gen_tls() {
+  local sni="$1"
+  mkdir -p "$GTUN_TLS_DIR"
+  if [ -f "$GTUN_TLS_DIR/cert.crt" ] && [ -f "$GTUN_TLS_DIR/cert.key" ]; then return 0; fi
+  command -v openssl >/dev/null 2>&1 || { apt-get update -y && apt-get install -y openssl; }
+  openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+    -keyout "$GTUN_TLS_DIR/cert.key" \
+    -out    "$GTUN_TLS_DIR/cert.crt" \
+    -subj   "/CN=${sni:-www.google.com}" \
+    -days 3650 >/dev/null 2>&1
+  chmod 600 "$GTUN_TLS_DIR/cert.key"
+}
+
+gtun_install_template() {
+  [ -f "$GTUN_SVC_TEMPLATE" ] && return 0
+  cat > "$GTUN_SVC_TEMPLATE" <<EOF
+[Unit]
+Description=GECKO Relay Tunnel (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /etc/hysteria2-gtunnels/%i/run.sh
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+gtun_write_run_script() {
+  local name="$1" role="$2" dir
+  dir="$(gtun_idir "$name")"
+  cat > "$dir/run.sh" <<EOF
+#!/bin/bash
+exec $GTUN_BIN $([ "$role" = "exit" ] && echo "server" || echo "client") -c "$dir/config.yaml"
+EOF
+  chmod +x "$dir/run.sh"
+}
+
+gtun_start() {
+  local name="$1"
+  systemctl daemon-reload
+  systemctl enable "$(gtun_svc "$name")" >/dev/null 2>&1
+  systemctl restart "$(gtun_svc "$name")"
+  sleep 2
+  if systemctl is-active --quiet "$(gtun_svc "$name")"; then
+    echo "Tunnel '$name' is ACTIVE."
+    return 0
+  else
+    echo "Tunnel '$name' failed to start. Recent log:"
+    journalctl -u "$(gtun_svc "$name")" -n 15 --no-pager
+    return 1
+  fi
+}
+
+# ---- Kharej (exit/server) ----
+
+gtun_write_exit_config() {
+  local name="$1" dir; dir="$(gtun_idir "$name")"
+  local port auth obfs sni up down
+  port="$(gtun_meta_get "$name" PORT)"
+  auth="$(gtun_meta_get "$name" AUTH)"
+  obfs="$(gtun_meta_get "$name" OBFS)"
+  sni="$(gtun_meta_get "$name"  SNI)";  sni="${sni:-www.google.com}"
+  up="$(gtun_meta_get "$name"   UP)";   up="${up:-100}"
+  down="$(gtun_meta_get "$name" DOWN)"; down="${down:-100}"
+
+  local AUTH_Y OBFS_Y
+  AUTH_Y="$(gtun_yaml_quote "$auth")"
+  OBFS_Y="$(gtun_yaml_quote "$obfs")"
+
+  cat > "$dir/config.yaml" <<EOF
+listen: :${port}
+
+tls:
+  cert: ${GTUN_TLS_DIR}/cert.crt
+  key:  ${GTUN_TLS_DIR}/cert.key
+  sniGuard: disable
+
+auth:
+  type: password
+  password: ${AUTH_Y}
+
+obfs:
+  type: gecko
+  gecko:
+    password: ${OBFS_Y}
+    minPacketSize: ${GECKO_MIN_PKT}
+    maxPacketSize: ${GECKO_MAX_PKT}
+
+bandwidth:
+  up:   ${up} mbps
+  down: ${down} mbps
+
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 60s
+  keepAlivePeriod: 10s
+  maxIncomingStreams: 1024
+  disablePathMTUDiscovery: false
+EOF
+}
+
+gtun_write_entry_config() {
+  local name="$1" dir; dir="$(gtun_idir "$name")"
+  local server_ip port ports auth obfs up down hop_interval
+  server_ip="$(gtun_meta_get "$name" REMOTE_IP)"
+  port="$(gtun_meta_get "$name"      PORT)"
+  ports="$(gtun_meta_get "$name"     PORTS)"
+  auth="$(gtun_meta_get "$name"      AUTH)"
+  obfs="$(gtun_meta_get "$name"      OBFS)"
+  up="$(gtun_meta_get "$name"        UP)";  up="${up:-100}"
+  down="$(gtun_meta_get "$name"      DOWN)"; down="${down:-100}"
+  hop_interval="$(gtun_meta_get "$name" HOP_INTERVAL)"; hop_interval="${hop_interval:-30s}"
+
+  local AUTH_Y OBFS_Y
+  AUTH_Y="$(gtun_yaml_quote "$auth")"
+  OBFS_Y="$(gtun_yaml_quote "$obfs")"
+
+  {
+    echo "server: ${server_ip}:${port}"
+    echo ""
+    echo "auth: ${AUTH_Y}"
+    echo ""
+    echo "tls:"
+    echo "  insecure: true"
+    echo ""
+    echo "obfs:"
+    echo "  type: gecko"
+    echo "  gecko:"
+    echo "    password: ${OBFS_Y}"
+    echo "    minPacketSize: ${GECKO_MIN_PKT}"
+    echo "    maxPacketSize: ${GECKO_MAX_PKT}"
+    echo ""
+    echo "bandwidth:"
+    echo "  up:   ${up} mbps"
+    echo "  down: ${down} mbps"
+    echo ""
+    echo "fastOpen: true"
+    echo ""
+    echo "quic:"
+    echo "  initStreamReceiveWindow: 8388608"
+    echo "  maxStreamReceiveWindow: 8388608"
+    echo "  initConnReceiveWindow: 20971520"
+    echo "  maxConnReceiveWindow: 20971520"
+    echo "  maxIdleTimeout: 60s"
+    echo "  keepAlivePeriod: 10s"
+    echo "  maxIncomingStreams: 1024"
+    echo "  disablePathMTUDiscovery: false"
+    if [[ "$port" == *-* ]]; then
+      echo ""
+      echo "transport:"
+      echo "  type: udp"
+      echo "  udp:"
+      echo "    hopInterval: ${hop_interval}"
+    fi
+    echo ""
+    echo "tcpForwarding:"
+    local p
+    IFS=',' read -ra parr <<< "$ports"
+    for p in "${parr[@]}"; do
+      p="$(echo "$p" | tr -d ' ')"
+      [ -n "$p" ] || continue
+      echo "  - listen: :${p}"
+      echo "    remote: 127.0.0.1:${p}"
+    done
+    echo ""
+    echo "udpForwarding:"
+    for p in "${parr[@]}"; do
+      p="$(echo "$p" | tr -d ' ')"
+      [ -n "$p" ] || continue
+      echo "  - listen: :${p}"
+      echo "    remote: 127.0.0.1:${p}"
+      echo "    timeout: 60s"
+    done
+  } > "$dir/config.yaml"
+}
+
+gtun_make_link() {
+  local name="$1"
+  local server_ip port auth obfs sni remark
+  server_ip="$(gtun_meta_get "$name" SERVER_IP)"
+  port="$(gtun_meta_get "$name"      PORT)"
+  auth="$(gtun_meta_get "$name"      AUTH)"
+  obfs="$(gtun_meta_get "$name"      OBFS)"
+  sni="$(gtun_meta_get "$name"       SNI)";    sni="${sni:-www.google.com}"
+  remark="$(gtun_meta_get "$name"    REMARK)"; remark="${remark:-GECKO-RELAY-$name}"
+
+  local EA EO ES ER
+  EA="$(gtun_urlencode "$auth")"
+  EO="$(gtun_urlencode "$obfs")"
+  ES="$(gtun_urlencode "$sni")"
+  ER="$(gtun_urlencode "$remark")"
+
+  # Port hopping: use mport= for ranges
+  local port_param
+  if [[ "$port" == *-* ]]; then
+    port_param="mport=${port}"
+    port="${port%%-*}"  # main port for the URI host
+  else
+    port_param=""
+  fi
+
+  local link="hy2://${EA}@${server_ip}:${port}?sni=${ES}&insecure=1&Insecure=1&obfs=gecko&obfs-password=${EO}"
+  [ -n "$port_param" ] && link="${link}&${port_param}"
+  link="${link}#${ER}"
+  echo "$link"
+}
+
+# ---- Setup: Kharej ----
+
+gtun_setup_kharej() {
+  clear
+  echo "======================================================="
+  echo " GECKO Relay Tunnel — Kharej (Exit) Setup"
+  echo "======================================================="
+  echo "This server will be the EXIT node."
+  echo "Run setup on Iran (entry) after this completes."
+  echo "======================================================="
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
+
+  gtun_ensure_binary   || return 1
+  gtun_install_template
+
+  local raw name
+  read -rp "Tunnel name [gtun1]: " raw
+  raw="${raw:-gtun1}"
+  name="$(gtun_slug "$raw")"
+  if [ -z "$name" ]; then echo "Invalid name."; return 1; fi
+  if [ -d "$(gtun_idir "$name")" ]; then
+    echo "Tunnel '$name' already exists. Delete it first."
+    return 1
+  fi
+  mkdir -p "$(gtun_idir "$name")"
+  gtun_meta_set "$name" ROLE "exit"
+
+  local DEFAULT_AUTH DEFAULT_OBFS
+  DEFAULT_AUTH="$(openssl rand -hex 16 2>/dev/null || cat /proc/sys/kernel/random/uuid | tr -d '-')"
+  DEFAULT_OBFS="$(openssl rand -base64 18 2>/dev/null | tr -d '=+/' || cat /proc/sys/kernel/random/uuid)"
+
+  local AUTH OBFS SNI REMARK PORT UP DOWN
+  read -rp "Auth password [$DEFAULT_AUTH]: " AUTH;   AUTH="${AUTH:-$DEFAULT_AUTH}"
+  read -rp "Gecko obfs password [$DEFAULT_OBFS]: " OBFS; OBFS="${OBFS:-$DEFAULT_OBFS}"
+  read -rp "SNI / certificate CN [www.google.com]: " SNI; SNI="${SNI:-www.google.com}"
+  read -rp "Link port (or range e.g. 8000-9000 for hopping) [443]: " PORT; PORT="${PORT:-443}"
+  if ! validate_port_or_range_hy2_global "$PORT" 2>/dev/null; then
+    if [[ ! "$PORT" =~ ^[0-9]+-[0-9]+$ ]] && ! [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge 1 && "$PORT" -le 65535 ]]; then
+      echo "Invalid port or range."; rm -rf "$(gtun_idir "$name")"; return 1
+    fi
+  fi
+  read -rp "Remark [GECKO-RELAY-${name}]: " REMARK; REMARK="${REMARK:-GECKO-RELAY-${name}}"
+  read -rp "Upload mbps [100]: " UP;   UP="${UP:-100}"
+  read -rp "Download mbps [100]: " DOWN; DOWN="${DOWN:-100}"
+
+  gtun_meta_set "$name" AUTH    "$AUTH"
+  gtun_meta_set "$name" OBFS    "$OBFS"
+  gtun_meta_set "$name" SNI     "$SNI"
+  gtun_meta_set "$name" PORT    "$PORT"
+  gtun_meta_set "$name" REMARK  "$REMARK"
+  gtun_meta_set "$name" UP      "$UP"
+  gtun_meta_set "$name" DOWN    "$DOWN"
+
+  gtun_gen_tls "$SNI"
+  gtun_write_exit_config "$name"
+  gtun_write_run_script  "$name" "exit"
+
+  # Firewall
+  local main_port="${PORT%%-*}"
+  command -v ufw >/dev/null 2>&1 && ufw allow "${main_port}/udp" >/dev/null 2>&1 || true
+  if [[ "$PORT" == *-* ]]; then
+    local p2="${PORT##*-}"
+    command -v ufw >/dev/null 2>&1 && ufw allow "${main_port}:${p2}/udp" >/dev/null 2>&1 || true
+  fi
+
+  gtun_start "$name" || { rm -rf "$(gtun_idir "$name")"; return 1; }
+
+  # Save public IP for link generation
+  local SERVER_IP
+  SERVER_IP="$(curl -4fsSL --max-time 6 https://api.ipify.org 2>/dev/null \
+             || curl -4fsSL --max-time 6 https://ifconfig.me 2>/dev/null \
+             || hostname -I | awk '{print $1}')"
+  gtun_meta_set "$name" SERVER_IP "$SERVER_IP"
+
+  local link; link="$(gtun_make_link "$name")"
+  echo "$link" > "$(gtun_idir "$name")/link.txt"
+
+  echo
+  echo "======================================================="
+  echo " GECKO Relay Tunnel '$name' is LIVE on Kharej."
+  echo "======================================================="
+  echo " Link port : $PORT"
+  echo " Auth      : $AUTH"
+  echo " Obfs      : $OBFS"
+  echo "-------------------------------------------------------"
+  echo " Share link (add to Iran entry):"
+  echo ""
+  echo " $link"
+  echo ""
+  echo " Link saved: $(gtun_idir "$name")/link.txt"
+  echo "======================================================="
+  echo
+  echo "Next: run this script on the IRAN server, choose"
+  echo "'GECKO Relay Tunnel Menu' -> 'Iran: Connect from link',"
+  echo "and paste the link above."
+}
+
+# ---- Setup: Iran (entry from link) ----
+
+gtun_setup_iran() {
+  clear
+  echo "======================================================="
+  echo " GECKO Relay Tunnel — Iran (Entry) Setup"
+  echo "======================================================="
+  echo "This server will be the ENTRY node."
+  echo "You need the hy2://... link from the Kharej setup."
+  echo "======================================================="
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
+
+  gtun_ensure_binary   || return 1
+  gtun_install_template
+
+  local raw name
+  read -rp "Tunnel name [gtun1]: " raw
+  raw="${raw:-gtun1}"
+  name="$(gtun_slug "$raw")"
+  if [ -z "$name" ]; then echo "Invalid name."; return 1; fi
+  if [ -d "$(gtun_idir "$name")" ]; then
+    echo "Tunnel '$name' already exists. Delete it first."
+    return 1
+  fi
+  mkdir -p "$(gtun_idir "$name")"
+  gtun_meta_set "$name" ROLE "entry"
+
+  local link
+  read -rp "Paste hy2://... link from Kharej: " link
+  if [[ ! "$link" =~ ^hy2:// ]]; then
+    echo "Invalid link — must start with hy2://"; rm -rf "$(gtun_idir "$name")"; return 1
+  fi
+
+  # Parse link: hy2://AUTH@IP:PORT?sni=...&obfs=gecko&obfs-password=...
+  local userinfo hostpart query
+  userinfo="${link#hy2://}";    userinfo="${userinfo%%@*}"
+  hostpart="${link#*@}";        hostpart="${hostpart%%\?*}"
+  query="${link#*\?}";          query="${query%%#*}"
+
+  local server_ip link_port auth obfs sni mport
+  auth="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "$userinfo")"
+  server_ip="${hostpart%%:*}"
+  link_port="${hostpart##*:}"
+
+  # Extract from query string
+  sni="$(echo "$query"   | tr '&' '\n' | grep '^sni='          | head -1 | cut -d= -f2-)"
+  obfs="$(echo "$query"  | tr '&' '\n' | grep '^obfs-password=' | head -1 | cut -d= -f2-)"
+  mport="$(echo "$query" | tr '&' '\n' | grep '^mport='         | head -1 | cut -d= -f2-)"
+  sni="$(python3   -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "${sni:-www.google.com}")"
+  obfs="$(python3  -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "${obfs:-}")"
+
+  local effective_port
+  effective_port="${mport:-$link_port}"
+
+  local ports UP DOWN
+  echo "Ports to forward from this server (comma-separated, e.g. 443,8080,2087):"
+  read -rp "Ports: " ports
+  [ -n "$ports" ] || { echo "At least one port required."; rm -rf "$(gtun_idir "$name")"; return 1; }
+  read -rp "Upload mbps [100]: "   UP;   UP="${UP:-100}"
+  read -rp "Download mbps [100]: " DOWN; DOWN="${DOWN:-100}"
+  if [[ "$effective_port" == *-* ]]; then
+    local hi; read -rp "Port hop interval [30s]: " hi
+    gtun_meta_set "$name" HOP_INTERVAL "${hi:-30s}"
+  fi
+
+  gtun_meta_set "$name" REMOTE_IP "$server_ip"
+  gtun_meta_set "$name" PORT      "$effective_port"
+  gtun_meta_set "$name" AUTH      "$auth"
+  gtun_meta_set "$name" OBFS      "$obfs"
+  gtun_meta_set "$name" SNI       "$sni"
+  gtun_meta_set "$name" PORTS     "$ports"
+  gtun_meta_set "$name" UP        "$UP"
+  gtun_meta_set "$name" DOWN      "$DOWN"
+
+  gtun_write_entry_config "$name"
+  gtun_write_run_script   "$name" "entry"
+
+  # Open user ports in firewall
+  local p
+  IFS=',' read -ra parr <<< "$ports"
+  for p in "${parr[@]}"; do
+    p="$(echo "$p" | tr -d ' ')"
+    [ -n "$p" ] || continue
+    command -v ufw >/dev/null 2>&1 && ufw allow "${p}/udp" >/dev/null 2>&1 || true
+    command -v ufw >/dev/null 2>&1 && ufw allow "${p}/tcp" >/dev/null 2>&1 || true
+  done
+
+  gtun_start "$name" || { rm -rf "$(gtun_idir "$name")"; return 1; }
+
+  echo
+  echo "======================================================="
+  echo " GECKO Relay Tunnel '$name' is LIVE on Iran."
+  echo "======================================================="
+  echo " Exit (Kharej)  : ${server_ip}:${effective_port}"
+  echo " Forwarded ports: ${ports}"
+  echo "======================================================="
+  echo "Point your clients at THIS server's IP on those ports."
+}
+
+# ---- List / Status / Delete / Restart ----
+
+gtun_list() {
+  clear
+  echo "======================================================="
+  echo " GECKO Relay Tunnels"
+  echo "======================================================="
+  local any=0
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    any=1
+    local role state remote ports
+    role="$(gtun_meta_get "$name" ROLE)"
+    state="$(gtun_svc_state "$name")"
+    remote="$(gtun_meta_get "$name" REMOTE_IP)"
+    ports="$(gtun_meta_get "$name" PORTS)"
+    local port; port="$(gtun_meta_get "$name" PORT)"
+    if [ "$role" = "exit" ]; then
+      echo "  * $name  [exit]  listen :${port}  [$state]"
+    else
+      echo "  * $name  [entry] -> ${remote}:${port}  ports:${ports}  [$state]"
+    fi
+  done < <(gtun_instances)
+  [ "$any" -eq 0 ] && echo "  No GECKO relay tunnels configured."
+  echo "======================================================="
+}
+
+gtun_pick() {
+  local names=() name i=1
+  while IFS= read -r name; do [ -n "$name" ] && names+=("$name"); done < <(gtun_instances)
+  if [ "${#names[@]}" -eq 0 ]; then echo "No tunnels found."; return 1; fi
+  echo "Choose a tunnel:"
+  for name in "${names[@]}"; do
+    local role state
+    role="$(gtun_meta_get "$name" ROLE)"
+    state="$(gtun_svc_state "$name")"
+    echo "  $i) $name  [$role] [$state]"
+    i=$((i+1))
+  done
+  local pick
+  read -rp "Number: " pick
+  if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#names[@]}" ]; then
+    echo "Invalid choice."; return 1
+  fi
+  GTUN_PICKED="${names[$((pick-1))]}"
+}
+
+gtun_show_status() {
+  clear
+  echo "======================================================="
+  echo " GECKO Relay Tunnel — Status"
+  echo "======================================================="
+  gtun_pick || return 1
+  local name="$GTUN_PICKED"
+  echo
+  systemctl status "$(gtun_svc "$name")" --no-pager | head -18
+  echo
+  echo "--- Last 20 log lines ---"
+  journalctl -u "$(gtun_svc "$name")" -n 20 --no-pager
+  echo
+  # Show link if exit
+  if [ "$(gtun_meta_get "$name" ROLE)" = "exit" ]; then
+    local lf="$(gtun_idir "$name")/link.txt"
+    if [ -f "$lf" ]; then
+      echo "--- Share link ---"
+      cat "$lf"
+      echo
+    fi
+  fi
+}
+
+gtun_restart_one() {
+  clear
+  echo "======================================================="
+  echo " GECKO Relay Tunnel — Restart"
+  echo "======================================================="
+  gtun_pick || return 1
+  gtun_start "$GTUN_PICKED"
+}
+
+gtun_restart_all() {
+  clear
+  echo "======================================================="
+  echo " GECKO Relay Tunnel — Restart ALL"
+  echo "======================================================="
+  local name any=0
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    any=1
+    systemctl restart "$(gtun_svc "$name")" 2>/dev/null && echo "Restarted: $name" || echo "Failed: $name"
+  done < <(gtun_instances)
+  [ "$any" -eq 0 ] && echo "No tunnels to restart."
+}
+
+gtun_show_link() {
+  clear
+  echo "======================================================="
+  echo " GECKO Relay Tunnel — Show Link"
+  echo "======================================================="
+  gtun_pick || return 1
+  local name="$GTUN_PICKED"
+  if [ "$(gtun_meta_get "$name" ROLE)" != "exit" ]; then
+    echo "Link is only available on EXIT (Kharej) tunnels."; return 1
+  fi
+  # Regenerate fresh (IP might have changed)
+  local SERVER_IP
+  SERVER_IP="$(curl -4fsSL --max-time 6 https://api.ipify.org 2>/dev/null \
+             || curl -4fsSL --max-time 6 https://ifconfig.me 2>/dev/null \
+             || hostname -I | awk '{print $1}')"
+  gtun_meta_set "$name" SERVER_IP "$SERVER_IP"
+  local link; link="$(gtun_make_link "$name")"
+  echo "$link" > "$(gtun_idir "$name")/link.txt"
+  echo
+  echo "$link"
+  echo
+  echo "(Saved to: $(gtun_idir "$name")/link.txt)"
+}
+
+gtun_delete_one() {
+  clear
+  echo "======================================================="
+  echo " GECKO Relay Tunnel — Delete"
+  echo "======================================================="
+  gtun_pick || return 1
+  local name="$GTUN_PICKED"
+  read -rp "Delete tunnel '$name'? [y/N]: " c
+  case "$c" in y|Y|yes|YES|Yes) ;; *) echo "Cancelled."; return 0 ;; esac
+  systemctl disable --now "$(gtun_svc "$name")" >/dev/null 2>&1 || true
+  rm -rf "$(gtun_idir "$name")"
+  systemctl daemon-reload
+  echo "Tunnel '$name' deleted."
+}
+
+gtun_uninstall_all() {
+  clear
+  echo "======================================================="
+  echo " GECKO Relay Tunnel — Uninstall ALL"
+  echo "======================================================="
+  local names=() name
+  while IFS= read -r name; do [ -n "$name" ] && names+=("$name"); done < <(gtun_instances)
+  if [ "${#names[@]}" -eq 0 ]; then echo "No tunnels to remove."; return 0; fi
+  read -rp "Remove ALL GECKO relay tunnels? [y/N]: " c
+  case "$c" in y|Y|yes|YES|Yes) ;; *) echo "Cancelled."; return 0 ;; esac
+  for name in "${names[@]}"; do
+    systemctl disable --now "$(gtun_svc "$name")" >/dev/null 2>&1 || true
+    rm -rf "$(gtun_idir "$name")"
+    echo "Removed: $name"
+  done
+  rm -f "$GTUN_SVC_TEMPLATE"
+  rm -rf "$GTUN_TLS_DIR"
+  systemctl daemon-reload
+  echo "All GECKO relay tunnels removed."
+}
+
+# ---- Main menu for this section ----
+
+gecko_relay_tunnel_menu() {
+  while true; do
+    clear
+    echo "======================================================="
+    echo " GECKO Relay Tunnel Menu"
+    echo "======================================================="
+    echo " Hysteria2 + Gecko obfs tunnel: Iran <-> Kharej"
+    echo " Iran entry forwards user ports to the Kharej exit."
+    echo "======================================================="
+    echo " 1) Kharej: Install new exit tunnel + get link"
+    echo " 2) Iran:   Connect from Kharej link"
+    echo " 3) List tunnels"
+    echo " 4) Status / logs"
+    echo " 5) Show / regenerate Kharej link"
+    echo " 6) Restart one tunnel"
+    echo " 7) Restart ALL tunnels"
+    echo " 8) Delete a tunnel"
+    echo " 9) Uninstall ALL tunnels"
+    echo " 0) Back"
+    echo "======================================================="
+    read -rp "Choose: " GTUN_CHOICE
+    case "$GTUN_CHOICE" in
+      1) gtun_setup_kharej;    read -rp "Press Enter to continue..." ;;
+      2) gtun_setup_iran;      read -rp "Press Enter to continue..." ;;
+      3) gtun_list;            read -rp "Press Enter to continue..." ;;
+      4) gtun_show_status;     read -rp "Press Enter to continue..." ;;
+      5) gtun_show_link;       read -rp "Press Enter to continue..." ;;
+      6) gtun_restart_one;     read -rp "Press Enter to continue..." ;;
+      7) gtun_restart_all;     read -rp "Press Enter to continue..." ;;
+      8) gtun_delete_one;      read -rp "Press Enter to continue..." ;;
+      9) gtun_uninstall_all;   read -rp "Press Enter to continue..." ;;
+      0) return ;;
+      *) echo "Invalid choice."; sleep 1 ;;
+    esac
+  done
+}
+
+
+# =======================================================
 # GECKO WARP Proxy Outbound - Kharej only
 # Uses fscarmen/warp Cloudflare Client Proxy mode and routes
 # only Real Gecko server outbound through local SOCKS5 proxy.
@@ -1441,6 +2117,7 @@ while true; do
   echo -e "4)  \e[92mApply Optimize 10 + 12 (Network + System Limits)\e[0m"
   echo -e "5)  \e[96mHysteria2 Gecko Port Hop Menu (Kharej only)\e[0m"
   echo -e "6)  \e[93mGECKO WARP Proxy Outbound Menu\e[0m"
+  echo -e "7)  \e[96mGECKO Relay Tunnel Menu (Iran <-> Kharej)\e[0m"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -1491,6 +2168,10 @@ while true; do
   6)
     clear
     gecko_warp_proxy_menu
+    ;;
+  7)
+    clear
+    gecko_relay_tunnel_menu
     ;;
   0)
     clear
