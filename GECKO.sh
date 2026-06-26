@@ -807,10 +807,32 @@ gost_status_m() {
   echo "======================================================="
   echo " GOST Multi-Tunnel — Status / Logs"
   echo "======================================================="
-  read -rp "Tunnel name: " name
-  gost_valid_name_m "$name" || { gost_err_m "Invalid name."; return 1; }
-  local unit="${GOST_SVC_PREFIX_M}${name}"
-  [ -f "${GOST_SVC_DIR_M}/${unit}.service" ] || { gost_err_m "No such tunnel."; return 1; }
+  shopt -s nullglob
+  local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
+  shopt -u nullglob
+  if [ ${#files[@]} -eq 0 ]; then
+    gost_warn_m "No GOST tunnels found."; return 0
+  fi
+  local names=()
+  local i=1
+  echo "Choose a tunnel:"
+  for f in "${files[@]}"; do
+    local base name state
+    base="$(basename "$f")"
+    name="${base#$GOST_SVC_PREFIX_M}"; name="${name%.service}"
+    state="$(systemctl is-active "$base" 2>/dev/null)"
+    names+=("$name")
+    echo "  $i) $name  [$state]"
+    i=$((i+1))
+  done
+  echo
+  read -rp "Number: " pick
+  if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#names[@]}" ]; then
+    gost_err_m "Invalid choice."; return 1
+  fi
+  local selected="${names[$((pick-1))]}"
+  local unit="${GOST_SVC_PREFIX_M}${selected}"
+  echo
   systemctl status "$unit" --no-pager | head -15
   echo
   echo "Last 20 log lines:"
