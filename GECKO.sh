@@ -856,6 +856,37 @@ gost_uninstall_all_m() {
   case "$rb" in y|Y|yes|YES|Yes) rm -f "$GOST_BIN_M"; gost_ok_m "gost binary removed." ;; esac
 }
 
+gost_auto_clear_cache_m() {
+  clear
+  echo "======================================================="
+  echo " GOST — Auto Clear Cache"
+  echo "======================================================="
+  echo " 1) Enable Auto Clear Cache"
+  echo " 2) Disable Auto Clear Cache"
+  echo " 0) Back"
+  echo "======================================================="
+  read -rp "Choose: " acc_choice
+  case "$acc_choice" in
+    1)
+      read -rp "Interval in days (e.g. 1=daily, 7=weekly): " interval_days
+      if ! [[ "$interval_days" =~ ^[0-9]+$ ]] || [ "$interval_days" -lt 1 ]; then
+        gost_err_m "Invalid interval."; return 1
+      fi
+      local cron_interval="0 0 */${interval_days} * *"
+      (crontab -l 2>/dev/null | grep -v "drop_caches"; \
+       echo "${cron_interval} sync; echo 1 > /proc/sys/vm/drop_caches && sync; echo 2 > /proc/sys/vm/drop_caches && sync; echo 3 > /proc/sys/vm/drop_caches") \
+        | crontab -
+      gost_ok_m "Auto Clear Cache enabled (every ${interval_days} day(s))."
+      ;;
+    2)
+      crontab -l 2>/dev/null | grep -v "drop_caches" | crontab -
+      gost_ok_m "Auto Clear Cache disabled."
+      ;;
+    0) return ;;
+    *) gost_err_m "Invalid choice." ;;
+  esac
+}
+
 gost_multi_menu() {
   while true; do
     clear
@@ -872,16 +903,18 @@ gost_multi_menu() {
     echo " 4) Status / logs of a tunnel"
     echo " 5) Restart ALL tunnels"
     echo " 6) Uninstall ALL tunnels"
+    echo " 7) Auto Clear Cache"
     echo " 0) Back"
     echo "======================================================="
     read -rp "Choose: " GOST_M_CHOICE
     case "$GOST_M_CHOICE" in
-      1) gost_create_m;       read -rp "Press Enter to return to menu..." ;;
-      2) gost_list_m;         read -rp "Press Enter to return to menu..." ;;
-      3) gost_delete_m;       read -rp "Press Enter to return to menu..." ;;
-      4) gost_status_m;       read -rp "Press Enter to return to menu..." ;;
-      5) gost_restart_all_m;  read -rp "Press Enter to return to menu..." ;;
-      6) gost_uninstall_all_m; read -rp "Press Enter to return to menu..." ;;
+      1) gost_create_m;            read -rp "Press Enter to return to menu..." ;;
+      2) gost_list_m;              read -rp "Press Enter to return to menu..." ;;
+      3) gost_delete_m;            read -rp "Press Enter to return to menu..." ;;
+      4) gost_status_m;            read -rp "Press Enter to return to menu..." ;;
+      5) gost_restart_all_m;       read -rp "Press Enter to return to menu..." ;;
+      6) gost_uninstall_all_m;     read -rp "Press Enter to return to menu..." ;;
+      7) gost_auto_clear_cache_m;  read -rp "Press Enter to return to menu..." ;;
       0) return ;;
       *) echo "Invalid choice."; sleep 1 ;;
     esac
