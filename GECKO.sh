@@ -613,6 +613,283 @@ open_udp_firewall_hy2_global() {
 
 
 # =======================================================
+# GOST Multi-Tunnel Manager
+# Multiple named tunnels, each to a different destination.
+# Forwarding: this-server:PORT -> destination:PORT (same port)
+# Each tunnel = its own systemd service: gostm_<name>.service
+# Supports TCP / UDP / gRPC, IPv4 and IPv6 destinations.
+# =======================================================
+
+GOST_BIN_M="/usr/local/bin/gost"
+GOST_SVC_PREFIX_M="gostm_"
+GOST_SVC_DIR_M="/etc/systemd/system"
+
+gost_ok_m()   { echo -e "\e[32m[OK]\e[0m $1"; }
+gost_err_m()  { echo -e "\e[31m[ERR]\e[0m $1"; }
+gost_info_m() { echo -e "\e[34m[*]\e[0m $1"; }
+gost_warn_m() { echo -e "\e[33m[!]\e[0m $1"; }
+
+gost_valid_name_m() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+gost_ensure_bin_m() {
+  if [ -x "$GOST_BIN_M" ]; then return 0; fi
+  gost_warn_m "gost binary not found at $GOST_BIN_M"
+  read -rp "Install GOST v3 now? [y/N]: " c
+  case "$c" in y|Y|yes|YES|Yes) ;; *) gost_err_m "Cannot continue without gost."; return 1 ;; esac
+  command -v wget >/dev/null 2>&1 || { apt-get update -y && apt-get install -y wget tar curl; }
+  gost_info_m "Downloading GOST v3..."
+  local url="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_amd64.tar.gz"
+  wget -qO /tmp/gost.tar.gz "$url" || { gost_err_m "Download failed."; return 1; }
+  [ -s /tmp/gost.tar.gz ] || { gost_err_m "Downloaded file is empty."; return 1; }
+  tar -xzf /tmp/gost.tar.gz -C /usr/local/bin/ gost 2>/dev/null || \
+    tar -xzf /tmp/gost.tar.gz -C /usr/local/bin/
+  chmod +x "$GOST_BIN_M"
+  rm -f /tmp/gost.tar.gz
+  [ -x "$GOST_BIN_M" ] && gost_ok_m "GOST installed." || { gost_err_m "Install failed."; return 1; }
+}
+
+gost_create_m() {
+  clear
+  echo "======================================================="
+  echo " GOST Multi-Tunnel — Create New"
+  echo "======================================================="
+  echo " Forwards this-server:PORT -> destination:PORT (same port)"
+  echo "======================================================="
+  gost_ensure_bin_m || return 1
+
+  read -rp "Tunnel name (letters/numbers/-/_): " name
+  if ! gost_valid_name_m "$name"; then
+    gost_err_m "Invalid name. Use only letters, numbers, - and _"; return 1
+  fi
+  local svc="${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}${name}.service"
+  if [ -f "$svc" ]; then
+    gost_err_m "A tunnel named '$name' already exists. Delete it first or pick another name."
+    return 1
+  fi
+
+  read -rp "Destination IP (IPv4 or IPv6): " dest
+  [ -n "$dest" ] || { gost_err_m "Destination required."; return 1; }
+
+  echo "Ports: comma-separated (e.g. 8880,2052,443)"
+  read -rp "Ports: " ports
+  [ -n "$ports" ] || { gost_err_m "At least one port required."; return 1; }
+
+  echo "Protocol:  1) TCP   2) UDP   3) gRPC"
+  read -rp "Choice: " p
+  case "$p" in
+    1) proto="tcp" ;;
+    2) proto="udp" ;;
+    3) proto="grpc" ;;
+    *) gost_err_m "Invalid protocol."; return 1 ;;
+  esac
+
+  local dest_fmt="$dest"
+  [[ "$dest" == *:* ]] && dest_fmt="[$dest]"
+
+  local exec_line="ExecStart=${GOST_BIN_M}"
+  local good=0
+  IFS=',' read -ra parr <<< "$ports"
+  for raw in "${parr[@]}"; do
+    local port; port="$(echo "$raw" | tr -d ' ')"
+    [ -z "$port" ] && continue
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+      gost_err_m "Invalid port: $port"; return 1
+    fi
+    exec_line+=" -L=${proto}://:${port}/${dest_fmt}:${port}"
+    good=1
+  done
+  [ "$good" -eq 1 ] || { gost_err_m "No valid ports."; return 1; }
+
+  cat > "$svc" <<EOF
+[Unit]
+Description=GOST Multi-Tunnel ($name -> $dest)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+Environment="GOST_LOGGER_LEVEL=fatal"
+$exec_line
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "${GOST_SVC_PREFIX_M}${name}" >/dev/null 2>&1
+  systemctl restart "${GOST_SVC_PREFIX_M}${name}"
+  sleep 2
+
+  echo
+  if systemctl is-active --quiet "${GOST_SVC_PREFIX_M}${name}"; then
+    gost_ok_m "Tunnel '$name' is RUNNING."
+    echo " Forwards:"
+    for raw in "${parr[@]}"; do
+      local port; port="$(echo "$raw" | tr -d ' ')"
+      [ -n "$port" ] && echo "   this-server:$port -> $dest:$port ($proto)"
+    done
+  else
+    gost_err_m "Tunnel failed to start. Recent logs:"
+    journalctl -u "${GOST_SVC_PREFIX_M}${name}" -n 15 --no-pager
+  fi
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    echo
+    gost_warn_m "ufw is active. Allow your ports, e.g.:"
+    for raw in "${parr[@]}"; do
+      local port; port="$(echo "$raw" | tr -d ' ')"
+      [ -n "$port" ] && echo "   ufw allow $port"
+    done
+  fi
+}
+
+gost_list_m() {
+  clear
+  echo "======================================================="
+  echo " GOST Multi-Tunnel — List"
+  echo "======================================================="
+  shopt -s nullglob
+  local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
+  shopt -u nullglob
+  if [ ${#files[@]} -eq 0 ]; then
+    gost_warn_m "No GOST tunnels created yet."
+    return 0
+  fi
+  for f in "${files[@]}"; do
+    local base name state dest
+    base="$(basename "$f")"
+    name="${base#$GOST_SVC_PREFIX_M}"; name="${name%.service}"
+    state="$(systemctl is-active "$base" 2>/dev/null)"
+    dest="$(grep -oP 'Description=GOST Multi-Tunnel \(\K[^)]+' "$f")"
+    echo -e "\e[96m$name\e[0m  [$state]"
+    echo "   $dest"
+    grep -oP -- '-L=\K[^ ]+' "$f" | sed 's/^/     /'
+    echo
+  done
+}
+
+gost_delete_m() {
+  clear
+  echo "======================================================="
+  echo " GOST Multi-Tunnel — Delete"
+  echo "======================================================="
+  shopt -s nullglob
+  local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
+  shopt -u nullglob
+  if [ ${#files[@]} -eq 0 ]; then
+    gost_warn_m "No tunnels to delete."; return 0
+  fi
+  echo "Existing tunnels:"
+  for f in "${files[@]}"; do
+    local base name; base="$(basename "$f")"
+    name="${base#$GOST_SVC_PREFIX_M}"; name="${name%.service}"
+    echo "  - $name"
+  done
+  echo
+  read -rp "Name to delete: " name
+  gost_valid_name_m "$name" || { gost_err_m "Invalid name."; return 1; }
+  local svc="${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}${name}.service"
+  [ -f "$svc" ] || { gost_err_m "No tunnel named '$name'."; return 1; }
+  read -rp "Confirm delete '$name'? [y/N]: " c
+  case "$c" in y|Y|yes|YES|Yes) ;; *) echo "Cancelled."; return 0 ;; esac
+  systemctl disable --now "${GOST_SVC_PREFIX_M}${name}" >/dev/null 2>&1
+  rm -f "$svc"
+  systemctl daemon-reload
+  gost_ok_m "Tunnel '$name' deleted."
+}
+
+gost_status_m() {
+  clear
+  echo "======================================================="
+  echo " GOST Multi-Tunnel — Status / Logs"
+  echo "======================================================="
+  read -rp "Tunnel name: " name
+  gost_valid_name_m "$name" || { gost_err_m "Invalid name."; return 1; }
+  local unit="${GOST_SVC_PREFIX_M}${name}"
+  [ -f "${GOST_SVC_DIR_M}/${unit}.service" ] || { gost_err_m "No such tunnel."; return 1; }
+  systemctl status "$unit" --no-pager | head -15
+  echo
+  echo "Last 20 log lines:"
+  journalctl -u "$unit" -n 20 --no-pager
+}
+
+gost_restart_all_m() {
+  clear
+  echo "======================================================="
+  echo " GOST Multi-Tunnel — Restart ALL"
+  echo "======================================================="
+  shopt -s nullglob
+  local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
+  shopt -u nullglob
+  [ ${#files[@]} -eq 0 ] && { gost_warn_m "No GOST tunnels."; return 0; }
+  systemctl daemon-reload
+  for f in "${files[@]}"; do
+    local base; base="$(basename "$f")"
+    systemctl restart "$base"
+    gost_ok_m "Restarted $base"
+  done
+}
+
+gost_uninstall_all_m() {
+  clear
+  echo "======================================================="
+  echo " GOST Multi-Tunnel — Uninstall ALL"
+  echo "======================================================="
+  shopt -s nullglob
+  local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
+  shopt -u nullglob
+  [ ${#files[@]} -eq 0 ] && { gost_warn_m "No GOST tunnels to remove."; return 0; }
+  read -rp "Remove ALL GOST tunnels (gostm_*)? [y/N]: " c
+  case "$c" in y|Y|yes|YES|Yes) ;; *) echo "Cancelled."; return 0 ;; esac
+  for f in "${files[@]}"; do
+    local base; base="$(basename "$f")"
+    systemctl disable --now "$base" >/dev/null 2>&1
+    rm -f "$f"
+  done
+  systemctl daemon-reload
+  gost_ok_m "All GOST tunnels removed."
+  read -rp "Also remove gost binary ($GOST_BIN_M)? [y/N]: " rb
+  case "$rb" in y|Y|yes|YES|Yes) rm -f "$GOST_BIN_M"; gost_ok_m "gost binary removed." ;; esac
+}
+
+gost_multi_menu() {
+  while true; do
+    clear
+    echo "======================================================="
+    echo " GOST Multi-Tunnel Menu"
+    echo "======================================================="
+    echo " Forward this-server:PORT -> destination:PORT (same port)"
+    echo " Each tunnel is its own systemd service (gostm_<name>)"
+    echo " Supports TCP / UDP / gRPC · IPv4 and IPv6"
+    echo "======================================================="
+    echo " 1) Create tunnel"
+    echo " 2) List tunnels"
+    echo " 3) Delete tunnel"
+    echo " 4) Status / logs of a tunnel"
+    echo " 5) Restart ALL tunnels"
+    echo " 6) Uninstall ALL tunnels"
+    echo " 0) Back"
+    echo "======================================================="
+    read -rp "Choose: " GOST_M_CHOICE
+    case "$GOST_M_CHOICE" in
+      1) gost_create_m;       read -rp "Press Enter to return to menu..." ;;
+      2) gost_list_m;         read -rp "Press Enter to return to menu..." ;;
+      3) gost_delete_m;       read -rp "Press Enter to return to menu..." ;;
+      4) gost_status_m;       read -rp "Press Enter to return to menu..." ;;
+      5) gost_restart_all_m;  read -rp "Press Enter to return to menu..." ;;
+      6) gost_uninstall_all_m; read -rp "Press Enter to return to menu..." ;;
+      0) return ;;
+      *) echo "Invalid choice."; sleep 1 ;;
+    esac
+  done
+}
+
+
+# =======================================================
 # GECKO Relay Tunnel
 # Hysteria2 + Gecko obfs tunnel between two servers.
 # Kharej (exit) = server side.  Iran (entry) = client side.
@@ -2118,6 +2395,7 @@ while true; do
   echo -e "5)  \e[96mHysteria2 Gecko Port Hop Menu (Kharej only)\e[0m"
   echo -e "6)  \e[93mGECKO WARP Proxy Outbound Menu\e[0m"
   echo -e "7)  \e[96mGECKO Relay Tunnel Menu (Iran <-> Kharej)\e[0m"
+  echo -e "8)  \e[93mGOST Multi-Tunnel Menu\e[0m"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -2172,6 +2450,10 @@ while true; do
   7)
     clear
     gecko_relay_tunnel_menu
+    ;;
+  8)
+    clear
+    gost_multi_menu
     ;;
   0)
     clear
