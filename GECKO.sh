@@ -781,65 +781,50 @@ csf_pick_proto_dir() {
 
 # ---- 3) Add port ----
 
+csf_show_all_ports() {
+  # Print numbered list for one key, returns count in CSFC_COUNT_<key>
+  local key="$1" color="$2"
+  local raw port_list=()
+  raw="$(grep "^${key} = " /etc/csf/csf.conf | head -1 | sed 's/.*= "\(.*\)"/\1/')"
+  [ -n "$raw" ] && IFS=',' read -ra port_list <<< "$raw"
+  echo -e " ${color}${key}\e[0m (${#port_list[@]} ports):"
+  if [ ${#port_list[@]} -eq 0 ]; then
+    echo "   (none)"
+  else
+    local i=1
+    for p in "${port_list[@]}"; do
+      p="$(echo "$p" | tr -d ' ')"
+      [ -n "$p" ] && { printf "   %3d) %s\n" "$i" "$p"; i=$((i+1)); }
+    done
+  fi
+}
+
+csf_get_port_list() {
+  local key="$1"
+  local raw
+  raw="$(grep "^${key} = " /etc/csf/csf.conf | head -1 | sed 's/.*= "\(.*\)"/\1/')"
+  CSFC_PORT_LIST=()
+  [ -n "$raw" ] && IFS=',' read -ra CSFC_PORT_LIST <<< "$raw"
+}
+
 csf_port_mgmt_c() {
   csf_require_install || return 1
-
-  # Step 1: pick protocol
-  clear
-  echo "======================================================="
-  echo " CSF Firewall — Port Management"
-  echo "======================================================="
-  echo " Protocol:"
-  echo "   1) TCP"
-  echo "   2) UDP"
-  read -rp " Choice: " pc
-  case "$pc" in
-    1) CSFC_PROTO="tcp" ;;
-    2) CSFC_PROTO="udp" ;;
-    *) csf_err_c "Invalid protocol."; return 1 ;;
-  esac
-
-  # Step 2: pick direction
-  echo
-  echo " Direction:"
-  echo "   1) Incoming (IN)"
-  echo "   2) Outgoing (OUT)"
-  read -rp " Choice: " dc
-  case "$dc" in
-    1) CSFC_DIR="IN" ;;
-    2) CSFC_DIR="OUT" ;;
-    *) csf_err_c "Invalid direction."; return 1 ;;
-  esac
-
-  local key; key="$(csf_conf_key "$CSFC_PROTO" "$CSFC_DIR")"
 
   while true; do
     clear
     echo "======================================================="
-    echo " CSF — ${key} Port Management"
+    echo " CSF Firewall — Port Management"
     echo "======================================================="
-
-    # Build numbered port list
-    local raw_ports port_list=()
-    raw_ports="$(grep "^${key} = " /etc/csf/csf.conf | head -1 | sed 's/.*= "\(.*\)"/\1/')"
-    if [ -n "$raw_ports" ]; then
-      IFS=',' read -ra port_list <<< "$raw_ports"
-    fi
-
-    if [ ${#port_list[@]} -eq 0 ]; then
-      echo " No ports currently defined in ${key}."
-    else
-      echo " Active ports in ${key}:"
-      local i=1
-      for p in "${port_list[@]}"; do
-        p="$(echo "$p" | tr -d ' ')"
-        [ -n "$p" ] && { printf "   %3d) %s\n" "$i" "$p"; i=$((i+1)); }
-      done
-    fi
-
+    csf_show_all_ports "TCP_IN"  "\e[92m"
+    echo
+    csf_show_all_ports "TCP_OUT" "\e[93m"
+    echo
+    csf_show_all_ports "UDP_IN"  "\e[96m"
+    echo
+    csf_show_all_ports "UDP_OUT" "\e[95m"
     echo "======================================================="
-    echo " 1) Add port"
-    echo " 2) Remove port (select by number)"
+    echo " 1) Add port(s)"
+    echo " 2) Remove port(s) by number"
     echo " 0) Back"
     echo "======================================================="
     read -rp " Choose: " action
@@ -847,30 +832,77 @@ csf_port_mgmt_c() {
     case "$action" in
       1)
         echo
-        read -rp " Port or range to add (e.g. 443 or 8000:9000): " new_port
-        [ -n "$new_port" ] || { csf_err_c "Port required."; continue; }
-        if csf_port_exists_in_conf "$key" "$new_port"; then
-          csf_warn_c "Port $new_port already exists in ${key}."
-        else
-          csf_add_port_to_conf "$key" "$new_port"
-          csf_ok_c "Port $new_port added to ${key}."
-          read -rp " Reload CSF now? [Y/n]: " rr
-          case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
-        fi
+        echo " Protocol:  1) TCP   2) UDP"
+        read -rp " Choice: " pc
+        case "$pc" in 1) CSFC_PROTO="tcp" ;; 2) CSFC_PROTO="udp" ;; *) csf_err_c "Invalid."; continue ;; esac
+        echo " Direction: 1) IN    2) OUT"
+        read -rp " Choice: " dc
+        case "$dc" in 1) CSFC_DIR="IN" ;; 2) CSFC_DIR="OUT" ;; *) csf_err_c "Invalid."; continue ;; esac
+        local key; key="$(csf_conf_key "$CSFC_PROTO" "$CSFC_DIR")"
+        echo
+        read -rp " Port(s) to add — comma separated (e.g. 443,8080,9000:9100): " input
+        [ -n "$input" ] || { csf_err_c "Input required."; continue; }
+        local added=0 skipped=0
+        IFS=',' read -ra new_ports <<< "$input"
+        for np in "${new_ports[@]}"; do
+          np="$(echo "$np" | tr -d ' ')"
+          [ -z "$np" ] && continue
+          if csf_port_exists_in_conf "$key" "$np"; then
+            csf_warn_c "Port $np already in ${key} — skipped."
+            skipped=$((skipped+1))
+          else
+            csf_add_port_to_conf "$key" "$np"
+            csf_ok_c "Added $np to ${key}."
+            added=$((added+1))
+          fi
+        done
+        echo " Done: $added added, $skipped skipped."
+        read -rp " Reload CSF now? [Y/n]: " rr
+        case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
         ;;
       2)
-        if [ ${#port_list[@]} -eq 0 ]; then
-          csf_warn_c "No ports to remove."; continue
+        echo
+        echo " Protocol:  1) TCP   2) UDP"
+        read -rp " Choice: " pc
+        case "$pc" in 1) CSFC_PROTO="tcp" ;; 2) CSFC_PROTO="udp" ;; *) csf_err_c "Invalid."; continue ;; esac
+        echo " Direction: 1) IN    2) OUT"
+        read -rp " Choice: " dc
+        case "$dc" in 1) CSFC_DIR="IN" ;; 2) CSFC_DIR="OUT" ;; *) csf_err_c "Invalid."; continue ;; esac
+        local key2; key2="$(csf_conf_key "$CSFC_PROTO" "$CSFC_DIR")"
+        csf_get_port_list "$key2"
+        if [ ${#CSFC_PORT_LIST[@]} -eq 0 ]; then
+          csf_warn_c "No ports in ${key2}."; continue
         fi
         echo
-        read -rp " Enter number to remove: " pick
-        if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#port_list[@]}" ]; then
-          csf_err_c "Invalid choice."; continue
-        fi
-        local target_port="${port_list[$((pick-1))]}"
-        target_port="$(echo "$target_port" | tr -d ' ')"
-        csf_remove_port_from_conf "$key" "$target_port"
-        csf_ok_c "Port $target_port removed from ${key}."
+        echo " ${key2} ports:"
+        local i=1
+        for p in "${CSFC_PORT_LIST[@]}"; do
+          p="$(echo "$p" | tr -d ' ')"
+          [ -n "$p" ] && { printf "   %3d) %s\n" "$i" "$p"; i=$((i+1)); }
+        done
+        echo
+        read -rp " Number(s) to remove — comma separated (e.g. 2,5,8): " picks
+        [ -n "$picks" ] || { csf_err_c "Input required."; continue; }
+        # Collect unique valid indices first
+        local to_remove=()
+        IFS=',' read -ra pick_arr <<< "$picks"
+        for pick in "${pick_arr[@]}"; do
+          pick="$(echo "$pick" | tr -d ' ')"
+          if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#CSFC_PORT_LIST[@]}" ]; then
+            csf_warn_c "Invalid number: $pick — skipped."
+            continue
+          fi
+          local tp="${CSFC_PORT_LIST[$((pick-1))]}"
+          tp="$(echo "$tp" | tr -d ' ')"
+          to_remove+=("$tp")
+        done
+        local removed=0
+        for tp in "${to_remove[@]}"; do
+          csf_remove_port_from_conf "$key2" "$tp"
+          csf_ok_c "Removed $tp from ${key2}."
+          removed=$((removed+1))
+        done
+        echo " Done: $removed port(s) removed."
         read -rp " Reload CSF now? [Y/n]: " rr
         case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
         ;;
