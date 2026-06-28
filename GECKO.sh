@@ -781,64 +781,103 @@ csf_pick_proto_dir() {
 
 # ---- 3) Add port ----
 
-csf_add_port_c() {
-  clear
-  echo "======================================================="
-  echo " CSF Firewall — Add Port to Allow List"
-  echo "======================================================="
+csf_port_mgmt_c() {
   csf_require_install || return 1
 
-  csf_pick_proto_dir || return 1
-  local key; key="$(csf_conf_key "$CSFC_PROTO" "$CSFC_DIR")"
-
-  echo
-  echo "Current ${key}:"
-  grep "^${key} = " /etc/csf/csf.conf | sed 's/.*= "\(.*\)"/\1/' | tr ',' '\n' | sed 's/^/  /'
-  echo
-
-  read -rp "Port or range to add (e.g. 443 or 8000:9000): " port
-  [ -n "$port" ] || { csf_err_c "Port required."; return 1; }
-
-  if csf_port_exists_in_conf "$key" "$port"; then
-    csf_warn_c "Port $port already in ${key}."; return 0
-  fi
-
-  csf_add_port_to_conf "$key" "$port"
-  csf_ok_c "Port $port added to ${key}."
-
-  read -rp "Reload CSF now? [Y/n]: " rr
-  case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
-}
-
-# ---- 4) Remove port ----
-
-csf_remove_port_c() {
+  # Step 1: pick protocol
   clear
   echo "======================================================="
-  echo " CSF Firewall — Remove Port from Allow List"
+  echo " CSF Firewall — Port Management"
   echo "======================================================="
-  csf_require_install || return 1
+  echo " Protocol:"
+  echo "   1) TCP"
+  echo "   2) UDP"
+  read -rp " Choice: " pc
+  case "$pc" in
+    1) CSFC_PROTO="tcp" ;;
+    2) CSFC_PROTO="udp" ;;
+    *) csf_err_c "Invalid protocol."; return 1 ;;
+  esac
 
-  csf_pick_proto_dir || return 1
+  # Step 2: pick direction
+  echo
+  echo " Direction:"
+  echo "   1) Incoming (IN)"
+  echo "   2) Outgoing (OUT)"
+  read -rp " Choice: " dc
+  case "$dc" in
+    1) CSFC_DIR="IN" ;;
+    2) CSFC_DIR="OUT" ;;
+    *) csf_err_c "Invalid direction."; return 1 ;;
+  esac
+
   local key; key="$(csf_conf_key "$CSFC_PROTO" "$CSFC_DIR")"
 
-  echo
-  echo "Current ${key}:"
-  grep "^${key} = " /etc/csf/csf.conf | sed 's/.*= "\(.*\)"/\1/' | tr ',' '\n' | sed 's/^/  /'
-  echo
+  while true; do
+    clear
+    echo "======================================================="
+    echo " CSF — ${key} Port Management"
+    echo "======================================================="
 
-  read -rp "Port or range to remove: " port
-  [ -n "$port" ] || { csf_err_c "Port required."; return 1; }
+    # Build numbered port list
+    local raw_ports port_list=()
+    raw_ports="$(grep "^${key} = " /etc/csf/csf.conf | head -1 | sed 's/.*= "\(.*\)"/\1/')"
+    if [ -n "$raw_ports" ]; then
+      IFS=',' read -ra port_list <<< "$raw_ports"
+    fi
 
-  if ! csf_port_exists_in_conf "$key" "$port"; then
-    csf_warn_m "Port $port not found in ${key}."; return 0
-  fi
+    if [ ${#port_list[@]} -eq 0 ]; then
+      echo " No ports currently defined in ${key}."
+    else
+      echo " Active ports in ${key}:"
+      local i=1
+      for p in "${port_list[@]}"; do
+        p="$(echo "$p" | tr -d ' ')"
+        [ -n "$p" ] && { printf "   %3d) %s\n" "$i" "$p"; i=$((i+1)); }
+      done
+    fi
 
-  csf_remove_port_from_conf "$key" "$port"
-  csf_ok_c "Port $port removed from ${key}."
+    echo "======================================================="
+    echo " 1) Add port"
+    echo " 2) Remove port (select by number)"
+    echo " 0) Back"
+    echo "======================================================="
+    read -rp " Choose: " action
 
-  read -rp "Reload CSF now? [Y/n]: " rr
-  case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
+    case "$action" in
+      1)
+        echo
+        read -rp " Port or range to add (e.g. 443 or 8000:9000): " new_port
+        [ -n "$new_port" ] || { csf_err_c "Port required."; continue; }
+        if csf_port_exists_in_conf "$key" "$new_port"; then
+          csf_warn_c "Port $new_port already exists in ${key}."
+        else
+          csf_add_port_to_conf "$key" "$new_port"
+          csf_ok_c "Port $new_port added to ${key}."
+          read -rp " Reload CSF now? [Y/n]: " rr
+          case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
+        fi
+        ;;
+      2)
+        if [ ${#port_list[@]} -eq 0 ]; then
+          csf_warn_c "No ports to remove."; continue
+        fi
+        echo
+        read -rp " Enter number to remove: " pick
+        if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#port_list[@]}" ]; then
+          csf_err_c "Invalid choice."; continue
+        fi
+        local target_port="${port_list[$((pick-1))]}"
+        target_port="$(echo "$target_port" | tr -d ' ')"
+        csf_remove_port_from_conf "$key" "$target_port"
+        csf_ok_c "Port $target_port removed from ${key}."
+        read -rp " Reload CSF now? [Y/n]: " rr
+        case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
+        ;;
+      0) return ;;
+      *) csf_err_c "Invalid choice."; sleep 1 ;;
+    esac
+  done
 }
 
 # ---- 5) Block IP ----
@@ -1014,32 +1053,30 @@ csf_menu() {
     echo "======================================================="
     echo " 1)  Install CSF"
     echo " 2)  Start / Stop / Reload"
-    echo " 3)  Add port to allow list    (TCP/UDP · IN/OUT)"
-    echo " 4)  Remove port from allow list"
-    echo " 5)  Block IP   (add to deny list)"
-    echo " 6)  Unblock IP (remove from deny list)"
-    echo " 7)  Allow IP   (whitelist)"
-    echo " 8)  Remove IP from whitelist"
-    echo " 9)  Show firewall rules"
-    echo " 10) Show LFD logs"
-    echo " 11) PING block (ICMP_IN)"
-    echo " 12) Uninstall CSF"
+    echo " 3)  Port Management (TCP/UDP · IN/OUT)"
+    echo " 4)  Block IP   (add to deny list)"
+    echo " 5)  Unblock IP (remove from deny list)"
+    echo " 6)  Allow IP   (whitelist)"
+    echo " 7)  Remove IP from whitelist"
+    echo " 8)  Show firewall rules"
+    echo " 9)  Show LFD logs"
+    echo " 10) PING block (ICMP_IN)"
+    echo " 11) Uninstall CSF"
     echo " 0)  Back"
     echo "======================================================="
     read -rp "Choose: " CSF_CHOICE
     case "$CSF_CHOICE" in
-      1)  csf_install_c;       read -rp "Press Enter to continue..." ;;
-      2)  csf_control_c;       read -rp "Press Enter to continue..." ;;
-      3)  csf_add_port_c;      read -rp "Press Enter to continue..." ;;
-      4)  csf_remove_port_c;   read -rp "Press Enter to continue..." ;;
-      5)  csf_block_ip_c;      read -rp "Press Enter to continue..." ;;
-      6)  csf_unblock_ip_c;    read -rp "Press Enter to continue..." ;;
-      7)  csf_allow_ip_c;      read -rp "Press Enter to continue..." ;;
-      8)  csf_remove_allow_ip_c; read -rp "Press Enter to continue..." ;;
-      9)  csf_show_rules_c;    read -rp "Press Enter to continue..." ;;
-      10) csf_show_logs_c;     read -rp "Press Enter to continue..." ;;
-      11) csf_ping_block_c;    read -rp "Press Enter to continue..." ;;
-      12) csf_uninstall_c;     read -rp "Press Enter to continue..." ;;
+      1)  csf_install_c;         read -rp "Press Enter to continue..." ;;
+      2)  csf_control_c;         read -rp "Press Enter to continue..." ;;
+      3)  csf_port_mgmt_c;       read -rp "Press Enter to continue..." ;;
+      4)  csf_block_ip_c;        read -rp "Press Enter to continue..." ;;
+      5)  csf_unblock_ip_c;      read -rp "Press Enter to continue..." ;;
+      6)  csf_allow_ip_c;        read -rp "Press Enter to continue..." ;;
+      7)  csf_remove_allow_ip_c; read -rp "Press Enter to continue..." ;;
+      8)  csf_show_rules_c;      read -rp "Press Enter to continue..." ;;
+      9)  csf_show_logs_c;       read -rp "Press Enter to continue..." ;;
+      10) csf_ping_block_c;      read -rp "Press Enter to continue..." ;;
+      11) csf_uninstall_c;       read -rp "Press Enter to continue..." ;;
       0)  return ;;
       *)  echo "Invalid choice."; sleep 1 ;;
     esac
