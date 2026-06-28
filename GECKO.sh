@@ -1067,6 +1067,120 @@ csf_uninstall_c() {
 
 # ---- Main menu ----
 
+csf_lfd_ssh_mgmt_c() {
+  csf_require_install || return 1
+
+  while true; do
+    clear
+    echo "======================================================="
+    echo " CSF — LFD SSH Brute-Force Settings"
+    echo "======================================================="
+
+    # Read current values
+    local cur_count cur_interval cur_perm cur_temp cur_temp_dur
+    cur_count="$(grep    "^LF_SSHD ="       /etc/csf/csf.conf | head -1 | grep -oP '"\K[^"]+')"
+    cur_interval="$(grep "^LF_TRIGGER_PERM" /etc/csf/csf.conf | head -1 | grep -oP '"\K[^"]+'  || echo "?")"
+    cur_perm="$(grep     "^LF_SSHD_PERM ="  /etc/csf/csf.conf | head -1 | grep -oP '"\K[^"]+')"
+    cur_temp="$(grep     "^LF_SSHD_TEMP ="  /etc/csf/csf.conf | head -1 | grep -oP '"\K[^"]+')"
+    cur_temp_dur="$(grep "^LF_TEMP_BLOCK ="  /etc/csf/csf.conf | head -1 | grep -oP '"\K[^"]+')"
+
+    # Block mode: PERM=1 means permanent, TEMP=1 means temporary
+    local block_mode="unknown"
+    [ "$cur_perm" = "1" ] && block_mode="Permanent"
+    [ "$cur_temp" = "1" ] && block_mode="Temporary (${cur_temp_dur}s)"
+    [ "$cur_perm" = "1" ] && [ "$cur_temp" = "1" ] && block_mode="Both (Perm+Temp)"
+    [ "$cur_perm" = "0" ] && [ "$cur_temp" = "0" ] && block_mode="Disabled"
+
+    echo " Current settings:"
+    echo "   Failed attempts before block : ${cur_count}"
+    echo "   Block mode                   : ${block_mode}"
+    [ "$cur_temp" = "1" ] &&     echo "   Temporary block duration     : ${cur_temp_dur} seconds ($(( ${cur_temp_dur:-0} / 60 )) min)"
+    echo "======================================================="
+    echo " 1) Change failed attempt limit  (LF_SSHD)"
+    echo " 2) Set block mode               (Permanent / Temporary / Both)"
+    echo " 3) Change temporary block duration (LF_TEMP_BLOCK)"
+    echo " 4) Disable SSH brute-force protection"
+    echo " 0) Back"
+    echo "======================================================="
+    read -rp " Choose: " lfd_choice
+
+    case "$lfd_choice" in
+      1)
+        echo
+        echo " Current: LF_SSHD = "${cur_count}""
+        echo " (0 = disabled, recommended: 5-10)"
+        read -rp " New value: " new_val
+        if ! [[ "$new_val" =~ ^[0-9]+$ ]]; then
+          csf_err_c "Must be a number."; sleep 1; continue
+        fi
+        sed -i "s/^LF_SSHD = \".*\"/LF_SSHD = \"${new_val}\"/" /etc/csf/csf.conf
+        csf_ok_c "LF_SSHD set to ${new_val}."
+        read -rp " Restart LFD now? [Y/n]: " rr
+        case "$rr" in n|N) ;; *) systemctl restart lfd && csf_ok_c "LFD restarted." ;; esac
+        ;;
+      2)
+        echo
+        echo " Block mode:"
+        echo "   1) Permanent  — blocked IP never auto-unblocked"
+        echo "   2) Temporary  — blocked IP unblocked after LF_TEMP_BLOCK seconds"
+        echo "   3) Both       — block permanently AND add temporary rule"
+        read -rp " Choose: " bm
+        case "$bm" in
+          1)
+            sed -i "s/^LF_SSHD_PERM = \".*\"/LF_SSHD_PERM = \"1\"/" /etc/csf/csf.conf
+            sed -i "s/^LF_SSHD_TEMP = \".*\"/LF_SSHD_TEMP = \"0\"/" /etc/csf/csf.conf
+            csf_ok_c "Block mode: Permanent."
+            ;;
+          2)
+            sed -i "s/^LF_SSHD_PERM = \".*\"/LF_SSHD_PERM = \"0\"/" /etc/csf/csf.conf
+            sed -i "s/^LF_SSHD_TEMP = \".*\"/LF_SSHD_TEMP = \"1\"/" /etc/csf/csf.conf
+            csf_ok_c "Block mode: Temporary."
+            ;;
+          3)
+            sed -i "s/^LF_SSHD_PERM = \".*\"/LF_SSHD_PERM = \"1\"/" /etc/csf/csf.conf
+            sed -i "s/^LF_SSHD_TEMP = \".*\"/LF_SSHD_TEMP = \"1\"/" /etc/csf/csf.conf
+            csf_ok_c "Block mode: Permanent + Temporary."
+            ;;
+          *) csf_err_c "Invalid."; sleep 1; continue ;;
+        esac
+        read -rp " Restart LFD now? [Y/n]: " rr
+        case "$rr" in n|N) ;; *) systemctl restart lfd && csf_ok_c "LFD restarted." ;; esac
+        ;;
+      3)
+        echo
+        echo " Current: LF_TEMP_BLOCK = "${cur_temp_dur}" seconds"
+        echo " Examples: 3600 = 1hr  |  86400 = 24hr  |  604800 = 7 days"
+        read -rp " New duration (seconds): " new_dur
+        if ! [[ "$new_dur" =~ ^[0-9]+$ ]]; then
+          csf_err_c "Must be a number in seconds."; sleep 1; continue
+        fi
+        local hrs=$(( new_dur / 3600 ))
+        local mins=$(( (new_dur % 3600) / 60 ))
+        sed -i "s/^LF_TEMP_BLOCK = \".*\"/LF_TEMP_BLOCK = \"${new_dur}\"/" /etc/csf/csf.conf
+        csf_ok_c "LF_TEMP_BLOCK set to ${new_dur}s (${hrs}h ${mins}m)."
+        read -rp " Restart LFD now? [Y/n]: " rr
+        case "$rr" in n|N) ;; *) systemctl restart lfd && csf_ok_c "LFD restarted." ;; esac
+        ;;
+      4)
+        echo
+        csf_warn_c "This will disable SSH brute-force protection (LF_SSHD = 0)."
+        read -rp " Are you sure? [y/N]: " confirm
+        case "$confirm" in
+          y|Y|yes|YES)
+            sed -i "s/^LF_SSHD = \".*\"/LF_SSHD = \"0\"/" /etc/csf/csf.conf
+            csf_ok_c "SSH brute-force protection disabled."
+            read -rp " Restart LFD now? [Y/n]: " rr
+            case "$rr" in n|N) ;; *) systemctl restart lfd && csf_ok_c "LFD restarted." ;; esac
+            ;;
+          *) echo " Cancelled." ;;
+        esac
+        ;;
+      0) return ;;
+      *) csf_err_c "Invalid choice."; sleep 1 ;;
+    esac
+  done
+}
+
 csf_menu() {
   while true; do
     clear
@@ -1093,7 +1207,8 @@ csf_menu() {
     echo " 8)  Show firewall rules"
     echo " 9)  Show LFD logs"
     echo " 10) PING block (ICMP_IN)"
-    echo " 11) Uninstall CSF"
+    echo " 11) LFD — SSH Brute-Force Settings"
+    echo " 12) Uninstall CSF"
     echo " 0)  Back"
     echo "======================================================="
     read -rp "Choose: " CSF_CHOICE
@@ -1108,7 +1223,8 @@ csf_menu() {
       8)  csf_show_rules_c;      read -rp "Press Enter to continue..." ;;
       9)  csf_show_logs_c;       read -rp "Press Enter to continue..." ;;
       10) csf_ping_block_c;      read -rp "Press Enter to continue..." ;;
-      11) csf_uninstall_c;       read -rp "Press Enter to continue..." ;;
+      11) csf_lfd_ssh_mgmt_c;    read -rp "Press Enter to continue..." ;;
+      12) csf_uninstall_c;       read -rp "Press Enter to continue..." ;;
       0)  return ;;
       *)  echo "Invalid choice."; sleep 1 ;;
     esac
