@@ -613,6 +613,441 @@ open_udp_firewall_hy2_global() {
 
 
 # =======================================================
+# CSF Firewall Manager
+# Install, manage ports (TCP/UDP, IN/OUT), manage IPs
+# Ubuntu/Debian compatible
+# =======================================================
+
+csf_ok_c()   { echo -e "\e[32m[OK]\e[0m $1"; }
+csf_err_c()  { echo -e "\e[31m[ERR]\e[0m $1"; }
+csf_info_c() { echo -e "\e[34m[*]\e[0m $1"; }
+csf_warn_c() { echo -e "\e[33m[!]\e[0m $1"; }
+
+csf_is_installed() { [ -x /usr/sbin/csf ]; }
+
+csf_require_install() {
+  if ! csf_is_installed; then
+    csf_err_c "CSF is not installed. Please install it first (option 1)."
+    return 1
+  fi
+}
+
+# ---- 1) Install ----
+
+csf_install_c() {
+  clear
+  echo "======================================================="
+  echo " CSF Firewall — Install"
+  echo "======================================================="
+  if csf_is_installed; then
+    csf_warn_c "CSF is already installed."
+    csf --version 2>/dev/null || true
+    return 0
+  fi
+
+  csf_info_c "Installing dependencies..."
+  apt-get update -y
+  apt-get install -y wget vim perl libwww-perl liblwp-protocol-https-perl \
+    libgd-graph-perl sendmail dnsutils iptables
+
+  csf_info_c "Downloading CSF..."
+  cd /usr/src/ || { csf_err_c "Cannot cd to /usr/src/"; return 1; }
+  wget -q --show-progress \
+    https://github.com/centminmod/configserver-scripts/raw/refs/heads/main/csf.tgz \
+    -O csf.tgz || { csf_err_c "Download failed."; return 1; }
+  [ -s csf.tgz ] || { csf_err_c "Downloaded file is empty."; return 1; }
+
+  csf_info_c "Extracting..."
+  tar -xzf csf.tgz
+  cd csf || { csf_err_c "Cannot cd to csf directory."; return 1; }
+
+  csf_info_c "Running installer..."
+  sh install.sh
+
+  # Disable firewalld if present
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    csf_info_c "Stopping and disabling firewalld..."
+    systemctl stop firewalld
+    systemctl disable firewalld
+  fi
+
+  # Disable TESTING mode
+  csf_info_c "Setting TESTING = 0 in csf.conf..."
+  sed -i 's/^TESTING = "1"/TESTING = "0"/' /etc/csf/csf.conf
+
+  # Start and enable services
+  systemctl start csf
+  systemctl start lfd
+  systemctl enable csf
+  systemctl enable lfd
+
+  echo
+  csf_ok_c "CSF installed and activated."
+  echo
+  echo "--- CSF test result ---"
+  perl /usr/local/csf/bin/csftest.pl 2>/dev/null | tail -5
+}
+
+# ---- 2) Start / Stop / Reload ----
+
+csf_control_c() {
+  clear
+  echo "======================================================="
+  echo " CSF Firewall — Start / Stop / Reload"
+  echo "======================================================="
+  csf_require_install || return 1
+  echo " 1) Start firewall     (csf -s)"
+  echo " 2) Stop  firewall     (csf -f)"
+  echo " 3) Reload rules       (csf -r)"
+  echo " 4) Show status"
+  echo " 0) Back"
+  echo "======================================================="
+  read -rp "Choose: " cc
+  case "$cc" in
+    1) csf -s && csf_ok_c "Firewall started." ;;
+    2) csf -f && csf_ok_c "Firewall stopped." ;;
+    3) csf -r && csf_ok_c "Rules reloaded." ;;
+    4)
+      echo
+      echo "--- CSF status ---"
+      systemctl is-active csf && echo "csf : active" || echo "csf : inactive"
+      systemctl is-active lfd && echo "lfd : active" || echo "lfd : inactive"
+      echo
+      echo "--- TESTING mode ---"
+      grep "^TESTING" /etc/csf/csf.conf
+      ;;
+    0) return ;;
+    *) csf_err_c "Invalid choice." ;;
+  esac
+}
+
+# ---- helpers: port conf keys ----
+
+# direction: IN / OUT
+# proto: tcp / udp
+# csf.conf key: TCP_IN, TCP_OUT, UDP_IN, UDP_OUT
+
+csf_conf_key() {
+  # $1=proto(tcp|udp) $2=dir(IN|OUT)
+  echo "${1^^}_${2^^}"
+}
+
+csf_port_exists_in_conf() {
+  local key="$1" port="$2"
+  local val
+  val="$(grep "^${key} = " /etc/csf/csf.conf | head -1 | sed 's/.*= "\(.*\)"/\1/')"
+  echo "$val" | tr ',' '\n' | grep -qxF "$port"
+}
+
+csf_add_port_to_conf() {
+  local key="$1" port="$2"
+  local current
+  current="$(grep "^${key} = " /etc/csf/csf.conf | head -1 | sed 's/.*= "\(.*\)"/\1/')"
+  if [ -z "$current" ]; then
+    sed -i "s/^${key} = \".*\"/${key} = \"${port}\"/" /etc/csf/csf.conf
+  else
+    sed -i "s/^${key} = \".*\"/${key} = \"${current},${port}\"/" /etc/csf/csf.conf
+  fi
+}
+
+csf_remove_port_from_conf() {
+  local key="$1" port="$2"
+  local current new_val
+  current="$(grep "^${key} = " /etc/csf/csf.conf | head -1 | sed 's/.*= "\(.*\)"/\1/')"
+  new_val="$(echo "$current" | tr ',' '\n' | grep -vxF "$port" | paste -sd ',')"
+  sed -i "s/^${key} = \".*\"/${key} = \"${new_val}\"/" /etc/csf/csf.conf
+}
+
+csf_pick_proto_dir() {
+  echo "Protocol:"
+  echo "  1) TCP"
+  echo "  2) UDP"
+  read -rp "Choice: " pc
+  case "$pc" in
+    1) CSFC_PROTO="tcp" ;;
+    2) CSFC_PROTO="udp" ;;
+    *) csf_err_c "Invalid protocol."; return 1 ;;
+  esac
+  echo "Direction:"
+  echo "  1) Incoming (IN)"
+  echo "  2) Outgoing (OUT)"
+  read -rp "Choice: " dc
+  case "$dc" in
+    1) CSFC_DIR="IN" ;;
+    2) CSFC_DIR="OUT" ;;
+    *) csf_err_c "Invalid direction."; return 1 ;;
+  esac
+}
+
+# ---- 3) Add port ----
+
+csf_add_port_c() {
+  clear
+  echo "======================================================="
+  echo " CSF Firewall — Add Port to Allow List"
+  echo "======================================================="
+  csf_require_install || return 1
+
+  csf_pick_proto_dir || return 1
+  local key; key="$(csf_conf_key "$CSFC_PROTO" "$CSFC_DIR")"
+
+  echo
+  echo "Current ${key}:"
+  grep "^${key} = " /etc/csf/csf.conf | sed 's/.*= "\(.*\)"/\1/' | tr ',' '\n' | sed 's/^/  /'
+  echo
+
+  read -rp "Port or range to add (e.g. 443 or 8000:9000): " port
+  [ -n "$port" ] || { csf_err_c "Port required."; return 1; }
+
+  if csf_port_exists_in_conf "$key" "$port"; then
+    csf_warn_c "Port $port already in ${key}."; return 0
+  fi
+
+  csf_add_port_to_conf "$key" "$port"
+  csf_ok_c "Port $port added to ${key}."
+
+  read -rp "Reload CSF now? [Y/n]: " rr
+  case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
+}
+
+# ---- 4) Remove port ----
+
+csf_remove_port_c() {
+  clear
+  echo "======================================================="
+  echo " CSF Firewall — Remove Port from Allow List"
+  echo "======================================================="
+  csf_require_install || return 1
+
+  csf_pick_proto_dir || return 1
+  local key; key="$(csf_conf_key "$CSFC_PROTO" "$CSFC_DIR")"
+
+  echo
+  echo "Current ${key}:"
+  grep "^${key} = " /etc/csf/csf.conf | sed 's/.*= "\(.*\)"/\1/' | tr ',' '\n' | sed 's/^/  /'
+  echo
+
+  read -rp "Port or range to remove: " port
+  [ -n "$port" ] || { csf_err_c "Port required."; return 1; }
+
+  if ! csf_port_exists_in_conf "$key" "$port"; then
+    csf_warn_m "Port $port not found in ${key}."; return 0
+  fi
+
+  csf_remove_port_from_conf "$key" "$port"
+  csf_ok_c "Port $port removed from ${key}."
+
+  read -rp "Reload CSF now? [Y/n]: " rr
+  case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
+}
+
+# ---- 5) Block IP ----
+
+csf_block_ip_c() {
+  clear
+  echo "======================================================="
+  echo " CSF Firewall — Block IP (add to deny list)"
+  echo "======================================================="
+  csf_require_install || return 1
+  read -rp "IP to block: " ip
+  [ -n "$ip" ] || { csf_err_c "IP required."; return 1; }
+  csf -d "$ip" && csf_ok_c "IP $ip blocked (added to csf.deny)."
+}
+
+# ---- 6) Unblock IP ----
+
+csf_unblock_ip_c() {
+  clear
+  echo "======================================================="
+  echo " CSF Firewall — Unblock IP (remove from deny list)"
+  echo "======================================================="
+  csf_require_install || return 1
+  echo "Current deny list:"
+  grep -v "^#" /etc/csf/csf.deny 2>/dev/null | grep -v "^$" | head -20 | sed 's/^/  /' || echo "  (empty)"
+  echo
+  read -rp "IP to unblock: " ip
+  [ -n "$ip" ] || { csf_err_c "IP required."; return 1; }
+  csf -dr "$ip" && csf_ok_c "IP $ip unblocked."
+}
+
+# ---- 7) Allow IP ----
+
+csf_allow_ip_c() {
+  clear
+  echo "======================================================="
+  echo " CSF Firewall — Allow IP (whitelist)"
+  echo "======================================================="
+  csf_require_install || return 1
+  read -rp "IP to allow (or comma-separated list): " ips
+  [ -n "$ips" ] || { csf_err_c "IP required."; return 1; }
+  IFS=',' read -ra ip_arr <<< "$ips"
+  for ip in "${ip_arr[@]}"; do
+    ip="$(echo "$ip" | tr -d ' ')"
+    [ -z "$ip" ] && continue
+    csf -a "$ip" && csf_ok_c "IP $ip allowed (added to csf.allow)."
+  done
+}
+
+# ---- 8) Remove IP from whitelist ----
+
+csf_remove_allow_ip_c() {
+  clear
+  echo "======================================================="
+  echo " CSF Firewall — Remove IP from Whitelist"
+  echo "======================================================="
+  csf_require_install || return 1
+  echo "Current allow list:"
+  grep -v "^#" /etc/csf/csf.allow 2>/dev/null | grep -v "^$" | head -20 | sed 's/^/  /' || echo "  (empty)"
+  echo
+  read -rp "IP to remove from whitelist: " ip
+  [ -n "$ip" ] || { csf_err_c "IP required."; return 1; }
+  csf -ar "$ip" && csf_ok_c "IP $ip removed from whitelist."
+}
+
+# ---- 9) Show rules ----
+
+csf_show_rules_c() {
+  clear
+  echo "======================================================="
+  echo " CSF Firewall — Current Rules"
+  echo "======================================================="
+  csf_require_install || return 1
+  csf -l 2>/dev/null | head -80
+}
+
+# ---- 10) Show LFD logs ----
+
+csf_show_logs_c() {
+  clear
+  echo "======================================================="
+  echo " CSF Firewall — LFD Logs (last 40 lines)"
+  echo "======================================================="
+  csf_require_install || return 1
+  local logfile=""
+  for f in /var/log/lfd.log /var/log/syslog /var/log/messages; do
+    [ -f "$f" ] && { logfile="$f"; break; }
+  done
+  if [ -z "$logfile" ]; then
+    csf_warn_c "No log file found. Trying journalctl..."
+    journalctl -u lfd -n 40 --no-pager
+  else
+    tail -n 40 "$logfile"
+  fi
+}
+
+# ---- 11) PING block ----
+
+csf_ping_block_c() {
+  clear
+  echo "======================================================="
+  echo " CSF Firewall — PING Block (ICMP_IN)"
+  echo "======================================================="
+  csf_require_install || return 1
+  local current
+  current="$(grep "^ICMP_IN = " /etc/csf/csf.conf | head -1 | grep -oP '"[01]"' | tr -d '"')"
+  echo "Current ICMP_IN = \"${current}\""
+  echo
+  echo " 1) Block PING   (ICMP_IN = 0)"
+  echo " 2) Allow PING   (ICMP_IN = 1)"
+  echo " 0) Back"
+  read -rp "Choose: " pc
+  case "$pc" in
+    1)
+      sed -i 's/^ICMP_IN = ".*"/ICMP_IN = "0"/' /etc/csf/csf.conf
+      csf_ok_c "PING blocked (ICMP_IN = 0)."
+      read -rp "Reload CSF now? [Y/n]: " rr
+      case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
+      ;;
+    2)
+      sed -i 's/^ICMP_IN = ".*"/ICMP_IN = "1"/' /etc/csf/csf.conf
+      csf_ok_c "PING allowed (ICMP_IN = 1)."
+      read -rp "Reload CSF now? [Y/n]: " rr
+      case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
+      ;;
+    0) return ;;
+    *) csf_err_c "Invalid choice." ;;
+  esac
+}
+
+# ---- 12) Uninstall ----
+
+csf_uninstall_c() {
+  clear
+  echo "======================================================="
+  echo " CSF Firewall — Uninstall"
+  echo "======================================================="
+  csf_require_install || return 1
+  read -rp "Uninstall CSF completely? [y/N]: " c
+  case "$c" in y|Y|yes|YES|Yes) ;; *) echo "Cancelled."; return 0 ;; esac
+  if [ -f /etc/csf/uninstall.sh ]; then
+    sh /etc/csf/uninstall.sh
+  elif [ -f /usr/src/csf/uninstall.sh ]; then
+    sh /usr/src/csf/uninstall.sh
+  else
+    csf_warn_c "Uninstall script not found. Removing manually..."
+    systemctl stop csf lfd 2>/dev/null || true
+    systemctl disable csf lfd 2>/dev/null || true
+    rm -rf /etc/csf /usr/local/csf
+    rm -f /usr/sbin/csf /usr/sbin/lfd
+    systemctl daemon-reload
+  fi
+  csf_ok_c "CSF uninstalled."
+}
+
+# ---- Main menu ----
+
+csf_menu() {
+  while true; do
+    clear
+    echo "======================================================="
+    echo " CSF Firewall Menu"
+    echo "======================================================="
+    if csf_is_installed; then
+      local csf_state lfd_state testing
+      csf_state="$(systemctl is-active csf 2>/dev/null)"
+      lfd_state="$(systemctl is-active lfd 2>/dev/null)"
+      testing="$(grep "^TESTING = " /etc/csf/csf.conf 2>/dev/null | grep -oP '"[01]"' | tr -d '"')"
+      echo " csf: [$csf_state]  lfd: [$lfd_state]  TESTING: [${testing:-?}]"
+    else
+      echo " CSF: [NOT INSTALLED]"
+    fi
+    echo "======================================================="
+    echo " 1)  Install CSF"
+    echo " 2)  Start / Stop / Reload"
+    echo " 3)  Add port to allow list    (TCP/UDP · IN/OUT)"
+    echo " 4)  Remove port from allow list"
+    echo " 5)  Block IP   (add to deny list)"
+    echo " 6)  Unblock IP (remove from deny list)"
+    echo " 7)  Allow IP   (whitelist)"
+    echo " 8)  Remove IP from whitelist"
+    echo " 9)  Show firewall rules"
+    echo " 10) Show LFD logs"
+    echo " 11) PING block (ICMP_IN)"
+    echo " 12) Uninstall CSF"
+    echo " 0)  Back"
+    echo "======================================================="
+    read -rp "Choose: " CSF_CHOICE
+    case "$CSF_CHOICE" in
+      1)  csf_install_c;       read -rp "Press Enter to continue..." ;;
+      2)  csf_control_c;       read -rp "Press Enter to continue..." ;;
+      3)  csf_add_port_c;      read -rp "Press Enter to continue..." ;;
+      4)  csf_remove_port_c;   read -rp "Press Enter to continue..." ;;
+      5)  csf_block_ip_c;      read -rp "Press Enter to continue..." ;;
+      6)  csf_unblock_ip_c;    read -rp "Press Enter to continue..." ;;
+      7)  csf_allow_ip_c;      read -rp "Press Enter to continue..." ;;
+      8)  csf_remove_allow_ip_c; read -rp "Press Enter to continue..." ;;
+      9)  csf_show_rules_c;    read -rp "Press Enter to continue..." ;;
+      10) csf_show_logs_c;     read -rp "Press Enter to continue..." ;;
+      11) csf_ping_block_c;    read -rp "Press Enter to continue..." ;;
+      12) csf_uninstall_c;     read -rp "Press Enter to continue..." ;;
+      0)  return ;;
+      *)  echo "Invalid choice."; sleep 1 ;;
+    esac
+  done
+}
+
+
+# =======================================================
 # GOST Multi-Tunnel Manager
 # Multiple named tunnels, each to a different destination.
 # Forwarding: this-server:PORT -> destination:PORT (same port)
@@ -2451,6 +2886,7 @@ while true; do
   echo -e "6)  \e[93mGECKO WARP Proxy Outbound Menu\e[0m"
   echo -e "7)  \e[96mGECKO Relay Tunnel Menu (Iran <-> Kharej)\e[0m"
   echo -e "8)  \e[93mGOST Multi-Tunnel Menu\e[0m"
+  echo -e "9)  \e[91mCSF Firewall Menu\e[0m"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -2509,6 +2945,10 @@ while true; do
   8)
     clear
     gost_multi_menu
+    ;;
+  9)
+    clear
+    csf_menu
     ;;
   0)
     clear
