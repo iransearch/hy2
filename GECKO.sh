@@ -465,7 +465,7 @@ EOF
   EN_OBFS="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_OBFS")"
   EN_SNI="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_SNI")"
   EN_REMARK="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_REMARK")"
-  HY2_LINK="hy2://$EN_AUTH@$SERVER_IP:$HY2_PORT?sni=$EN_SNI&insecure=1&Insecure=1&obfs=gecko&obfs-password=$EN_OBFS#$EN_REMARK"
+  HY2_LINK="hy2://$EN_AUTH@$SERVER_IP:$HY2_PORT?sni=$EN_SNI&insecure=1&obfs=gecko&obfs-password=$EN_OBFS#$EN_REMARK"
 
   cat > "$HYSTERIA_DIR/client-link.txt" <<EOF
 $HY2_LINK
@@ -1844,7 +1844,7 @@ gtun_make_link() {
     port_param=""
   fi
 
-  local link="hy2://${EA}@${server_ip}:${port}?sni=${ES}&insecure=1&Insecure=1&obfs=gecko&obfs-password=${EO}"
+  local link="hy2://${EA}@${server_ip}:${port}?sni=${ES}&insecure=1&obfs=gecko&obfs-password=${EO}"
   [ -n "$port_param" ] && link="${link}&${port_param}"
   link="${link}#${ER}"
   echo "$link"
