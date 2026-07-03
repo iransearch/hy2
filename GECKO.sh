@@ -3020,14 +3020,14 @@ PY
 # =======================================================
 # =======================================================
 # Xboard ISP Dedicated Proxies - Local SOCKS Bridge
-# Xboard panel should point to: 127.0.0.1:40000
+# Xboard panel should point to: 127.0.0.1:30000
 # This server-side bridge authenticates to the remote ISP SOCKS proxy.
 # No Xray/Xboard config file is patched by this module.
 # =======================================================
 
 XBOARD_ISP_TAG="ISP Dedicated Proxies"
 XBOARD_ISP_LOCAL_ADDR="127.0.0.1"
-XBOARD_ISP_LOCAL_PORT="40000"
+XBOARD_ISP_LOCAL_PORT="30000"
 XBOARD_ISP_DIR="/etc/xboard-isp-socks-bridge"
 XBOARD_ISP_ENV="$XBOARD_ISP_DIR/bridge.env"
 XBOARD_ISP_SCRIPT="/usr/local/bin/xboard-isp-socks-bridge.py"
@@ -3083,7 +3083,7 @@ import sys
 import time
 
 LISTEN_HOST = os.environ.get('LISTEN_HOST', '127.0.0.1')
-LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '40000'))
+LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '30000'))
 UPSTREAM_HOST = os.environ.get('UPSTREAM_HOST', '')
 UPSTREAM_PORT = int(os.environ.get('UPSTREAM_PORT', '0'))
 UPSTREAM_USER = os.environ.get('UPSTREAM_USER', '')
@@ -3488,7 +3488,7 @@ xboard_socks_routing_menu() {
     echo "======================================================="
     echo " Xboard ISP Dedicated Proxies Local Bridge Menu"
     echo "======================================================="
-    echo "Purpose: Xboard -> 127.0.0.1:40000 -> remote ISP SOCKS -> Internet"
+    echo "Purpose: Xboard -> 127.0.0.1:30000 -> remote ISP SOCKS -> Internet"
     echo "Panel outbound tag: $XBOARD_ISP_TAG"
     echo "Local SOCKS       : $XBOARD_ISP_LOCAL_ADDR:$XBOARD_ISP_LOCAL_PORT"
     echo
