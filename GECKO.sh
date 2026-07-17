@@ -1,6 +1,379 @@
-#!/bin/bash
+پ#!/bin/bash
 
 source <(curl -sSL https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box_Config_Installer/Source.sh)
+
+# -----------------------------------------------------------------------------
+# TUI-only overrides
+#   - Install the latest sing-box-extended release instead of the upstream core.
+#   - Let TCP Reality installations choose whether to use XTLS Vision flow.
+# The Legacy menu and every custom menu below remain unchanged.
+# -----------------------------------------------------------------------------
+TUI_EXTENDED_REPO="shtorm-7/sing-box-extended"
+TUI_MENU_URL="https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box_Config_Installer/TUI-Menu.sh"
+
+tui_error() {
+  local message="$1"
+  if command -v whiptail >/dev/null 2>&1; then
+    whiptail --title "TUI Error" --msgbox "$message" 12 72
+  else
+    echo "ERROR: $message" >&2
+  fi
+}
+
+# This function intentionally has the same name as Source.sh's installer.
+# TUI-Menu.sh will therefore use sing-box-extended for every TUI protocol.
+install_core() {
+  local Protocol="${1:-}"
+  local machine arch latest_url latest_tag version archive_name download_url
+  local tmp_dir binary_path cronet_path installed_version
+
+  if [[ -z "$Protocol" || ! "$Protocol" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    tui_error "Invalid protocol name for sing-box installation."
+    return 1
+  fi
+
+  machine="$(uname -m)"
+  case "$machine" in
+    x86_64 | amd64) arch="amd64" ;;
+    aarch64 | arm64) arch="arm64" ;;
+    i386 | i486 | i586 | i686) arch="386" ;;
+    armv7l | armv7) arch="armv7" ;;
+    armv6l | armv6) arch="armv6" ;;
+    armv5l | armv5) arch="armv5" ;;
+    mips64el) arch="mips64le" ;;
+    mipsel) arch="mipsle" ;;
+    riscv64 | s390x | ppc64le) arch="$machine" ;;
+    loongarch64 | loong64) arch="loong64" ;;
+    *)
+      tui_error "Unsupported CPU architecture: $machine"
+      return 1
+      ;;
+  esac
+
+  echo "Checking the latest ${TUI_EXTENDED_REPO} release..."
+  if ! latest_url="$(curl -fsSL --retry 3 --connect-timeout 15 \
+    -o /dev/null -w '%{url_effective}' \
+    "https://github.com/${TUI_EXTENDED_REPO}/releases/latest")"; then
+    tui_error "Could not determine the latest sing-box-extended release."
+    return 1
+  fi
+
+  latest_url="${latest_url%/}"
+  latest_tag="${latest_url##*/}"
+  if [[ ! "$latest_tag" =~ ^v[0-9] ]]; then
+    tui_error "GitHub returned an invalid latest release tag: $latest_tag"
+    return 1
+  fi
+
+  version="${latest_tag#v}"
+  archive_name="sing-box-${version}-linux-${arch}.tar.gz"
+  download_url="https://github.com/${TUI_EXTENDED_REPO}/releases/download/${latest_tag}/${archive_name}"
+  tmp_dir="$(mktemp -d /tmp/sing-box-extended.XXXXXX)" || {
+    tui_error "Could not create a temporary download directory."
+    return 1
+  }
+
+  echo "Downloading sing-box-extended ${version} for linux-${arch}..."
+  if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
+    -o "$tmp_dir/$archive_name" "$download_url"; then
+    rm -rf "$tmp_dir"
+    tui_error "Download failed:\n$download_url"
+    return 1
+  fi
+
+  if ! tar -xzf "$tmp_dir/$archive_name" -C "$tmp_dir"; then
+    rm -rf "$tmp_dir"
+    tui_error "The downloaded sing-box-extended archive is invalid."
+    return 1
+  fi
+
+  binary_path="$(find "$tmp_dir" -type f -name sing-box -print -quit)"
+  if [[ -z "$binary_path" || ! -f "$binary_path" ]]; then
+    rm -rf "$tmp_dir"
+    tui_error "The sing-box binary was not found in the release archive."
+    return 1
+  fi
+
+  if ! install -m 0755 "$binary_path" "/usr/bin/$Protocol"; then
+    rm -rf "$tmp_dir"
+    tui_error "Could not install sing-box-extended to /usr/bin/$Protocol."
+    return 1
+  fi
+
+  # The extended pure-Go Linux package may include libcronet for Naive support.
+  cronet_path="$(find "$tmp_dir" -type f -name libcronet.so -print -quit)"
+  if [[ -n "$cronet_path" && -f "$cronet_path" ]]; then
+    install -m 0644 "$cronet_path" /usr/lib/libcronet.so
+    command -v ldconfig >/dev/null 2>&1 && ldconfig >/dev/null 2>&1 || true
+  fi
+
+  installed_version="$("/usr/bin/$Protocol" version 2>/dev/null | head -n 1)"
+  rm -rf "$tmp_dir"
+
+  if [[ -z "$installed_version" ]]; then
+    tui_error "sing-box-extended was copied, but the installed binary did not run correctly."
+    return 1
+  fi
+
+  echo "Installed: $installed_version"
+}
+
+select_reality_flow() {
+  local choice
+  choice=$(whiptail --clear --title "Reality Flow" \
+    --menu "Select Flow mode for Reality TCP:" 15 72 2 \
+    "with_flow" "With Flow (xtls-rprx-vision)" \
+    "without_flow" "Without Flow" \
+    2>&1 >/dev/tty) || return 1
+  printf '%s' "$choice"
+}
+
+configure_reality_tui() {
+  local mode="$1"
+  local Transport="$2"
+  local user_port user_sni flow_mode="without_flow" config_url
+  local uuid short_id service_name output private_key public_key
+  local tmp_json check_log public_ipv4 public_ipv6 flow_query=""
+  local result_url result_url2 ipv4qr ipv6qr completion_message
+
+  if [[ "$Transport" != "tcp" && "$Transport" != "grpc" ]]; then
+    tui_error "Unsupported Reality transport: $Transport"
+    return 1
+  fi
+
+  user_port=$(whiptail --inputbox "Enter Port:" 10 40 2>&1 >/dev/tty) || return 0
+  if [[ ! "$user_port" =~ ^[0-9]+$ ]] || ((user_port < 1 || user_port > 65535)); then
+    tui_error "Port must be a number between 1 and 65535."
+    return 1
+  fi
+
+  user_sni=$(whiptail --inputbox "Enter SNI:" 10 50 2>&1 >/dev/tty) || return 0
+  if [[ -z "$user_sni" ]]; then
+    tui_error "SNI cannot be empty."
+    return 1
+  fi
+
+  if [[ "$Transport" == "tcp" ]]; then
+    flow_mode="$(select_reality_flow)" || return 0
+  fi
+
+  # Install/update RS before changing an existing configuration. If GitHub is
+  # unavailable, Modify exits without deleting the working Reality config.
+  install_core RS || return 1
+
+  if [[ "$mode" == "modify" ]]; then
+    systemctl stop RS >/dev/null 2>&1 || true
+    rm -rf /etc/reality
+  fi
+  mkdir -p /etc/reality
+
+  if [[ "$Transport" == "grpc" ]]; then
+    config_url="https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box/Server/Reality-gRPC.json"
+  else
+    config_url="https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box/Server/Reality-tcp.json"
+  fi
+
+  if ! curl -fsSL "$config_url" -o /etc/reality/config.json; then
+    tui_error "Could not download the Reality configuration template."
+    return 1
+  fi
+  if ! curl -fsSL \
+    "https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box/RS.service" \
+    -o /etc/systemd/system/RS.service; then
+    tui_error "Could not download the Reality systemd service."
+    return 1
+  fi
+  systemctl daemon-reload
+
+  uuid="$(cat /proc/sys/kernel/random/uuid)"
+  short_id="$(openssl rand -hex 8)"
+  service_name="$(openssl rand -hex 4)"
+  if ! output="$(/usr/bin/RS generate reality-keypair 2>&1)"; then
+    tui_error "Could not generate the Reality key pair.\n$output"
+    return 1
+  fi
+  private_key="$(printf '%s\n' "$output" | sed -n 's/^PrivateKey:[[:space:]]*//p' | head -n 1)"
+  public_key="$(printf '%s\n' "$output" | sed -n 's/^PublicKey:[[:space:]]*//p' | head -n 1)"
+  if [[ -z "$private_key" || -z "$public_key" ]]; then
+    tui_error "sing-box-extended returned an invalid Reality key pair."
+    return 1
+  fi
+
+  sed -i \
+    -e "s/PORT/$user_port/g" \
+    -e "s/SNI/$user_sni/g" \
+    -e "s/NAME/Reality/g" \
+    -e "s/UUID/$uuid/g" \
+    -e "s/PRIVATE-KEY/$private_key/g" \
+    -e "s/SHORT-ID/$short_id/g" \
+    -e "s/PATH/$service_name/g" \
+    /etc/reality/config.json
+
+  if [[ "$Transport" == "tcp" && "$flow_mode" == "without_flow" ]]; then
+    tmp_json="$(mktemp /tmp/reality-config.XXXXXX)" || return 1
+    if ! jq 'del(.inbounds[0].users[0].flow)' /etc/reality/config.json >"$tmp_json"; then
+      rm -f "$tmp_json"
+      tui_error "Could not remove Flow from the Reality configuration."
+      return 1
+    fi
+    mv "$tmp_json" /etc/reality/config.json
+  fi
+
+  check_log="$(mktemp /tmp/reality-check.XXXXXX)" || return 1
+  if ! /usr/bin/RS check -c /etc/reality/config.json >"$check_log" 2>&1; then
+    if command -v whiptail >/dev/null 2>&1; then
+      whiptail --title "Reality config error" --textbox "$check_log" 22 78
+    else
+      cat "$check_log" >&2
+    fi
+    rm -f "$check_log"
+    return 1
+  fi
+  rm -f "$check_log"
+
+  public_ipv4=$(wget -qO- --no-check-certificate --user-agent=Mozilla --tries=2 --timeout=2 https://v4.ident.me)
+  public_ipv6=$(wget -qO- --no-check-certificate --user-agent=Mozilla --tries=2 --timeout=2 https://v6.ident.me)
+
+  set_ufw tcp
+
+  if ! systemctl enable --now RS; then
+    tui_error "Reality was configured, but the RS service could not be started."
+    return 1
+  fi
+
+  if ! crontab -l 2>/dev/null | grep -Fq "systemctl restart RS"; then
+    (crontab -l 2>/dev/null; echo "0 */5 * * * systemctl restart RS") | crontab -
+  fi
+
+  if [[ "$Transport" == "grpc" ]]; then
+    result_url="
+        ipv4 : vless://$uuid@$public_ipv4:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=grpc&serviceName=$service_name&encryption=none#Reality
+        ---------------------------------------------------------------
+        ipv6 : vless://$uuid@[$public_ipv6]:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=grpc&serviceName=$service_name&encryption=none#Reality-V6"
+
+    result_url2="
+        ipv4 : vless://UUID@$public_ipv4:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=grpc&serviceName=$service_name&encryption=none#NAME-Reality
+        ---------------------------------------------------------------
+        ipv6 : vless://UUID@[$public_ipv6]:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=grpc&serviceName=$service_name&encryption=none#NAME-Reality-V6"
+  else
+    if [[ "$flow_mode" == "with_flow" ]]; then
+      flow_query="&flow=xtls-rprx-vision"
+    fi
+    result_url="
+        ipv4 : vless://$uuid@$public_ipv4:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=tcp${flow_query}&encryption=none#Reality
+        ---------------------------------------------------------------
+        ipv6 : vless://$uuid@[$public_ipv6]:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=tcp${flow_query}&encryption=none#Reality-V6"
+
+    result_url2="
+        ipv4 : vless://UUID@$public_ipv4:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=tcp${flow_query}&encryption=none#NAME-Reality
+        ---------------------------------------------------------------
+        ipv6 : vless://UUID@[$public_ipv6]:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=tcp${flow_query}&encryption=none#NAME-Reality-V6"
+  fi
+
+  echo -e "Config URL: $result_url" >/etc/reality/user-config.txt
+  echo -e "Config URL: $result_url2" >/etc/reality/config.txt
+  echo -e "Config URL: \e[91m$result_url\e[0m"
+
+  ipv4qr=$(grep -oP 'ipv4 : \K\S+' /etc/reality/user-config.txt)
+  ipv6qr=$(grep -oP 'ipv6 : \K\S+' /etc/reality/user-config.txt)
+  if command -v qrencode >/dev/null 2>&1; then
+    [[ -n "$ipv4qr" ]] && { echo "IPv4:"; qrencode -t ANSIUTF8 <<<"$ipv4qr"; }
+    [[ -n "$ipv6qr" ]] && { echo "IPv6:"; qrencode -t ANSIUTF8 <<<"$ipv6qr"; }
+  fi
+
+  if [[ "$mode" == "modify" ]]; then
+    completion_message="Reality configuration modified."
+  else
+    completion_message="Reality setup completed."
+  fi
+  echo "$completion_message"
+  echo -e "\e[31mPress Enter to Exit\e[0m"
+  read -r
+  clear
+}
+
+install_reality() {
+  configure_reality_tui install "$1"
+}
+
+modify_reality_config() {
+  configure_reality_tui modify "$1"
+}
+
+# Additional Reality users inherit the Flow choice made during installation.
+add_reality_user() {
+  local config_file="/etc/reality/config.json"
+  local name name_regex="^[A-Za-z0-9]+$" user_exists uuid transport_type
+  local default_flow tmp_config
+
+  if [[ ! -e "$config_file" ]]; then
+    whiptail --msgbox "Reality is not installed yet." 10 40
+    clear
+    return
+  fi
+
+  name=$(whiptail --inputbox "Enter the user's name:" 10 40 2>&1 >/dev/tty) || return
+  if [[ ! "$name" =~ $name_regex ]]; then
+    whiptail --msgbox "Invalid characters. Use only A-Z and 0-9." 10 50
+    clear
+    return
+  fi
+
+  user_exists=$(jq --arg name "$name" '.inbounds[0].users | map(select(.name == $name)) | length' "$config_file")
+  if [[ "$user_exists" -ne 0 ]]; then
+    whiptail --msgbox "User already exists!" 10 40
+    clear
+    return
+  fi
+
+  uuid="$(cat /proc/sys/kernel/random/uuid)"
+  transport_type="$(jq -r '.inbounds[0].transport.type // "tcp"' "$config_file")"
+  default_flow="$(jq -r '.inbounds[0].users[0].flow // ""' "$config_file")"
+  tmp_config="$(mktemp /tmp/reality-user.XXXXXX)" || return 1
+
+  if [[ "$transport_type" != "grpc" && "$default_flow" == "xtls-rprx-vision" ]]; then
+    jq --arg name "$name" --arg uuid "$uuid" \
+      '.inbounds[0].users += [{"name": $name, "uuid": $uuid, "flow": "xtls-rprx-vision"}]' \
+      "$config_file" >"$tmp_config"
+  else
+    jq --arg name "$name" --arg uuid "$uuid" \
+      '.inbounds[0].users += [{"name": $name, "uuid": $uuid}]' \
+      "$config_file" >"$tmp_config"
+  fi
+
+  if [[ $? -ne 0 ]]; then
+    rm -f "$tmp_config"
+    tui_error "Could not add the Reality user."
+    return 1
+  fi
+
+  mv "$tmp_config" "$config_file"
+  systemctl restart RS
+  whiptail --msgbox "User added successfully!" 10 40
+  clear
+}
+
+# Load the upstream TUI menu in the current shell, but omit its Source.sh line.
+# This keeps the menu UI current while retaining the overrides defined above.
+tui() {
+  local tui_script filtered_script status
+
+  if ! tui_script="$(curl -fsSL --retry 3 --connect-timeout 15 "$TUI_MENU_URL")"; then
+    tui_error "Could not download the TUI menu."
+    return 1
+  fi
+
+  filtered_script="$(printf '%s\n' "$tui_script" | \
+    sed '/^[[:space:]]*source <(curl .*Sing-Box_Config_Installer\/Source\.sh)/d')"
+  if [[ -z "$filtered_script" ]]; then
+    tui_error "The downloaded TUI menu is empty."
+    return 1
+  fi
+
+  source /dev/stdin <<<"$filtered_script"
+  status=$?
+  exit "$status"
+}
 
 root_check
 add_alias
