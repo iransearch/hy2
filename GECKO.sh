@@ -1,4 +1,4 @@
-پ#!/bin/bash
+#!/bin/bash
 
 source <(curl -sSL https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box_Config_Installer/Source.sh)
 
