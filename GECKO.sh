@@ -6,10 +6,13 @@ source <(curl -sSL https://raw.githubusercontent.com/TheyCallMeSecond/config-exa
 # TUI-only overrides
 #   - Install the latest sing-box-extended release instead of the upstream core.
 #   - Let TCP Reality installations choose whether to use XTLS Vision flow.
+#   - Add a complete VLESS + XHTTP + TLS manager.
 # The Legacy menu and every custom menu below remain unchanged.
 # -----------------------------------------------------------------------------
 TUI_EXTENDED_REPO="shtorm-7/sing-box-extended"
 TUI_MENU_URL="https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box_Config_Installer/TUI-Menu.sh"
+XHTTP_DIR="/etc/xhttp"
+XHTTP_SERVICE="XH"
 
 tui_error() {
   local message="$1"
@@ -81,7 +84,7 @@ install_core() {
     return 1
   fi
 
-  if ! tar -xzf "$tmp_dir/$archive_name" -C "$tmp_dir"; then
+  if ! tar --no-same-owner -xzf "$tmp_dir/$archive_name" -C "$tmp_dir"; then
     rm -rf "$tmp_dir"
     tui_error "The downloaded sing-box-extended archive is invalid."
     return 1
@@ -402,6 +405,849 @@ add_reality_user() {
   clear
 }
 
+# -----------------------------------------------------------------------------
+# VLESS + XHTTP + TLS
+#
+# sing-box-extended implements XHTTP as the "xhttp" V2Ray transport.  The
+# server is intentionally configured in auto mode so links can independently
+# use auto, stream-up, stream-one, or packet-up.
+# -----------------------------------------------------------------------------
+xhttp_urlencode() {
+  jq -rn --arg value "$1" '$value | @uri'
+}
+
+xhttp_is_hostname() {
+  local value="$1" label
+  local -a labels
+
+  [[ -n "$value" && ${#value} -le 253 ]] || return 1
+  [[ "$value" == *.* && "$value" != .* && "$value" != *. && "$value" != *..* ]] || return 1
+  [[ ! "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS='.' read -r -a labels <<<"$value"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
+  done
+}
+
+xhttp_normalize_address() {
+  local value="$1"
+  value="${value#[}"
+  value="${value%]}"
+  [[ -n "$value" && ${#value} -le 253 ]] || return 1
+  [[ "$value" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
+  printf '%s' "$value"
+}
+
+xhttp_normalize_path() {
+  local value="$1"
+  [[ -n "$value" ]] || value="/$(openssl rand -hex 8)"
+  [[ "$value" == /* ]] || value="/$value"
+  [[ ${#value} -le 200 && "$value" =~ ^/[A-Za-z0-9._~/-]+$ ]] || return 1
+  printf '%s' "$value"
+}
+
+xhttp_valid_user_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]]
+}
+
+select_xhttp_mode() {
+  local default_mode="${1:-auto}" choice
+  choice=$(whiptail --clear --title "XHTTP Mode" --default-item "$default_mode" \
+    --menu "Default mode for generated client links (the server accepts all modes):" 18 78 4 \
+    "auto" "Automatic mode selection" \
+    "stream-up" "Streaming upload with separate download" \
+    "stream-one" "Single bidirectional stream" \
+    "packet-up" "Packetized upload; broadly CDN compatible" \
+    2>&1 >/dev/tty) || return 1
+  printf '%s' "$choice"
+}
+
+select_xhttp_tls_mode() {
+  local default_mode="${1:-letsencrypt}" choice
+  choice=$(whiptail --clear --title "XHTTP TLS Certificate" --default-item "$default_mode" \
+    --menu "Select the TLS certificate type:" 16 78 2 \
+    "letsencrypt" "Trusted Let's Encrypt certificate (DNS must point to this server)" \
+    "selfsigned" "Self-signed certificate (flexible SNI; requires Allow Insecure)" \
+    2>&1 >/dev/tty) || return 1
+  printf '%s' "$choice"
+}
+
+select_xhttp_insecure() {
+  local default_value="${1:-false}" default_item="verify" choice
+  [[ "$default_value" == "true" ]] && default_item="insecure"
+  choice=$(whiptail --clear --title "XHTTP TLS Verification" --default-item "$default_item" \
+    --menu "Choose the client certificate-verification setting:" 16 78 2 \
+    "verify" "Verify the TLS certificate (recommended)" \
+    "insecure" "Add insecure=1 and allowInsecure=1 to links" \
+    2>&1 >/dev/tty) || return 1
+  if [[ "$choice" == "insecure" ]]; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+select_xhttp_fingerprint() {
+  local default_fingerprint="${1:-chrome}" choice
+  choice=$(whiptail --clear --title "XHTTP Fingerprint" --default-item "$default_fingerprint" \
+    --menu "Select the uTLS fingerprint used in generated links:" 18 70 5 \
+    "chrome" "Google Chrome" \
+    "firefox" "Mozilla Firefox" \
+    "safari" "Apple Safari" \
+    "edge" "Microsoft Edge" \
+    "randomized" "Randomized fingerprint" \
+    2>&1 >/dev/tty) || return 1
+  printf '%s' "$choice"
+}
+
+xhttp_collect_settings() {
+  local metadata_file="${1:-}"
+  local default_port="443" default_address="" default_sni=""
+  local default_host="" default_path="" default_mode="auto"
+  local default_tls_mode="letsencrypt" default_fingerprint="chrome"
+  local default_insecure="false" host_input metadata_loaded="false"
+
+  if [[ -f "$metadata_file" ]] && jq -e . "$metadata_file" >/dev/null 2>&1; then
+    metadata_loaded="true"
+    default_port="$(jq -r '.port // 443' "$metadata_file")"
+    default_address="$(jq -r '.address // ""' "$metadata_file")"
+    default_sni="$(jq -r '.sni // ""' "$metadata_file")"
+    default_host="$(jq -r '.host // ""' "$metadata_file")"
+    default_path="$(jq -r '.path // ""' "$metadata_file")"
+    default_mode="$(jq -r '.mode // "auto"' "$metadata_file")"
+    default_tls_mode="$(jq -r '.certificate_mode // "letsencrypt"' "$metadata_file")"
+    default_fingerprint="$(jq -r '.fingerprint // "chrome"' "$metadata_file")"
+    default_insecure="$(jq -r '.insecure // false' "$metadata_file")"
+  fi
+
+  XHTTP_PORT=$(whiptail --inputbox "Enter listening port:" 10 55 "$default_port" 2>&1 >/dev/tty) || return 1
+  if [[ ! "$XHTTP_PORT" =~ ^[0-9]+$ ]] || ((XHTTP_PORT < 1 || XHTTP_PORT > 65535)); then
+    tui_error "XHTTP port must be between 1 and 65535."
+    return 1
+  fi
+
+  XHTTP_TLS_MODE="$(select_xhttp_tls_mode "$default_tls_mode")" || return 1
+  XHTTP_SNI=$(whiptail --inputbox \
+    "Enter TLS SNI/certificate domain (for example speedtest.net):" \
+    10 78 "$default_sni" 2>&1 >/dev/tty) || return 1
+  if ! xhttp_is_hostname "$XHTTP_SNI"; then
+    tui_error "Enter a valid domain name for TLS SNI. IP addresses and URLs are not accepted."
+    return 1
+  fi
+
+  XHTTP_ADDRESS=$(whiptail --inputbox \
+    "Connection address in generated links (domain, IPv4, or IPv6; blank = SNI):" \
+    10 78 "$default_address" 2>&1 >/dev/tty) || return 1
+  [[ -n "$XHTTP_ADDRESS" ]] || XHTTP_ADDRESS="$XHTTP_SNI"
+  if ! XHTTP_ADDRESS="$(xhttp_normalize_address "$XHTTP_ADDRESS")"; then
+    tui_error "The XHTTP connection address is invalid. Do not include a scheme, port, or path."
+    return 1
+  fi
+
+  if [[ "$metadata_loaded" == "true" && -z "$default_host" ]]; then
+    default_host="-"
+  fi
+  host_input=$(whiptail --inputbox \
+    "XHTTP Host header (blank = SNI, '-' = omit):" \
+    10 78 "$default_host" 2>&1 >/dev/tty) || return 1
+  if [[ "$host_input" == "-" ]]; then
+    XHTTP_HOST=""
+  else
+    XHTTP_HOST="${host_input:-$XHTTP_SNI}"
+    if ! xhttp_is_hostname "$XHTTP_HOST"; then
+      tui_error "The XHTTP Host value must be a valid domain name, '-' or blank."
+      return 1
+    fi
+  fi
+
+  [[ -n "$default_path" ]] || default_path="/$(openssl rand -hex 8)"
+  XHTTP_PATH=$(whiptail --inputbox \
+    "Enter XHTTP path (letters, numbers, '.', '_', '~' and '-' are allowed):" \
+    10 78 "$default_path" 2>&1 >/dev/tty) || return 1
+  if ! XHTTP_PATH="$(xhttp_normalize_path "$XHTTP_PATH")"; then
+    tui_error "Invalid XHTTP path. Example: /NEWS or /api/v1/connect"
+    return 1
+  fi
+
+  XHTTP_MODE="$(select_xhttp_mode "$default_mode")" || return 1
+  XHTTP_FINGERPRINT="$(select_xhttp_fingerprint "$default_fingerprint")" || return 1
+
+  if [[ "$XHTTP_TLS_MODE" == "selfsigned" ]]; then
+    XHTTP_INSECURE="true"
+  else
+    XHTTP_INSECURE="$(select_xhttp_insecure "$default_insecure")" || return 1
+  fi
+}
+
+xhttp_create_selfsigned_certificate() {
+  local target_dir="$1" sni="$2" openssl_config="$1/openssl.cnf"
+
+  command -v openssl >/dev/null 2>&1 || {
+    tui_error "OpenSSL is required to create the XHTTP certificate."
+    return 1
+  }
+
+  cat >"$openssl_config" <<EOF_XHTTP_OPENSSL
+[req]
+distinguished_name = subject
+x509_extensions = extensions
+prompt = no
+
+[subject]
+CN = $sni
+
+[extensions]
+subjectAltName = DNS:$sni
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+basicConstraints = critical, CA:FALSE
+EOF_XHTTP_OPENSSL
+
+  if ! openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 3650 \
+    -keyout "$target_dir/server.key" \
+    -out "$target_dir/server.crt" \
+    -config "$openssl_config" >/dev/null 2>&1; then
+    rm -f "$openssl_config"
+    tui_error "Could not create the self-signed XHTTP certificate."
+    return 1
+  fi
+  rm -f "$openssl_config"
+  chmod 0600 "$target_dir/server.key"
+  chmod 0644 "$target_dir/server.crt"
+}
+
+XHTTP_RESTART_SERVICES=()
+
+xhttp_restart_http_services() {
+  local unit
+  for unit in "${XHTTP_RESTART_SERVICES[@]}"; do
+    systemctl start "$unit" >/dev/null 2>&1 || true
+  done
+  XHTTP_RESTART_SERVICES=()
+}
+
+xhttp_stop_port_80_services() {
+  local pid unit existing
+  local -a pids
+  XHTTP_RESTART_SERVICES=()
+
+  command -v lsof >/dev/null 2>&1 || return 0
+  mapfile -t pids < <(lsof -nP -t -iTCP:80 -sTCP:LISTEN 2>/dev/null | sort -u)
+  for pid in "${pids[@]}"; do
+    [[ -r "/proc/$pid/cgroup" ]] || continue
+    unit=$(awk -F/ '{for (i = 1; i <= NF; i++) if ($i ~ /\.service$/) {print $i; exit}}' "/proc/$pid/cgroup")
+    if [[ -z "$unit" ]]; then
+      xhttp_restart_http_services
+      tui_error "Port 80 is used by PID $pid and its systemd service could not be identified. Stop it before requesting a certificate."
+      return 1
+    fi
+    existing=" $(printf '%s ' "${XHTTP_RESTART_SERVICES[@]}")"
+    if [[ "$existing" != *" $unit "* ]] && systemctl is-active --quiet "$unit"; then
+      if ! systemctl stop "$unit"; then
+        xhttp_restart_http_services
+        tui_error "Could not temporarily stop $unit to free port 80 for Let's Encrypt."
+        return 1
+      fi
+      XHTTP_RESTART_SERVICES+=("$unit")
+    fi
+  done
+}
+
+xhttp_obtain_letsencrypt_certificate() {
+  local target_dir="$1" domain="$2" cert_dir="/etc/letsencrypt/live/$2" status
+
+  command -v certbot >/dev/null 2>&1 || {
+    tui_error "Certbot is required for Let's Encrypt. Install certbot or choose a self-signed certificate."
+    return 1
+  }
+
+  if [[ ! -s "$cert_dir/fullchain.pem" || ! -s "$cert_dir/privkey.pem" ]] || \
+    ! openssl x509 -checkend 604800 -noout -in "$cert_dir/fullchain.pem" >/dev/null 2>&1; then
+    xhttp_stop_port_80_services || return 1
+    certbot certonly --standalone --preferred-challenges http \
+      --non-interactive --agree-tos --register-unsafely-without-email \
+      --keep-until-expiring -d "$domain"
+    status=$?
+    xhttp_restart_http_services
+    if ((status != 0)); then
+      tui_error "Let's Encrypt certificate generation failed. Verify DNS and inbound TCP port 80, or choose self-signed TLS."
+      return 1
+    fi
+  fi
+
+  if [[ ! -s "$cert_dir/fullchain.pem" || ! -s "$cert_dir/privkey.pem" ]]; then
+    tui_error "Let's Encrypt completed without creating the expected certificate files."
+    return 1
+  fi
+  install -m 0644 "$cert_dir/fullchain.pem" "$target_dir/server.crt"
+  install -m 0600 "$cert_dir/privkey.pem" "$target_dir/server.key"
+}
+
+xhttp_prepare_certificate() {
+  local target_dir="$1" certificate_mode="$2" sni="$3"
+  if [[ "$certificate_mode" == "letsencrypt" ]]; then
+    xhttp_obtain_letsencrypt_certificate "$target_dir" "$sni"
+  else
+    xhttp_create_selfsigned_certificate "$target_dir" "$sni"
+  fi
+}
+
+xhttp_build_server_config() {
+  local output_file="$1" cert_path="$2" key_path="$3" users_json="$4"
+  jq -n \
+    --argjson port "$XHTTP_PORT" \
+    --arg sni "$XHTTP_SNI" \
+    --arg cert_path "$cert_path" \
+    --arg key_path "$key_path" \
+    --arg path "$XHTTP_PATH" \
+    --argjson users "$users_json" \
+    '{
+      "log": {
+        "level": "info",
+        "timestamp": true
+      },
+      "inbounds": [
+        {
+          "type": "vless",
+          "tag": "vless-xhttp-in",
+          "listen": "::",
+          "listen_port": $port,
+          "users": $users,
+          "tls": {
+            "enabled": true,
+            "server_name": $sni,
+            "alpn": "h2",
+            "certificate_path": $cert_path,
+            "key_path": $key_path
+          },
+          "transport": {
+            "type": "xhttp",
+            "mode": "auto",
+            "host": "",
+            "path": $path,
+            "headers": {},
+            "x_padding_bytes": "100-1000",
+            "no_sse_header": false,
+            "sc_max_each_post_bytes": 1000000,
+            "sc_max_buffered_posts": 30,
+            "sc_stream_up_server_secs": "20-80"
+          }
+        }
+      ],
+      "outbounds": [
+        {
+          "type": "direct",
+          "tag": "direct"
+        }
+      ],
+      "route": {
+        "rules": [
+          {
+            "action": "sniff"
+          }
+        ],
+        "final": "direct",
+        "auto_detect_interface": true
+      }
+    }' >"$output_file"
+}
+
+xhttp_write_metadata() {
+  local output_file="$1"
+  jq -n \
+    --arg address "$XHTTP_ADDRESS" \
+    --argjson port "$XHTTP_PORT" \
+    --arg sni "$XHTTP_SNI" \
+    --arg host "$XHTTP_HOST" \
+    --arg path "$XHTTP_PATH" \
+    --arg mode "$XHTTP_MODE" \
+    --arg fingerprint "$XHTTP_FINGERPRINT" \
+    --argjson insecure "$XHTTP_INSECURE" \
+    --arg certificate_mode "$XHTTP_TLS_MODE" \
+    '{
+      "address": $address,
+      "port": $port,
+      "sni": $sni,
+      "host": $host,
+      "path": $path,
+      "mode": $mode,
+      "fingerprint": $fingerprint,
+      "insecure": $insecure,
+      "certificate_mode": $certificate_mode
+    }' >"$output_file"
+}
+
+xhttp_build_link() {
+  local metadata_file="$1" uuid="$2" name="$3"
+  local address port sni host path mode fingerprint insecure authority query
+
+  address="$(jq -r '.address' "$metadata_file")"
+  port="$(jq -r '.port' "$metadata_file")"
+  sni="$(jq -r '.sni' "$metadata_file")"
+  host="$(jq -r '.host // ""' "$metadata_file")"
+  path="$(jq -r '.path' "$metadata_file")"
+  mode="$(jq -r '.mode' "$metadata_file")"
+  fingerprint="$(jq -r '.fingerprint' "$metadata_file")"
+  insecure="$(jq -r '.insecure // false' "$metadata_file")"
+
+  if [[ "$address" == *:* ]]; then
+    authority="[$address]"
+  else
+    authority="$address"
+  fi
+
+  query="encryption=none&security=tls&sni=$(xhttp_urlencode "$sni")&fp=$(xhttp_urlencode "$fingerprint")"
+  if [[ "$insecure" == "true" ]]; then
+    query+="&insecure=1&allowInsecure=1"
+  fi
+  query+="&type=xhttp"
+  if [[ -n "$host" ]]; then
+    query+="&host=$(xhttp_urlencode "$host")"
+  fi
+  query+="&path=$(xhttp_urlencode "$path")&mode=$(xhttp_urlencode "$mode")"
+
+  printf 'vless://%s@%s:%s?%s#%s' \
+    "$uuid" "$authority" "$port" "$query" "$(xhttp_urlencode "$name")"
+}
+
+xhttp_write_links() {
+  local config_file="${1:-$XHTTP_DIR/config.json}"
+  local metadata_file="${2:-$XHTTP_DIR/client.json}"
+  local name uuid link
+
+  [[ -f "$config_file" && -f "$metadata_file" ]] || return 1
+  : >"$XHTTP_DIR/user-config.txt"
+  while IFS=$'\t' read -r name uuid; do
+    [[ -n "$name" && -n "$uuid" ]] || continue
+    link="$(xhttp_build_link "$metadata_file" "$uuid" "$name-XHTTP")" || return 1
+    printf '%s\n' "$link" >>"$XHTTP_DIR/user-config.txt"
+  done < <(jq -r '.inbounds[0].users[] | [.name, .uuid] | @tsv' "$config_file")
+
+  xhttp_build_link "$metadata_file" "UUID" "NAME-XHTTP" >"$XHTTP_DIR/config.txt"
+  printf '\n' >>"$XHTTP_DIR/config.txt"
+}
+
+xhttp_write_service() {
+  cat >"/etc/systemd/system/${XHTTP_SERVICE}.service" <<'EOF_XHTTP_SERVICE'
+[Unit]
+Description=VLESS XHTTP TLS (sing-box-extended)
+Documentation=https://github.com/shtorm-7/sing-box-extended
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/XH run -c /etc/xhttp/config.json
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF_XHTTP_SERVICE
+}
+
+xhttp_show_config() {
+  local metadata_file="$XHTTP_DIR/client.json" link index=0
+  if [[ ! -f "$XHTTP_DIR/config.json" || ! -f "$metadata_file" ]]; then
+    whiptail --msgbox "XHTTP is not installed yet." 10 45
+    clear
+    return
+  fi
+
+  xhttp_write_links || {
+    tui_error "Could not regenerate XHTTP user links."
+    return 1
+  }
+
+  clear
+  echo "VLESS + XHTTP + TLS"
+  echo "Address : $(jq -r '.address' "$metadata_file"):$(jq -r '.port' "$metadata_file")"
+  echo "SNI     : $(jq -r '.sni' "$metadata_file")"
+  echo "Host    : $(jq -r 'if .host == "" then "(omitted)" else .host end' "$metadata_file")"
+  echo "Path    : $(jq -r '.path' "$metadata_file")"
+  echo "Mode    : $(jq -r '.mode' "$metadata_file") (server: auto)"
+  echo
+  while IFS= read -r link; do
+    [[ -n "$link" ]] || continue
+    ((index += 1))
+    echo "[$index] $link"
+    if command -v qrencode >/dev/null 2>&1; then
+      qrencode -t ANSIUTF8 <<<"$link"
+    fi
+    echo
+  done <"$XHTTP_DIR/user-config.txt"
+  echo -e "\e[31mPress Enter to return\e[0m"
+  read -r
+  clear
+}
+
+configure_xhttp_tui() {
+  local operation="$1" stage_dir backup_dir="" service_backup=""
+  local users_json uuid check_log final_config old_installed="false"
+  local final_cert_path final_key_path user_port
+
+  if [[ "$operation" == "install" && -f "$XHTTP_DIR/config.json" ]]; then
+    whiptail --msgbox "XHTTP is already installed." 10 45
+    clear
+    return
+  fi
+  if [[ "$operation" == "modify" && ! -f "$XHTTP_DIR/config.json" ]]; then
+    whiptail --msgbox "XHTTP is not installed yet." 10 45
+    clear
+    return
+  fi
+
+  xhttp_collect_settings "$XHTTP_DIR/client.json" || return 0
+  install_core "$XHTTP_SERVICE" || return 1
+
+  stage_dir="$(mktemp -d /tmp/xhttp-stage.XXXXXX)" || {
+    tui_error "Could not create the XHTTP staging directory."
+    return 1
+  }
+
+  if [[ "$operation" == "modify" ]]; then
+    users_json="$(jq -c '.inbounds[0].users' "$XHTTP_DIR/config.json")"
+    old_installed="true"
+  else
+    uuid="$(cat /proc/sys/kernel/random/uuid)"
+    users_json="$(jq -nc --arg uuid "$uuid" '[{"name":"default","uuid":$uuid}]')"
+  fi
+  if [[ -z "$users_json" || "$users_json" == "null" ]]; then
+    rm -rf "$stage_dir"
+    tui_error "Could not read the XHTTP users."
+    return 1
+  fi
+
+  if ! xhttp_prepare_certificate "$stage_dir" "$XHTTP_TLS_MODE" "$XHTTP_SNI"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  if ! xhttp_build_server_config "$stage_dir/config.json" \
+    "$stage_dir/server.crt" "$stage_dir/server.key" "$users_json"; then
+    rm -rf "$stage_dir"
+    tui_error "Could not build the XHTTP server configuration."
+    return 1
+  fi
+  if ! xhttp_write_metadata "$stage_dir/client.json"; then
+    rm -rf "$stage_dir"
+    tui_error "Could not build the XHTTP client metadata."
+    return 1
+  fi
+
+  check_log="$(mktemp /tmp/xhttp-check.XXXXXX)" || {
+    rm -rf "$stage_dir"
+    return 1
+  }
+  if ! "/usr/bin/$XHTTP_SERVICE" check -c "$stage_dir/config.json" >"$check_log" 2>&1; then
+    sed -i $'s/\033\\[[0-9;]*m//g' "$check_log" 2>/dev/null || true
+    whiptail --title "XHTTP config error" --textbox "$check_log" 22 78
+    rm -f "$check_log"
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  rm -f "$check_log"
+
+  final_config="$stage_dir/final-config.json"
+  if [[ "$XHTTP_TLS_MODE" == "letsencrypt" ]]; then
+    final_cert_path="/etc/letsencrypt/live/$XHTTP_SNI/fullchain.pem"
+    final_key_path="/etc/letsencrypt/live/$XHTTP_SNI/privkey.pem"
+  else
+    final_cert_path="/etc/xhttp/server.crt"
+    final_key_path="/etc/xhttp/server.key"
+  fi
+  if ! jq --arg cert_path "$final_cert_path" --arg key_path "$final_key_path" \
+    '.inbounds[0].tls.certificate_path = $cert_path |
+     .inbounds[0].tls.key_path = $key_path' \
+    "$stage_dir/config.json" >"$final_config"; then
+    rm -rf "$stage_dir"
+    tui_error "Could not finalize the XHTTP certificate paths."
+    return 1
+  fi
+
+  if [[ -d "$XHTTP_DIR" ]]; then
+    backup_dir="$(mktemp -d /tmp/xhttp-backup.XXXXXX)" || {
+      rm -rf "$stage_dir"
+      return 1
+    }
+    cp -a "$XHTTP_DIR/." "$backup_dir/"
+  fi
+  if [[ -f "/etc/systemd/system/${XHTTP_SERVICE}.service" ]]; then
+    service_backup="$(mktemp /tmp/xhttp-service.XXXXXX)"
+    cp -a "/etc/systemd/system/${XHTTP_SERVICE}.service" "$service_backup"
+  fi
+
+  systemctl stop "$XHTTP_SERVICE" >/dev/null 2>&1 || true
+  mkdir -p "$XHTTP_DIR"
+  install -m 0644 "$final_config" "$XHTTP_DIR/config.json"
+  install -m 0644 "$stage_dir/client.json" "$XHTTP_DIR/client.json"
+  install -m 0644 "$stage_dir/server.crt" "$XHTTP_DIR/server.crt"
+  install -m 0600 "$stage_dir/server.key" "$XHTTP_DIR/server.key"
+  xhttp_write_service
+  systemctl daemon-reload
+
+  user_port="$XHTTP_PORT"
+  set_ufw tcp
+  if ! systemctl enable --now "$XHTTP_SERVICE"; then
+    systemctl stop "$XHTTP_SERVICE" >/dev/null 2>&1 || true
+    systemctl disable "$XHTTP_SERVICE" >/dev/null 2>&1 || true
+    if [[ -n "$backup_dir" ]]; then
+      rm -rf "$XHTTP_DIR"
+      mkdir -p "$XHTTP_DIR"
+      cp -a "$backup_dir/." "$XHTTP_DIR/"
+    else
+      rm -rf "$XHTTP_DIR"
+    fi
+    if [[ -n "$service_backup" ]]; then
+      cp -a "$service_backup" "/etc/systemd/system/${XHTTP_SERVICE}.service"
+    else
+      rm -f "/etc/systemd/system/${XHTTP_SERVICE}.service"
+    fi
+    systemctl daemon-reload
+    [[ "$old_installed" == "true" ]] && systemctl start "$XHTTP_SERVICE" >/dev/null 2>&1 || true
+    rm -rf "$stage_dir"
+    [[ -n "$backup_dir" ]] && rm -rf "$backup_dir"
+    [[ -n "$service_backup" ]] && rm -f "$service_backup"
+    tui_error "XHTTP configuration was valid, but the service could not start. The previous installation was restored."
+    return 1
+  fi
+
+  if ! crontab -l 2>/dev/null | grep -Fq "systemctl restart $XHTTP_SERVICE"; then
+    (crontab -l 2>/dev/null; echo "0 */5 * * * systemctl restart $XHTTP_SERVICE") | crontab -
+  fi
+  xhttp_write_links
+
+  rm -rf "$stage_dir"
+  [[ -n "$backup_dir" ]] && rm -rf "$backup_dir"
+  [[ -n "$service_backup" ]] && rm -f "$service_backup"
+  if [[ "$operation" == "modify" ]]; then
+    echo "XHTTP configuration modified successfully."
+  else
+    echo "XHTTP installed successfully."
+  fi
+  xhttp_show_config
+}
+
+install_xhttp() {
+  configure_xhttp_tui install
+}
+
+modify_xhttp_config() {
+  configure_xhttp_tui modify
+}
+
+xhttp_commit_user_config() {
+  local candidate="$1" backup restart_status
+  backup="$(mktemp /tmp/xhttp-config-backup.XXXXXX)" || return 1
+  cp -a "$XHTTP_DIR/config.json" "$backup"
+  install -m 0644 "$candidate" "$XHTTP_DIR/config.json"
+  systemctl restart "$XHTTP_SERVICE"
+  restart_status=$?
+  if ((restart_status != 0)) || ! xhttp_write_links; then
+    cp -a "$backup" "$XHTTP_DIR/config.json"
+    systemctl restart "$XHTTP_SERVICE" >/dev/null 2>&1 || true
+    xhttp_write_links >/dev/null 2>&1 || true
+    rm -f "$backup"
+    return 1
+  fi
+  rm -f "$backup"
+}
+
+add_xhttp_user() {
+  local name uuid candidate check_log
+  if [[ ! -f "$XHTTP_DIR/config.json" ]]; then
+    whiptail --msgbox "XHTTP is not installed yet." 10 45
+    clear
+    return
+  fi
+
+  name=$(whiptail --inputbox "User name (A-Z, 0-9, '.', '_' or '-'):" 10 60 2>&1 >/dev/tty) || return
+  if ! xhttp_valid_user_name "$name"; then
+    tui_error "Invalid name. Use 1-32 ASCII letters, numbers, '.', '_' or '-'."
+    return 1
+  fi
+  if jq -e --arg name "$name" '.inbounds[0].users[] | select(.name == $name)' \
+    "$XHTTP_DIR/config.json" >/dev/null; then
+    tui_error "An XHTTP user with this name already exists."
+    return 1
+  fi
+
+  uuid="$(cat /proc/sys/kernel/random/uuid)"
+  candidate="$(mktemp /tmp/xhttp-user.XXXXXX)" || return 1
+  if ! jq --arg name "$name" --arg uuid "$uuid" \
+    '.inbounds[0].users += [{"name":$name,"uuid":$uuid}]' \
+    "$XHTTP_DIR/config.json" >"$candidate"; then
+    rm -f "$candidate"
+    tui_error "Could not add the XHTTP user."
+    return 1
+  fi
+
+  check_log="$(mktemp /tmp/xhttp-check.XXXXXX)" || {
+    rm -f "$candidate"
+    return 1
+  }
+  if ! "/usr/bin/$XHTTP_SERVICE" check -c "$candidate" >"$check_log" 2>&1; then
+    sed -i $'s/\033\\[[0-9;]*m//g' "$check_log" 2>/dev/null || true
+    whiptail --title "XHTTP config error" --textbox "$check_log" 22 78
+    rm -f "$check_log" "$candidate"
+    return 1
+  fi
+  rm -f "$check_log"
+
+  if ! xhttp_commit_user_config "$candidate"; then
+    rm -f "$candidate"
+    tui_error "The XHTTP service rejected the new user; the previous config was restored."
+    return 1
+  fi
+  rm -f "$candidate"
+  whiptail --msgbox "XHTTP user '$name' added successfully." 10 55
+  xhttp_show_config
+}
+
+remove_xhttp_user() {
+  local count choice candidate check_log
+  local name uuid
+  local -a menu_items=()
+
+  if [[ ! -f "$XHTTP_DIR/config.json" ]]; then
+    whiptail --msgbox "XHTTP is not installed yet." 10 45
+    clear
+    return
+  fi
+  count="$(jq '.inbounds[0].users | length' "$XHTTP_DIR/config.json")"
+  if ((count <= 1)); then
+    whiptail --msgbox "The last XHTTP user cannot be removed." 10 50
+    return
+  fi
+
+  while IFS=$'\t' read -r name uuid; do
+    menu_items+=("$name" "$uuid")
+  done < <(jq -r '.inbounds[0].users[] | [.name, .uuid] | @tsv' "$XHTTP_DIR/config.json")
+  choice=$(whiptail --clear --title "Remove XHTTP User" \
+    --menu "Select the user to remove:" 20 78 10 \
+    "${menu_items[@]}" 2>&1 >/dev/tty) || return
+
+  candidate="$(mktemp /tmp/xhttp-user.XXXXXX)" || return 1
+  if ! jq --arg name "$choice" \
+    '.inbounds[0].users |= map(select(.name != $name))' \
+    "$XHTTP_DIR/config.json" >"$candidate"; then
+    rm -f "$candidate"
+    tui_error "Could not remove the XHTTP user."
+    return 1
+  fi
+
+  check_log="$(mktemp /tmp/xhttp-check.XXXXXX)" || {
+    rm -f "$candidate"
+    return 1
+  }
+  if ! "/usr/bin/$XHTTP_SERVICE" check -c "$candidate" >"$check_log" 2>&1; then
+    sed -i $'s/\033\\[[0-9;]*m//g' "$check_log" 2>/dev/null || true
+    whiptail --title "XHTTP config error" --textbox "$check_log" 22 78
+    rm -f "$check_log" "$candidate"
+    return 1
+  fi
+  rm -f "$check_log"
+
+  if ! xhttp_commit_user_config "$candidate"; then
+    rm -f "$candidate"
+    tui_error "The XHTTP service rejected the change; the previous config was restored."
+    return 1
+  fi
+  rm -f "$candidate"
+  whiptail --msgbox "XHTTP user '$choice' removed successfully." 10 55
+  clear
+}
+
+update_xhttp_core() {
+  local check_log
+  if [[ ! -f "$XHTTP_DIR/config.json" ]]; then
+    whiptail --msgbox "XHTTP is not installed yet." 10 45
+    return
+  fi
+  install_core "$XHTTP_SERVICE" || return 1
+  check_log="$(mktemp /tmp/xhttp-check.XXXXXX)" || return 1
+  if ! "/usr/bin/$XHTTP_SERVICE" check -c "$XHTTP_DIR/config.json" >"$check_log" 2>&1; then
+    sed -i $'s/\033\\[[0-9;]*m//g' "$check_log" 2>/dev/null || true
+    whiptail --title "XHTTP config error" --textbox "$check_log" 22 78
+    rm -f "$check_log"
+    return 1
+  fi
+  rm -f "$check_log"
+  if systemctl restart "$XHTTP_SERVICE"; then
+    whiptail --msgbox "The XHTTP sing-box-extended core was updated successfully." 10 60
+  else
+    tui_error "The XHTTP core was updated, but its service could not restart."
+    return 1
+  fi
+}
+
+uninstall_xhttp() {
+  local crontab_file
+  if ! whiptail --title "Uninstall XHTTP" --yesno \
+    "Remove XHTTP, all users, certificates and generated links?" 12 68; then
+    return
+  fi
+  systemctl disable --now "$XHTTP_SERVICE" >/dev/null 2>&1 || true
+  rm -f "/usr/bin/$XHTTP_SERVICE"
+  rm -rf "$XHTTP_DIR"
+  rm -f "/etc/systemd/system/${XHTTP_SERVICE}.service"
+  crontab_file="$(mktemp /tmp/xhttp-crontab.XXXXXX)" || crontab_file=""
+  if [[ -n "$crontab_file" ]] && crontab -l >"$crontab_file" 2>/dev/null; then
+    sed "/systemctl restart $XHTTP_SERVICE/d" "$crontab_file" | crontab -
+  fi
+  [[ -n "$crontab_file" ]] && rm -f "$crontab_file"
+  systemctl daemon-reload
+  whiptail --msgbox "XHTTP uninstalled successfully. Let's Encrypt account data was kept." 10 70
+  clear
+}
+
+inject_xhttp_tui_menu() {
+  local script="$1"
+  local main_marker='        "VLESS-gRPC-tls" "Manage VLESS-gRPC-tls" \'
+  local main_entry='        "VLESS-XHTTP-tls" "Manage VLESS-XHTTP-tls" \'
+  local case_marker='    "VLESS-WebSocket-tls")'
+  local xhttp_case
+
+  IFS= read -r -d '' xhttp_case <<'EOF_XHTTP_TUI_CASE' || true
+    "VLESS-XHTTP-tls")
+        while true; do
+            user_choice=$(whiptail --clear --title "VLESS-XHTTP-tls Menu" --menu "Please select an option:" 25 58 15 \
+                "1" "Install" \
+                "2" "Modify Config" \
+                "3" "Add a new user" \
+                "4" "Remove an existing user" \
+                "5" "Show User Configs" \
+                "6" "Update sing-box-extended core" \
+                "7" "Uninstall" \
+                "0" "Back to Main Menu" 3>&1 1>&2 2>&3)
+            case $user_choice in
+            "1") clear; install_xhttp ;;
+            "2") clear; modify_xhttp_config ;;
+            "3") clear; add_xhttp_user ;;
+            "4") clear; remove_xhttp_user ;;
+            "5") clear; xhttp_show_config ;;
+            "6") clear; update_xhttp_core ;;
+            "7") clear; uninstall_xhttp ;;
+            "0") break ;;
+            *) whiptail --msgbox "Invalid choice. Please select a valid option." 10 45 ;;
+            esac
+        done
+        ;;
+EOF_XHTTP_TUI_CASE
+
+  if [[ "$script" != *'"VLESS-XHTTP-tls" "Manage VLESS-XHTTP-tls"'* ]]; then
+    [[ "$script" == *"$main_marker"* ]] || return 1
+    script="${script/"$main_marker"/"$main_marker"$'\n'"$main_entry"}"
+  fi
+  if [[ "$script" != *'"VLESS-XHTTP-tls")'* ]]; then
+    [[ "$script" == *"$case_marker"* ]] || return 1
+    script="${script/"$case_marker"/"$xhttp_case"$'\n'"$case_marker"}"
+  fi
+  printf '%s\n' "$script"
+}
+
 # Load the upstream TUI menu in the current shell, but omit its Source.sh line.
 # This keeps the menu UI current while retaining the overrides defined above.
 tui() {
@@ -418,6 +1264,10 @@ tui() {
     tui_error "The downloaded TUI menu is empty."
     return 1
   fi
+  if ! filtered_script="$(inject_xhttp_tui_menu "$filtered_script")"; then
+    tui_error "The upstream TUI menu changed and the XHTTP item could not be inserted safely."
+    return 1
+  fi
 
   source /dev/stdin <<<"$filtered_script"
   status=$?
@@ -432,7 +1282,7 @@ get_storage_usage
 check_system_info
 check_system_ip
 
-processes=("SH:Hysteria2:/etc/hysteria2/server.json" "ST:ShadowTLS:/etc/shadowtls/config.json" "WS:WebSocket:/etc/ws/config.json" "RS:Reality:/etc/reality/config.json" "NS:Naive:/etc/naive/config.json" "TS:TUIC:/etc/tuic/server.json" "GS:gRPC:/etc/grpc/config.json")
+processes=("SH:Hysteria2:/etc/hysteria2/server.json" "ST:ShadowTLS:/etc/shadowtls/config.json" "WS:WebSocket:/etc/ws/config.json" "RS:Reality:/etc/reality/config.json" "NS:Naive:/etc/naive/config.json" "TS:TUIC:/etc/tuic/server.json" "GS:gRPC:/etc/grpc/config.json" "XH:XHTTP:/etc/xhttp/config.json")
 
 
 apply_hy2_network_and_limits_optimize() {
