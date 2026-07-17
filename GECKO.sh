@@ -128,6 +128,49 @@ select_reality_flow() {
   printf '%s' "$choice"
 }
 
+# The upstream TUI templates still use fields removed in sing-box 1.13.
+# Convert them to rule actions before validating or starting Reality.
+migrate_reality_config_113() {
+  local config_file="$1"
+  local migrated_file
+
+  migrated_file="$(mktemp /tmp/reality-migrate.XXXXXX)" || return 1
+  if ! jq '
+    del(
+      .inbounds[].sniff,
+      .inbounds[].sniff_override_destination,
+      .inbounds[].sniff_timeout,
+      .inbounds[].domain_strategy,
+      .inbounds[].udp_disable_domain_unmapping
+    )
+    | .route.rules = (
+        [{"action": "sniff"}]
+        + [
+            .route.rules[]
+            | select(.action != "sniff")
+            | if (.outbound? == "block") then
+                del(.outbound) + {"action": "reject"}
+              elif (.outbound? == "dns") then
+                del(.outbound) + {"action": "hijack-dns"}
+              elif has("outbound") then
+                . + {"action": "route"}
+              else
+                .
+              end
+          ]
+      )
+    | .outbounds = [
+        .outbounds[]
+        | select(.type != "block" and .type != "dns")
+      ]
+  ' "$config_file" >"$migrated_file"; then
+    rm -f "$migrated_file"
+    return 1
+  fi
+
+  mv "$migrated_file" "$config_file"
+}
+
 configure_reality_tui() {
   local mode="$1"
   local Transport="$2"
@@ -209,6 +252,11 @@ configure_reality_tui() {
     -e "s/PATH/$service_name/g" \
     /etc/reality/config.json
 
+  if ! migrate_reality_config_113 /etc/reality/config.json; then
+    tui_error "Could not migrate the Reality template to sing-box 1.13 format."
+    return 1
+  fi
+
   if [[ "$Transport" == "tcp" && "$flow_mode" == "without_flow" ]]; then
     tmp_json="$(mktemp /tmp/reality-config.XXXXXX)" || return 1
     if ! jq 'del(.inbounds[0].users[0].flow)' /etc/reality/config.json >"$tmp_json"; then
@@ -221,6 +269,7 @@ configure_reality_tui() {
 
   check_log="$(mktemp /tmp/reality-check.XXXXXX)" || return 1
   if ! /usr/bin/RS check -c /etc/reality/config.json >"$check_log" 2>&1; then
+    sed -i $'s/\033\\[[0-9;]*m//g' "$check_log" 2>/dev/null || true
     if command -v whiptail >/dev/null 2>&1; then
       whiptail --title "Reality config error" --textbox "$check_log" 22 78
     else
