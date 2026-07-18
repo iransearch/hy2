@@ -5,12 +5,15 @@ source <(curl -sSL https://raw.githubusercontent.com/TheyCallMeSecond/config-exa
 # -----------------------------------------------------------------------------
 # TUI-only overrides
 #   - Install the latest sing-box-extended release instead of the upstream core.
-#   - Let TCP Reality installations choose whether to use XTLS Vision flow.
+#   - Manage simultaneous TCP/gRPC Reality configs with optional XTLS Vision.
 #   - Add a complete VLESS + XHTTP + TLS manager.
 # The Legacy menu and every custom menu below remain unchanged.
 # -----------------------------------------------------------------------------
 TUI_EXTENDED_REPO="shtorm-7/sing-box-extended"
 TUI_MENU_URL="https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box_Config_Installer/TUI-Menu.sh"
+REALITY_DIR="/etc/reality"
+REALITY_INSTANCES_DIR="$REALITY_DIR/instances"
+REALITY_SERVICE="RS"
 XHTTP_DIR="/etc/xhttp"
 XHTTP_SERVICE="XH"
 
@@ -121,288 +124,1007 @@ install_core() {
   echo "Installed: $installed_version"
 }
 
-select_reality_flow() {
-  local choice
-  choice=$(whiptail --clear --title "Reality Flow" \
-    --menu "Select Flow mode for Reality TCP:" 15 72 2 \
-    "with_flow" "With Flow (xtls-rprx-vision)" \
-    "without_flow" "Without Flow" \
+# -----------------------------------------------------------------------------
+# Multi-instance VLESS + Reality manager
+#
+# Each instance is stored independently under /etc/reality/instances.  A single
+# validated sing-box configuration is generated from those records, so TCP and
+# gRPC Reality listeners can run together without competing for /etc/reality or
+# the RS systemd unit.
+# -----------------------------------------------------------------------------
+reality_urlencode() {
+  jq -rn --arg value "$1" '$value | @uri'
+}
+
+reality_valid_identifier() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]
+}
+
+reality_valid_user_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]]
+}
+
+reality_valid_hostname() {
+  local value="$1" label
+  local -a labels
+
+  [[ -n "$value" && ${#value} -le 253 ]] || return 1
+  [[ "$value" == *.* && "$value" != .* && "$value" != *. && "$value" != *..* ]] || return 1
+  [[ ! "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS='.' read -r -a labels <<<"$value"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
+  done
+}
+
+reality_normalize_address() {
+  local value="$1" octet
+  local -a octets
+  value="${value#[}"
+  value="${value%]}"
+  [[ -n "$value" ]] || return 1
+
+  if [[ "$value" == *:* ]]; then
+    [[ "$value" =~ ^[0-9A-Fa-f:]+$ && "$value" == *:*:* ]] || return 1
+  elif [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    IFS='.' read -r -a octets <<<"$value"
+    for octet in "${octets[@]}"; do
+      ((10#$octet <= 255)) || return 1
+    done
+  else
+    reality_valid_hostname "$value" || return 1
+  fi
+  printf '%s' "$value"
+}
+
+reality_have_instances() {
+  local instances_dir="${1:-$REALITY_INSTANCES_DIR}"
+  [[ -d "$instances_dir" ]] &&
+    [[ -n "$(find "$instances_dir" -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null)" ]]
+}
+
+reality_instance_path() {
+  local id="$1" instances_dir="${2:-$REALITY_INSTANCES_DIR}"
+  printf '%s/%s.json' "$instances_dir" "$id"
+}
+
+select_reality_transport() {
+  local default_transport="${1:-tcp}" choice
+  choice=$(whiptail --clear --title "Reality Transport" --default-item "$default_transport" \
+    --menu "Select the transport for this Reality config:" 16 70 2 \
+    "tcp" "VLESS + Reality over TCP" \
+    "grpc" "VLESS + Reality over gRPC" \
     2>&1 >/dev/tty) || return 1
   printf '%s' "$choice"
 }
 
-# The upstream TUI templates still use fields removed in sing-box 1.13.
-# Convert them to rule actions before validating or starting Reality.
-migrate_reality_config_113() {
-  local config_file="$1"
-  local migrated_file
-
-  migrated_file="$(mktemp /tmp/reality-migrate.XXXXXX)" || return 1
-  if ! jq '
-    del(
-      .inbounds[].sniff,
-      .inbounds[].sniff_override_destination,
-      .inbounds[].sniff_timeout,
-      .inbounds[].domain_strategy,
-      .inbounds[].udp_disable_domain_unmapping
-    )
-    | .route.rules = (
-        [{"action": "sniff"}]
-        + [
-            .route.rules[]
-            | select(.action != "sniff")
-            | if (.outbound? == "block") then
-                del(.outbound) + {"action": "reject"}
-              elif (.outbound? == "dns") then
-                del(.outbound) + {"action": "hijack-dns"}
-              elif has("outbound") then
-                . + {"action": "route"}
-              else
-                .
-              end
-          ]
-      )
-    | .outbounds = [
-        .outbounds[]
-        | select(.type != "block" and .type != "dns")
-      ]
-  ' "$config_file" >"$migrated_file"; then
-    rm -f "$migrated_file"
-    return 1
+select_reality_flow() {
+  local default_flow="${1:-}" default_item="without_flow" choice
+  [[ "$default_flow" == "xtls-rprx-vision" || "$default_flow" == "with_flow" ]] && default_item="with_flow"
+  choice=$(whiptail --clear --title "Reality Flow" --default-item "$default_item" \
+    --menu "Select Flow mode for this Reality TCP config:" 15 72 2 \
+    "with_flow" "With Flow (xtls-rprx-vision)" \
+    "without_flow" "Without Flow" \
+    2>&1 >/dev/tty) || return 1
+  if [[ "$choice" == "with_flow" ]]; then
+    printf 'xtls-rprx-vision'
+  else
+    printf ''
   fi
-
-  mv "$migrated_file" "$config_file"
 }
 
-configure_reality_tui() {
-  local mode="$1"
-  local Transport="$2"
-  local user_port user_sni flow_mode="without_flow" config_url
-  local uuid short_id service_name output private_key public_key
-  local tmp_json check_log public_ipv4 public_ipv6 flow_query=""
-  local result_url result_url2 ipv4qr ipv6qr completion_message
-
-  if [[ "$Transport" != "tcp" && "$Transport" != "grpc" ]]; then
-    tui_error "Unsupported Reality transport: $Transport"
-    return 1
-  fi
-
-  user_port=$(whiptail --inputbox "Enter Port:" 10 40 2>&1 >/dev/tty) || return 0
-  if [[ ! "$user_port" =~ ^[0-9]+$ ]] || ((user_port < 1 || user_port > 65535)); then
-    tui_error "Port must be a number between 1 and 65535."
-    return 1
-  fi
-
-  user_sni=$(whiptail --inputbox "Enter SNI:" 10 50 2>&1 >/dev/tty) || return 0
-  if [[ -z "$user_sni" ]]; then
-    tui_error "SNI cannot be empty."
-    return 1
-  fi
-
-  if [[ "$Transport" == "tcp" ]]; then
-    flow_mode="$(select_reality_flow)" || return 0
-  fi
-
-  # Install/update RS before changing an existing configuration. If GitHub is
-  # unavailable, Modify exits without deleting the working Reality config.
-  install_core RS || return 1
-
-  if [[ "$mode" == "modify" ]]; then
-    systemctl stop RS >/dev/null 2>&1 || true
-    rm -rf /etc/reality
-  fi
-  mkdir -p /etc/reality
-
-  if [[ "$Transport" == "grpc" ]]; then
-    config_url="https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box/Server/Reality-gRPC.json"
-  else
-    config_url="https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box/Server/Reality-tcp.json"
-  fi
-
-  if ! curl -fsSL "$config_url" -o /etc/reality/config.json; then
-    tui_error "Could not download the Reality configuration template."
-    return 1
-  fi
-  if ! curl -fsSL \
-    "https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box/RS.service" \
-    -o /etc/systemd/system/RS.service; then
-    tui_error "Could not download the Reality systemd service."
-    return 1
-  fi
-  systemctl daemon-reload
-
-  uuid="$(cat /proc/sys/kernel/random/uuid)"
-  short_id="$(openssl rand -hex 8)"
-  service_name="$(openssl rand -hex 4)"
-  if ! output="$(/usr/bin/RS generate reality-keypair 2>&1)"; then
+reality_generate_keypair() {
+  local output
+  if ! output="$("/usr/bin/$REALITY_SERVICE" generate reality-keypair 2>&1)"; then
     tui_error "Could not generate the Reality key pair.\n$output"
     return 1
   fi
-  private_key="$(printf '%s\n' "$output" | sed -n 's/^PrivateKey:[[:space:]]*//p' | head -n 1)"
-  public_key="$(printf '%s\n' "$output" | sed -n 's/^PublicKey:[[:space:]]*//p' | head -n 1)"
-  if [[ -z "$private_key" || -z "$public_key" ]]; then
+  REALITY_PRIVATE_KEY="$(printf '%s\n' "$output" | sed -n 's/^PrivateKey:[[:space:]]*//p' | head -n 1)"
+  REALITY_PUBLIC_KEY="$(printf '%s\n' "$output" | sed -n 's/^PublicKey:[[:space:]]*//p' | head -n 1)"
+  if [[ -z "$REALITY_PRIVATE_KEY" || -z "$REALITY_PUBLIC_KEY" ]]; then
     tui_error "sing-box-extended returned an invalid Reality key pair."
     return 1
   fi
+}
 
-  sed -i \
-    -e "s/PORT/$user_port/g" \
-    -e "s/SNI/$user_sni/g" \
-    -e "s/NAME/Reality/g" \
-    -e "s/UUID/$uuid/g" \
-    -e "s/PRIVATE-KEY/$private_key/g" \
-    -e "s/SHORT-ID/$short_id/g" \
-    -e "s/PATH/$service_name/g" \
-    /etc/reality/config.json
+# Import an existing single Reality installation the first time the manager is
+# opened.  The server private key and users are preserved.  The public key is
+# recovered from the old generated link when available.
+reality_migrate_legacy_installation() {
+  local legacy_config="$REALITY_DIR/config.json" transport port sni flow
+  local private_key public_key short_id service_name id users_json link_file
 
-  if ! migrate_reality_config_113 /etc/reality/config.json; then
-    tui_error "Could not migrate the Reality template to sing-box 1.13 format."
+  mkdir -p "$REALITY_INSTANCES_DIR"
+  reality_have_instances && return 0
+  [[ -f "$legacy_config" ]] || return 0
+  jq -e '.inbounds[0].type == "vless"' "$legacy_config" >/dev/null 2>&1 || return 0
+
+  transport="$(jq -r 'if .inbounds[0].transport.type? == "grpc" then "grpc" else "tcp" end' "$legacy_config")"
+  port="$(jq -r '.inbounds[0].listen_port // empty' "$legacy_config")"
+  sni="$(jq -r '.inbounds[0].tls.server_name // .inbounds[0].tls.reality.handshake.server // empty' "$legacy_config")"
+  flow="$(jq -r '.inbounds[0].users[0].flow // ""' "$legacy_config")"
+  private_key="$(jq -r '.inbounds[0].tls.reality.private_key // empty' "$legacy_config")"
+  short_id="$(jq -r '.inbounds[0].tls.reality.short_id[0] // empty' "$legacy_config")"
+  service_name="$(jq -r '.inbounds[0].transport.service_name // ""' "$legacy_config")"
+  users_json="$(jq -c '[.inbounds[0].users[]? | {name:(.name // "default"), uuid:.uuid}]' "$legacy_config")"
+
+  [[ "$port" =~ ^[0-9]+$ && -n "$sni" && -n "$private_key" && -n "$short_id" ]] || return 0
+  [[ "$users_json" != "[]" ]] || return 0
+
+  public_key=""
+  for link_file in "$REALITY_DIR/config.txt" "$REALITY_DIR/user-config.txt"; do
+    if [[ -f "$link_file" ]]; then
+      public_key="$(grep -oE 'pbk=[^&[:space:]]+' "$link_file" 2>/dev/null | head -n 1 | cut -d= -f2-)"
+      [[ -n "$public_key" ]] && break
+    fi
+  done
+
+  id="legacy-${transport}-${port}"
+  if ! jq -n \
+    --arg id "$id" \
+    --arg transport "$transport" \
+    --argjson port "$port" \
+    --arg sni "$sni" \
+    --arg flow "$flow" \
+    --arg service_name "$service_name" \
+    --arg private_key "$private_key" \
+    --arg public_key "$public_key" \
+    --arg short_id "$short_id" \
+    --argjson users "$users_json" \
+    '{
+      id: $id,
+      transport: $transport,
+      port: $port,
+      sni: $sni,
+      flow: $flow,
+      service_name: $service_name,
+      private_key: $private_key,
+      public_key: $public_key,
+      short_id: $short_id,
+      users: $users,
+      migrated_from_legacy: true
+    }' >"$(reality_instance_path "$id")"; then
+    rm -f "$(reality_instance_path "$id")"
+    return 1
+  fi
+  chmod 0600 "$(reality_instance_path "$id")"
+}
+
+reality_prepare_manager() {
+  mkdir -p "$REALITY_INSTANCES_DIR"
+  chmod 0700 "$REALITY_DIR" "$REALITY_INSTANCES_DIR" 2>/dev/null || true
+  reality_migrate_legacy_installation
+}
+
+reality_select_instance() {
+  local prompt="${1:-Select a Reality config:}" file id transport port sni choice
+  local -a menu_items=()
+
+  reality_prepare_manager
+  while IFS= read -r -d '' file; do
+    id="$(jq -r '.id' "$file")"
+    transport="$(jq -r '.transport | ascii_upcase' "$file")"
+    port="$(jq -r '.port' "$file")"
+    sni="$(jq -r '.sni' "$file")"
+    menu_items+=("$id" "$transport | :$port | $sni")
+  done < <(find "$REALITY_INSTANCES_DIR" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null | sort -z)
+
+  if ((${#menu_items[@]} == 0)); then
+    whiptail --msgbox "No Reality configs exist yet." 10 45
     return 1
   fi
 
-  if [[ "$Transport" == "tcp" && "$flow_mode" == "without_flow" ]]; then
-    tmp_json="$(mktemp /tmp/reality-config.XXXXXX)" || return 1
-    if ! jq 'del(.inbounds[0].users[0].flow)' /etc/reality/config.json >"$tmp_json"; then
-      rm -f "$tmp_json"
-      tui_error "Could not remove Flow from the Reality configuration."
-      return 1
-    fi
-    mv "$tmp_json" /etc/reality/config.json
+  choice=$(whiptail --clear --title "Reality Configs" \
+    --menu "$prompt" 22 84 12 "${menu_items[@]}" 2>&1 >/dev/tty) || return 1
+  printf '%s' "$choice"
+}
+
+reality_select_user() {
+  local id="$1" prompt="${2:-Select a user:}" file name uuid choice
+  local -a menu_items=()
+  file="$(reality_instance_path "$id")"
+  [[ -f "$file" ]] || return 1
+
+  while IFS=$'\t' read -r name uuid; do
+    [[ -n "$name" && -n "$uuid" ]] || continue
+    menu_items+=("$name" "$uuid")
+  done < <(jq -r '.users[] | [.name, .uuid] | @tsv' "$file")
+
+  if ((${#menu_items[@]} == 0)); then
+    whiptail --msgbox "This Reality config has no users." 10 50
+    return 1
+  fi
+  choice=$(whiptail --clear --title "Reality Users - $id" \
+    --menu "$prompt" 22 78 12 "${menu_items[@]}" 2>&1 >/dev/tty) || return 1
+  printf '%s' "$choice"
+}
+
+reality_port_in_use() {
+  local port="$1" exclude_id="${2:-}" instances_dir="${3:-$REALITY_INSTANCES_DIR}"
+  local file file_id file_port
+  while IFS= read -r -d '' file; do
+    file_id="$(jq -r '.id' "$file")"
+    file_port="$(jq -r '.port' "$file")"
+    [[ "$file_id" == "$exclude_id" ]] && continue
+    [[ "$file_port" == "$port" ]] && return 0
+  done < <(find "$instances_dir" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null)
+  return 1
+}
+
+reality_collect_instance_settings() {
+  local current_file="${1:-}" forced_transport="${2:-}"
+  local default_id="" default_transport="tcp" default_port="443" default_sni=""
+  local default_flow="" default_service_name="" old_id="" default_candidate
+
+  if [[ -n "$current_file" && -f "$current_file" ]]; then
+    old_id="$(jq -r '.id' "$current_file")"
+    default_id="$old_id"
+    default_transport="$(jq -r '.transport' "$current_file")"
+    default_port="$(jq -r '.port' "$current_file")"
+    default_sni="$(jq -r '.sni' "$current_file")"
+    default_flow="$(jq -r '.flow // ""' "$current_file")"
+    default_service_name="$(jq -r '.service_name // ""' "$current_file")"
   fi
 
-  check_log="$(mktemp /tmp/reality-check.XXXXXX)" || return 1
-  if ! /usr/bin/RS check -c /etc/reality/config.json >"$check_log" 2>&1; then
-    sed -i $'s/\033\\[[0-9;]*m//g' "$check_log" 2>/dev/null || true
-    if command -v whiptail >/dev/null 2>&1; then
-      whiptail --title "Reality config error" --textbox "$check_log" 22 78
-    else
-      cat "$check_log" >&2
+  if [[ "$forced_transport" == "tcp" || "$forced_transport" == "grpc" ]]; then
+    REALITY_TRANSPORT="$forced_transport"
+  else
+    REALITY_TRANSPORT="$(select_reality_transport "$default_transport")" || return 1
+  fi
+
+  REALITY_PORT=$(whiptail --inputbox "Listening port for this config:" 10 62 \
+    "$default_port" 2>&1 >/dev/tty) || return 1
+  if [[ ! "$REALITY_PORT" =~ ^[0-9]+$ ]] || ((REALITY_PORT < 1 || REALITY_PORT > 65535)); then
+    tui_error "Reality port must be between 1 and 65535."
+    return 1
+  fi
+  if reality_port_in_use "$REALITY_PORT" "$old_id"; then
+    tui_error "Port $REALITY_PORT is already assigned to another Reality config."
+    return 1
+  fi
+
+  default_candidate="${REALITY_TRANSPORT}-${REALITY_PORT}"
+  [[ -n "$default_id" ]] || default_id="$default_candidate"
+  REALITY_ID=$(whiptail --inputbox \
+    "Unique config name (A-Z, 0-9, '_' or '-'):" 10 68 \
+    "$default_id" 2>&1 >/dev/tty) || return 1
+  if ! reality_valid_identifier "$REALITY_ID"; then
+    tui_error "Config name must contain 1-32 ASCII letters, numbers, '_' or '-'."
+    return 1
+  fi
+  if [[ "$REALITY_ID" != "$old_id" && -e "$(reality_instance_path "$REALITY_ID")" ]]; then
+    tui_error "A Reality config named '$REALITY_ID' already exists."
+    return 1
+  fi
+
+  REALITY_SNI=$(whiptail --inputbox \
+    "Reality SNI/handshake domain:" 10 68 "$default_sni" 2>&1 >/dev/tty) || return 1
+  if ! reality_valid_hostname "$REALITY_SNI"; then
+    tui_error "Enter a valid domain name for Reality SNI."
+    return 1
+  fi
+
+  REALITY_FLOW=""
+  REALITY_SERVICE_NAME=""
+  if [[ "$REALITY_TRANSPORT" == "tcp" ]]; then
+    REALITY_FLOW="$(select_reality_flow "$default_flow")" || return 1
+  else
+    [[ -n "$default_service_name" ]] || default_service_name="$(openssl rand -hex 4)"
+    REALITY_SERVICE_NAME=$(whiptail --inputbox \
+      "gRPC service name:" 10 62 "$default_service_name" 2>&1 >/dev/tty) || return 1
+    if [[ ! "$REALITY_SERVICE_NAME" =~ ^[A-Za-z0-9._~-]{1,64}$ ]]; then
+      tui_error "gRPC service name contains invalid characters."
+      return 1
     fi
-    rm -f "$check_log"
+  fi
+}
+
+reality_build_combined_config() {
+  local instances_dir="$1" output_file="$2" tmp_file warp_tag
+  local -a instance_files=()
+
+  mapfile -d '' -t instance_files < <(
+    find "$instances_dir" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null | sort -z
+  )
+  ((${#instance_files[@]} > 0)) || return 1
+
+  if ! jq -s '
+    map(select(type == "object")) as $instances
+    | {
+        log: {
+          level: "info",
+          timestamp: true
+        },
+        inbounds: [
+          $instances[]
+          | . as $instance
+          | {
+              type: "vless",
+              tag: ("reality-" + $instance.id),
+              listen: "::",
+              listen_port: $instance.port,
+              users: [
+                $instance.users[]
+                | {name: .name, uuid: .uuid}
+                  + if ($instance.transport == "tcp" and ($instance.flow // "") != "") then
+                      {flow: $instance.flow}
+                    else
+                      {}
+                    end
+              ],
+              tls: {
+                enabled: true,
+                server_name: $instance.sni,
+                reality: {
+                  enabled: true,
+                  handshake: {
+                    server: $instance.sni,
+                    server_port: 443
+                  },
+                  private_key: $instance.private_key,
+                  short_id: [$instance.short_id]
+                }
+              }
+            }
+            + if $instance.transport == "grpc" then
+                {
+                  transport: {
+                    type: "grpc",
+                    service_name: $instance.service_name
+                  }
+                }
+              else
+                {}
+              end
+        ],
+        outbounds: [
+          {
+            type: "direct",
+            tag: "direct"
+          }
+        ],
+        route: {
+          rules: [
+            {
+              action: "sniff"
+            }
+          ],
+          final: "direct",
+          auto_detect_interface: true
+        }
+      }
+  ' "${instance_files[@]}" >"$output_file"; then
+    return 1
+  fi
+
+  if [[ -f "$REALITY_DIR/warp-enabled" && -f /etc/sbw/proxy.json ]] &&
+    jq -e '.outbounds | type == "array" and length > 0' /etc/sbw/proxy.json >/dev/null 2>&1; then
+    warp_tag="$(jq -r '.outbounds[] | select(.type == "wireguard") | .tag // empty' \
+      /etc/sbw/proxy.json | head -n 1)"
+    if [[ -n "$warp_tag" ]]; then
+      tmp_file="$(mktemp /tmp/reality-warp.XXXXXX)" || return 1
+      if ! jq --slurpfile warp /etc/sbw/proxy.json --arg warp_tag "$warp_tag" '
+        (.inbounds | map(.tag)) as $inbound_tags
+        | .outbounds = $warp[0].outbounds
+        | .route.rules += [{
+            inbound: $inbound_tags,
+            action: "route",
+            outbound: $warp_tag
+          }]
+      ' "$output_file" >"$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+      fi
+      mv "$tmp_file" "$output_file"
+    fi
+  fi
+}
+
+reality_write_service() {
+  cat >"/etc/systemd/system/${REALITY_SERVICE}.service" <<EOF_REALITY_SERVICE
+[Unit]
+Description=Multi-instance VLESS Reality (sing-box-extended)
+Documentation=https://github.com/shtorm-7/sing-box-extended
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$REALITY_DIR
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+ExecStart=/usr/bin/$REALITY_SERVICE run -c $REALITY_DIR/config.json
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF_REALITY_SERVICE
+}
+
+reality_stage_instances() {
+  local stage_dir
+  stage_dir="$(mktemp -d /tmp/reality-stage.XXXXXX)" || return 1
+  if [[ -d "$REALITY_INSTANCES_DIR" ]]; then
+    cp -a "$REALITY_INSTANCES_DIR/." "$stage_dir/" || {
+      rm -rf "$stage_dir"
+      return 1
+    }
+  fi
+  printf '%s' "$stage_dir"
+}
+
+# Validate the entire combined config before replacing the live files.  If the
+# new service cannot start, both the previous records and service are restored.
+reality_commit_stage() {
+  local stage_dir="$1" candidate check_log backup_dir
+  local old_running="false" old_enabled="false" deploy_ok="true"
+
+  candidate="$(mktemp /tmp/reality-config.XXXXXX)" || return 1
+  check_log="$(mktemp /tmp/reality-check.XXXXXX)" || {
+    rm -f "$candidate"
+    return 1
+  }
+  backup_dir="$(mktemp -d /tmp/reality-backup.XXXXXX)" || {
+    rm -f "$candidate" "$check_log"
+    return 1
+  }
+
+  find "$stage_dir" -maxdepth 1 -type f -name '*.json' -exec chmod 0600 {} +
+
+  if ! reality_build_combined_config "$stage_dir" "$candidate"; then
+    rm -f "$candidate" "$check_log"
+    rm -rf "$backup_dir"
+    tui_error "Could not build the combined Reality configuration."
+    return 1
+  fi
+  if ! "/usr/bin/$REALITY_SERVICE" check -c "$candidate" >"$check_log" 2>&1; then
+    sed -i $'s/\033\\[[0-9;]*m//g' "$check_log" 2>/dev/null || true
+    whiptail --title "Reality config error" --textbox "$check_log" 22 84
+    rm -f "$candidate" "$check_log"
+    rm -rf "$backup_dir"
     return 1
   fi
   rm -f "$check_log"
 
-  public_ipv4=$(wget -qO- --no-check-certificate --user-agent=Mozilla --tries=2 --timeout=2 https://v4.ident.me)
-  public_ipv6=$(wget -qO- --no-check-certificate --user-agent=Mozilla --tries=2 --timeout=2 https://v6.ident.me)
+  if [[ -d "$REALITY_INSTANCES_DIR" ]] &&
+    ! cp -a "$REALITY_INSTANCES_DIR" "$backup_dir/instances"; then
+    rm -f "$candidate"
+    rm -rf "$backup_dir"
+    tui_error "Could not back up the current Reality instance records."
+    return 1
+  fi
+  if [[ -f "$REALITY_DIR/config.json" ]] &&
+    ! cp -a "$REALITY_DIR/config.json" "$backup_dir/config.json"; then
+    rm -f "$candidate"
+    rm -rf "$backup_dir"
+    tui_error "Could not back up the current Reality configuration."
+    return 1
+  fi
+  if [[ -f "/etc/systemd/system/${REALITY_SERVICE}.service" ]] &&
+    ! cp -a "/etc/systemd/system/${REALITY_SERVICE}.service" "$backup_dir/service"; then
+    rm -f "$candidate"
+    rm -rf "$backup_dir"
+    tui_error "Could not back up the Reality service."
+    return 1
+  fi
+  systemctl is-active --quiet "$REALITY_SERVICE" && old_running="true"
+  systemctl is-enabled --quiet "$REALITY_SERVICE" && old_enabled="true"
 
-  set_ufw tcp
+  systemctl stop "$REALITY_SERVICE" >/dev/null 2>&1 || true
+  mkdir -p "$REALITY_DIR" || deploy_ok="false"
+  [[ "$deploy_ok" == "true" ]] && chmod 0700 "$REALITY_DIR" || deploy_ok="false"
+  rm -rf "$REALITY_INSTANCES_DIR" || deploy_ok="false"
+  [[ "$deploy_ok" == "true" ]] && mkdir -p "$REALITY_INSTANCES_DIR" || deploy_ok="false"
+  [[ "$deploy_ok" == "true" ]] && chmod 0700 "$REALITY_INSTANCES_DIR" || deploy_ok="false"
+  [[ "$deploy_ok" == "true" ]] && cp -a "$stage_dir/." "$REALITY_INSTANCES_DIR/" || deploy_ok="false"
+  [[ "$deploy_ok" == "true" ]] && install -m 0600 "$candidate" "$REALITY_DIR/config.json" || deploy_ok="false"
+  [[ "$deploy_ok" == "true" ]] && reality_write_service || deploy_ok="false"
+  [[ "$deploy_ok" == "true" ]] && systemctl daemon-reload || deploy_ok="false"
 
-  if ! systemctl enable --now RS; then
-    tui_error "Reality was configured, but the RS service could not be started."
+  if [[ "$deploy_ok" != "true" ]] || ! systemctl enable --now "$REALITY_SERVICE"; then
+    systemctl disable --now "$REALITY_SERVICE" >/dev/null 2>&1 || true
+    rm -rf "$REALITY_INSTANCES_DIR"
+    if [[ -d "$backup_dir/instances" ]]; then
+      cp -a "$backup_dir/instances" "$REALITY_INSTANCES_DIR"
+    else
+      mkdir -p "$REALITY_INSTANCES_DIR"
+    fi
+    if [[ -f "$backup_dir/config.json" ]]; then
+      cp -a "$backup_dir/config.json" "$REALITY_DIR/config.json"
+    else
+      rm -f "$REALITY_DIR/config.json"
+    fi
+    if [[ -f "$backup_dir/service" ]]; then
+      cp -a "$backup_dir/service" "/etc/systemd/system/${REALITY_SERVICE}.service"
+    else
+      rm -f "/etc/systemd/system/${REALITY_SERVICE}.service"
+    fi
+    systemctl daemon-reload
+    if [[ "$old_enabled" == "true" ]]; then
+      systemctl enable "$REALITY_SERVICE" >/dev/null 2>&1 || true
+    fi
+    [[ "$old_running" == "true" ]] && systemctl start "$REALITY_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$candidate"
+    rm -rf "$backup_dir"
+    tui_error "The new Reality config was valid, but the service could not start. The previous setup was restored."
     return 1
   fi
 
-  if ! crontab -l 2>/dev/null | grep -Fq "systemctl restart RS"; then
-    (crontab -l 2>/dev/null; echo "0 */5 * * * systemctl restart RS") | crontab -
+  if ! crontab -l 2>/dev/null | grep -Fq "systemctl restart $REALITY_SERVICE"; then
+    (crontab -l 2>/dev/null; echo "0 */5 * * * systemctl restart $REALITY_SERVICE") | crontab -
   fi
 
-  if [[ "$Transport" == "grpc" ]]; then
-    result_url="
-        ipv4 : vless://$uuid@$public_ipv4:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=grpc&serviceName=$service_name&encryption=none#Reality
-        ---------------------------------------------------------------
-        ipv6 : vless://$uuid@[$public_ipv6]:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=grpc&serviceName=$service_name&encryption=none#Reality-V6"
+  rm -f "$candidate"
+  rm -rf "$backup_dir"
+}
 
-    result_url2="
-        ipv4 : vless://UUID@$public_ipv4:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=grpc&serviceName=$service_name&encryption=none#NAME-Reality
-        ---------------------------------------------------------------
-        ipv6 : vless://UUID@[$public_ipv6]:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=grpc&serviceName=$service_name&encryption=none#NAME-Reality-V6"
+reality_build_link() {
+  local instance_file="$1" user_name="$2" address="$3"
+  local uuid transport port sni flow service_name public_key short_id id authority query
+
+  uuid="$(jq -r --arg name "$user_name" '.users[] | select(.name == $name) | .uuid' "$instance_file")"
+  transport="$(jq -r '.transport' "$instance_file")"
+  port="$(jq -r '.port' "$instance_file")"
+  sni="$(jq -r '.sni' "$instance_file")"
+  flow="$(jq -r '.flow // ""' "$instance_file")"
+  service_name="$(jq -r '.service_name // ""' "$instance_file")"
+  public_key="$(jq -r '.public_key // ""' "$instance_file")"
+  short_id="$(jq -r '.short_id' "$instance_file")"
+  id="$(jq -r '.id' "$instance_file")"
+  [[ -n "$uuid" && -n "$public_key" ]] || return 1
+
+  address="${address#[}"
+  address="${address%]}"
+  if [[ "$address" == *:* ]]; then
+    authority="[$address]"
   else
-    if [[ "$flow_mode" == "with_flow" ]]; then
-      flow_query="&flow=xtls-rprx-vision"
+    authority="$address"
+  fi
+
+  query="encryption=none&security=reality&sni=$(reality_urlencode "$sni")&fp=firefox&pbk=$(reality_urlencode "$public_key")&sid=$(reality_urlencode "$short_id")&type=$transport"
+  if [[ "$transport" == "grpc" ]]; then
+    query+="&serviceName=$(reality_urlencode "$service_name")"
+  elif [[ -n "$flow" ]]; then
+    query+="&flow=$(reality_urlencode "$flow")"
+  fi
+  printf 'vless://%s@%s:%s?%s#%s' \
+    "$uuid" "$authority" "$port" "$query" "$(reality_urlencode "$id-$user_name")"
+}
+
+reality_wait_for_enter() {
+  echo
+  echo -e "\e[31mPress Enter to return to the Reality menu\e[0m"
+  if [[ -r /dev/tty ]]; then
+    read -r </dev/tty
+  else
+    read -r
+  fi
+  clear
+}
+
+reality_display_user_link() {
+  local id="$1" user_name="$2" instance_file public_ipv4 public_ipv6 manual_address
+  local ipv4_link="" ipv6_link=""
+  instance_file="$(reality_instance_path "$id")"
+  [[ -f "$instance_file" ]] || return 1
+
+  if [[ -z "$(jq -r '.public_key // ""' "$instance_file")" ]]; then
+    whiptail --msgbox \
+      "The old config was imported, but its public key was not found in config.txt. Use 'Regenerate Keys' once to create new working links." \
+      13 76
+    return 1
+  fi
+
+  public_ipv4="$(wget -qO- --no-check-certificate --user-agent=Mozilla --tries=2 --timeout=3 https://v4.ident.me 2>/dev/null)"
+  public_ipv6="$(wget -qO- --no-check-certificate --user-agent=Mozilla --tries=2 --timeout=3 https://v6.ident.me 2>/dev/null)"
+  public_ipv4="$(reality_normalize_address "$public_ipv4" 2>/dev/null)" || public_ipv4=""
+  public_ipv6="$(reality_normalize_address "$public_ipv6" 2>/dev/null)" || public_ipv6=""
+  if [[ -z "$public_ipv4" && -z "$public_ipv6" ]]; then
+    manual_address=$(whiptail --inputbox \
+      "Public connection address could not be detected. Enter a domain, IPv4 or IPv6 address:" \
+      11 78 2>&1 >/dev/tty) || return 1
+    if ! manual_address="$(reality_normalize_address "$manual_address")"; then
+      tui_error "Enter a valid domain, IPv4 or IPv6 connection address without a port or URL scheme."
+      return 1
     fi
-    result_url="
-        ipv4 : vless://$uuid@$public_ipv4:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=tcp${flow_query}&encryption=none#Reality
-        ---------------------------------------------------------------
-        ipv6 : vless://$uuid@[$public_ipv6]:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=tcp${flow_query}&encryption=none#Reality-V6"
-
-    result_url2="
-        ipv4 : vless://UUID@$public_ipv4:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=tcp${flow_query}&encryption=none#NAME-Reality
-        ---------------------------------------------------------------
-        ipv6 : vless://UUID@[$public_ipv6]:$user_port?security=reality&sni=$user_sni&fp=firefox&pbk=$public_key&sid=$short_id&type=tcp${flow_query}&encryption=none#NAME-Reality-V6"
+    if [[ "$manual_address" == *:* ]]; then
+      public_ipv6="$manual_address"
+    else
+      public_ipv4="$manual_address"
+    fi
   fi
 
-  echo -e "Config URL: $result_url" >/etc/reality/user-config.txt
-  echo -e "Config URL: $result_url2" >/etc/reality/config.txt
-  echo -e "Config URL: \e[91m$result_url\e[0m"
+  [[ -n "$public_ipv4" ]] && ipv4_link="$(reality_build_link "$instance_file" "$user_name" "$public_ipv4")"
+  [[ -n "$public_ipv6" ]] && ipv6_link="$(reality_build_link "$instance_file" "$user_name" "$public_ipv6")"
 
-  ipv4qr=$(grep -oP 'ipv4 : \K\S+' /etc/reality/user-config.txt)
-  ipv6qr=$(grep -oP 'ipv6 : \K\S+' /etc/reality/user-config.txt)
-  if command -v qrencode >/dev/null 2>&1; then
-    [[ -n "$ipv4qr" ]] && { echo "IPv4:"; qrencode -t ANSIUTF8 <<<"$ipv4qr"; }
-    [[ -n "$ipv6qr" ]] && { echo "IPv6:"; qrencode -t ANSIUTF8 <<<"$ipv6qr"; }
-  fi
-
-  if [[ "$mode" == "modify" ]]; then
-    completion_message="Reality configuration modified."
+  clear
+  echo "VLESS + Reality"
+  echo "Config    : $id"
+  echo "Transport : $(jq -r '.transport | ascii_upcase' "$instance_file")"
+  echo "Port      : $(jq -r '.port' "$instance_file")"
+  echo "SNI       : $(jq -r '.sni' "$instance_file")"
+  echo "User      : $user_name"
+  if [[ "$(jq -r '.transport' "$instance_file")" == "tcp" ]]; then
+    echo "Flow      : $(jq -r 'if (.flow // "") == "" then "disabled" else .flow end' "$instance_file")"
   else
-    completion_message="Reality setup completed."
+    echo "Service   : $(jq -r '.service_name' "$instance_file")"
   fi
-  echo "$completion_message"
-  echo -e "\e[31mPress Enter to Exit\e[0m"
-  read -r
+  echo
+
+  if [[ -n "$ipv4_link" ]]; then
+    echo -e "IPv4: \e[91m$ipv4_link\e[0m"
+    echo
+    command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 <<<"$ipv4_link"
+  fi
+  if [[ -n "$ipv6_link" ]]; then
+    echo -e "IPv6: \e[91m$ipv6_link\e[0m"
+    echo
+    command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 <<<"$ipv6_link"
+  fi
+  reality_wait_for_enter
+}
+
+reality_create_instance() {
+  local forced_transport="${1:-}" stage_dir uuid short_id user_port
+
+  reality_prepare_manager
+  reality_collect_instance_settings "" "$forced_transport" || return 0
+  install_core "$REALITY_SERVICE" || return 1
+  reality_generate_keypair || return 1
+
+  uuid="$(cat /proc/sys/kernel/random/uuid)"
+  short_id="$(openssl rand -hex 8)"
+  stage_dir="$(reality_stage_instances)" || return 1
+  if ! jq -n \
+    --arg id "$REALITY_ID" \
+    --arg transport "$REALITY_TRANSPORT" \
+    --argjson port "$REALITY_PORT" \
+    --arg sni "$REALITY_SNI" \
+    --arg flow "$REALITY_FLOW" \
+    --arg service_name "$REALITY_SERVICE_NAME" \
+    --arg private_key "$REALITY_PRIVATE_KEY" \
+    --arg public_key "$REALITY_PUBLIC_KEY" \
+    --arg short_id "$short_id" \
+    --arg uuid "$uuid" \
+    '{
+      id: $id,
+      transport: $transport,
+      port: $port,
+      sni: $sni,
+      flow: $flow,
+      service_name: $service_name,
+      private_key: $private_key,
+      public_key: $public_key,
+      short_id: $short_id,
+      users: [{name: "default", uuid: $uuid}]
+    }' >"$(reality_instance_path "$REALITY_ID" "$stage_dir")"; then
+    rm -rf "$stage_dir"
+    tui_error "Could not create the Reality instance record."
+    return 1
+  fi
+
+  if ! reality_commit_stage "$stage_dir"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  rm -rf "$stage_dir"
+  user_port="$REALITY_PORT"
+  set_ufw tcp
+  reality_display_user_link "$REALITY_ID" "default"
+}
+
+reality_edit_instance() {
+  local old_id current_file stage_dir staged_file user_port
+
+  reality_prepare_manager
+  old_id="$(reality_select_instance "Select the Reality config to edit:")" || return 0
+  current_file="$(reality_instance_path "$old_id")"
+  reality_collect_instance_settings "$current_file" || return 0
+  [[ -x "/usr/bin/$REALITY_SERVICE" ]] || install_core "$REALITY_SERVICE" || return 1
+
+  stage_dir="$(reality_stage_instances)" || return 1
+  staged_file="$(reality_instance_path "$old_id" "$stage_dir")"
+  if ! jq \
+    --arg id "$REALITY_ID" \
+    --arg transport "$REALITY_TRANSPORT" \
+    --argjson port "$REALITY_PORT" \
+    --arg sni "$REALITY_SNI" \
+    --arg flow "$REALITY_FLOW" \
+    --arg service_name "$REALITY_SERVICE_NAME" \
+    '.id = $id |
+     .transport = $transport |
+     .port = $port |
+     .sni = $sni |
+     .flow = $flow |
+     .service_name = $service_name' \
+    "$staged_file" >"$stage_dir/.edited.json"; then
+    rm -rf "$stage_dir"
+    tui_error "Could not edit the Reality instance record."
+    return 1
+  fi
+  rm -f "$staged_file"
+  mv "$stage_dir/.edited.json" "$(reality_instance_path "$REALITY_ID" "$stage_dir")"
+
+  if ! reality_commit_stage "$stage_dir"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  rm -rf "$stage_dir"
+  user_port="$REALITY_PORT"
+  set_ufw tcp
+  reality_display_user_link "$REALITY_ID" "$(jq -r '.users[0].name' "$(reality_instance_path "$REALITY_ID")")"
+}
+
+reality_delete_instance() {
+  local id instance_file stage_dir remaining crontab_file
+
+  reality_prepare_manager
+  id="$(reality_select_instance "Select the Reality config to delete:")" || return 0
+  instance_file="$(reality_instance_path "$id")"
+  if ! whiptail --title "Delete Reality Config" --yesno \
+    "Delete '$id' and all users stored inside it?" 12 64; then
+    return 0
+  fi
+
+  stage_dir="$(reality_stage_instances)" || return 1
+  rm -f "$(reality_instance_path "$id" "$stage_dir")"
+  remaining="$(find "$stage_dir" -maxdepth 1 -type f -name '*.json' -print -quit)"
+  if [[ -z "$remaining" ]]; then
+    systemctl disable --now "$REALITY_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$instance_file" "$REALITY_DIR/config.json"
+    crontab_file="$(mktemp /tmp/reality-crontab.XXXXXX)" || crontab_file=""
+    if [[ -n "$crontab_file" ]] && crontab -l >"$crontab_file" 2>/dev/null; then
+      sed "/systemctl restart $REALITY_SERVICE/d" "$crontab_file" | crontab -
+    fi
+    [[ -n "$crontab_file" ]] && rm -f "$crontab_file"
+  else
+    if ! reality_commit_stage "$stage_dir"; then
+      rm -rf "$stage_dir"
+      return 1
+    fi
+  fi
+  rm -rf "$stage_dir"
+  whiptail --msgbox "Reality config '$id' was deleted." 10 58
+  clear
+}
+
+add_reality_user() {
+  local id instance_file name uuid stage_dir staged_file
+
+  reality_prepare_manager
+  id="$(reality_select_instance "Select the Reality config that receives the new user:")" || return 0
+  instance_file="$(reality_instance_path "$id")"
+  name=$(whiptail --inputbox \
+    "User name (A-Z, 0-9, '.', '_' or '-'):" 10 62 2>&1 >/dev/tty) || return 0
+  if ! reality_valid_user_name "$name"; then
+    tui_error "User name must contain 1-32 ASCII letters, numbers, '.', '_' or '-'."
+    return 1
+  fi
+  if jq -e --arg name "$name" '.users[] | select(.name == $name)' "$instance_file" >/dev/null; then
+    tui_error "A user named '$name' already exists in '$id'."
+    return 1
+  fi
+
+  uuid="$(cat /proc/sys/kernel/random/uuid)"
+  stage_dir="$(reality_stage_instances)" || return 1
+  staged_file="$(reality_instance_path "$id" "$stage_dir")"
+  if ! jq --arg name "$name" --arg uuid "$uuid" \
+    '.users += [{name: $name, uuid: $uuid}]' "$staged_file" >"$stage_dir/.user.json"; then
+    rm -rf "$stage_dir"
+    tui_error "Could not add the Reality user."
+    return 1
+  fi
+  mv "$stage_dir/.user.json" "$staged_file"
+  if ! reality_commit_stage "$stage_dir"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  rm -rf "$stage_dir"
+  reality_display_user_link "$id" "$name"
+}
+
+remove_reality_user() {
+  local id instance_file count name stage_dir staged_file
+
+  reality_prepare_manager
+  id="$(reality_select_instance "Select the Reality config:")" || return 0
+  instance_file="$(reality_instance_path "$id")"
+  count="$(jq '.users | length' "$instance_file")"
+  if ((count <= 1)); then
+    whiptail --msgbox "The last user cannot be removed. Delete the config instead." 11 66
+    return 0
+  fi
+  name="$(reality_select_user "$id" "Select the user to remove:")" || return 0
+  if ! whiptail --title "Remove Reality User" --yesno \
+    "Remove user '$name' from '$id'?" 11 60; then
+    return 0
+  fi
+
+  stage_dir="$(reality_stage_instances)" || return 1
+  staged_file="$(reality_instance_path "$id" "$stage_dir")"
+  if ! jq --arg name "$name" '.users |= map(select(.name != $name))' \
+    "$staged_file" >"$stage_dir/.user.json"; then
+    rm -rf "$stage_dir"
+    tui_error "Could not remove the Reality user."
+    return 1
+  fi
+  mv "$stage_dir/.user.json" "$staged_file"
+  if ! reality_commit_stage "$stage_dir"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  rm -rf "$stage_dir"
+  whiptail --msgbox "Reality user '$name' was removed." 10 58
+  clear
+}
+
+show_reality_config() {
+  local id name
+  reality_prepare_manager
+  id="$(reality_select_instance "Select a Reality config to view:")" || return 0
+  name="$(reality_select_user "$id" "Select a user to show its links:")" || return 0
+  reality_display_user_link "$id" "$name"
+}
+
+regenerate_keys() {
+  local id stage_dir staged_file first_user
+
+  reality_prepare_manager
+  id="$(reality_select_instance "Select the Reality config whose keys will be regenerated:")" || return 0
+  if ! whiptail --title "Regenerate Reality Keys" --yesno \
+    "All existing links for '$id' will stop working. Continue?" 12 68; then
+    return 0
+  fi
+  [[ -x "/usr/bin/$REALITY_SERVICE" ]] || install_core "$REALITY_SERVICE" || return 1
+  reality_generate_keypair || return 1
+
+  stage_dir="$(reality_stage_instances)" || return 1
+  staged_file="$(reality_instance_path "$id" "$stage_dir")"
+  if ! jq \
+    --arg private_key "$REALITY_PRIVATE_KEY" \
+    --arg public_key "$REALITY_PUBLIC_KEY" \
+    --arg short_id "$(openssl rand -hex 8)" \
+    '.private_key = $private_key |
+     .public_key = $public_key |
+     .short_id = $short_id' \
+    "$staged_file" >"$stage_dir/.keys.json"; then
+    rm -rf "$stage_dir"
+    tui_error "Could not update the Reality keys."
+    return 1
+  fi
+  mv "$stage_dir/.keys.json" "$staged_file"
+  if ! reality_commit_stage "$stage_dir"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  rm -rf "$stage_dir"
+  first_user="$(jq -r '.users[0].name' "$(reality_instance_path "$id")")"
+  reality_display_user_link "$id" "$first_user"
+}
+
+toggle_warp_reality() {
+  local enabling="false" stage_dir
+  reality_prepare_manager
+  if ! reality_have_instances; then
+    whiptail --msgbox "No Reality configs exist yet." 10 45
+    return 0
+  fi
+
+  if [[ -f "$REALITY_DIR/warp-enabled" ]]; then
+    rm -f "$REALITY_DIR/warp-enabled"
+  else
+    if [[ ! -f /etc/sbw/proxy.json ]] ||
+      ! jq -e '.outbounds[] | select(.type == "wireguard")' /etc/sbw/proxy.json >/dev/null 2>&1; then
+      whiptail --msgbox "WARP is not installed or its WireGuard outbound is invalid." 11 68
+      return 0
+    fi
+    touch "$REALITY_DIR/warp-enabled"
+    enabling="true"
+  fi
+
+  stage_dir="$(reality_stage_instances)" || return 1
+  if ! reality_commit_stage "$stage_dir"; then
+    if [[ "$enabling" == "true" ]]; then
+      rm -f "$REALITY_DIR/warp-enabled"
+    else
+      touch "$REALITY_DIR/warp-enabled"
+    fi
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  rm -rf "$stage_dir"
+  if [[ "$enabling" == "true" ]]; then
+    whiptail --msgbox "WARP is enabled for all Reality configs." 10 58
+  else
+    whiptail --msgbox "WARP is disabled for all Reality configs." 10 58
+  fi
+  clear
+}
+
+uninstall_reality() {
+  local crontab_file
+  if ! whiptail --title "Uninstall Reality" --yesno \
+    "Remove every Reality config, user, key and generated link?" 12 70; then
+    return 0
+  fi
+  systemctl disable --now "$REALITY_SERVICE" >/dev/null 2>&1 || true
+  rm -f "/usr/bin/$REALITY_SERVICE"
+  rm -rf "$REALITY_DIR"
+  rm -f "/etc/systemd/system/${REALITY_SERVICE}.service"
+  crontab_file="$(mktemp /tmp/reality-crontab.XXXXXX)" || crontab_file=""
+  if [[ -n "$crontab_file" ]] && crontab -l >"$crontab_file" 2>/dev/null; then
+    sed "/systemctl restart $REALITY_SERVICE/d" "$crontab_file" | crontab -
+  fi
+  [[ -n "$crontab_file" ]] && rm -f "$crontab_file"
+  systemctl daemon-reload
+  whiptail --msgbox "All Reality configs were uninstalled." 10 58
   clear
 }
 
 install_reality() {
-  configure_reality_tui install "$1"
+  reality_create_instance "${1:-}"
 }
 
 modify_reality_config() {
-  configure_reality_tui modify "$1"
+  reality_edit_instance
 }
 
-# Additional Reality users inherit the Flow choice made during installation.
-add_reality_user() {
-  local config_file="/etc/reality/config.json"
-  local name name_regex="^[A-Za-z0-9]+$" user_exists uuid transport_type
-  local default_flow tmp_config
-
-  if [[ ! -e "$config_file" ]]; then
-    whiptail --msgbox "Reality is not installed yet." 10 40
-    clear
-    return
-  fi
-
-  name=$(whiptail --inputbox "Enter the user's name:" 10 40 2>&1 >/dev/tty) || return
-  if [[ ! "$name" =~ $name_regex ]]; then
-    whiptail --msgbox "Invalid characters. Use only A-Z and 0-9." 10 50
-    clear
-    return
-  fi
-
-  user_exists=$(jq --arg name "$name" '.inbounds[0].users | map(select(.name == $name)) | length' "$config_file")
-  if [[ "$user_exists" -ne 0 ]]; then
-    whiptail --msgbox "User already exists!" 10 40
-    clear
-    return
-  fi
-
-  uuid="$(cat /proc/sys/kernel/random/uuid)"
-  transport_type="$(jq -r '.inbounds[0].transport.type // "tcp"' "$config_file")"
-  default_flow="$(jq -r '.inbounds[0].users[0].flow // ""' "$config_file")"
-  tmp_config="$(mktemp /tmp/reality-user.XXXXXX)" || return 1
-
-  if [[ "$transport_type" != "grpc" && "$default_flow" == "xtls-rprx-vision" ]]; then
-    jq --arg name "$name" --arg uuid "$uuid" \
-      '.inbounds[0].users += [{"name": $name, "uuid": $uuid, "flow": "xtls-rprx-vision"}]' \
-      "$config_file" >"$tmp_config"
-  else
-    jq --arg name "$name" --arg uuid "$uuid" \
-      '.inbounds[0].users += [{"name": $name, "uuid": $uuid}]' \
-      "$config_file" >"$tmp_config"
-  fi
-
-  if [[ $? -ne 0 ]]; then
-    rm -f "$tmp_config"
-    tui_error "Could not add the Reality user."
-    return 1
-  fi
-
-  mv "$tmp_config" "$config_file"
-  systemctl restart RS
-  whiptail --msgbox "User added successfully!" 10 40
+reality_manager_menu() {
+  local choice
+  reality_prepare_manager
+  while true; do
+    choice=$(whiptail --clear --title "Reality Multi-Config Manager" \
+      --menu "Create and manage simultaneous TCP/gRPC Reality configs:" 27 72 14 \
+      "1" "Create a new config" \
+      "2" "Edit an existing config" \
+      "3" "Delete a config" \
+      "4" "Add a user" \
+      "5" "Remove a user" \
+      "6" "Show user links / QR" \
+      "7" "Regenerate keys for one config" \
+      "8" "Enable / Disable WARP" \
+      "9" "Uninstall all Reality configs" \
+      "0" "Back to Main Menu" 3>&1 1>&2 2>&3) || break
+    case "$choice" in
+      "1") clear; reality_create_instance ;;
+      "2") clear; reality_edit_instance ;;
+      "3") clear; reality_delete_instance ;;
+      "4") clear; add_reality_user ;;
+      "5") clear; remove_reality_user ;;
+      "6") clear; show_reality_config ;;
+      "7") clear; regenerate_keys ;;
+      "8") clear; toggle_warp_reality ;;
+      "9") clear; uninstall_reality ;;
+      "0") break ;;
+      *) whiptail --msgbox "Invalid choice." 10 40 ;;
+    esac
+  done
   clear
+}
+
+inject_reality_tui_menu() {
+  local script="$1"
+  local start_marker='    "Reality")'
+  local end_marker='    "ShadowTLS")'
+  local replacement prefix after_start suffix
+
+  IFS= read -r -d '' replacement <<'EOF_REALITY_TUI_CASE' || true
+    "Reality")
+        clear
+        reality_manager_menu
+        ;;
+EOF_REALITY_TUI_CASE
+
+  [[ "$script" == *"$start_marker"*"$end_marker"* ]] || return 1
+  prefix="${script%%"$start_marker"*}"
+  after_start="${script#*"$start_marker"}"
+  suffix="${after_start#*"$end_marker"}"
+  printf '%s%s\n%s%s\n' "$prefix" "$replacement" "$end_marker" "$suffix"
 }
 
 # -----------------------------------------------------------------------------
@@ -1264,12 +1986,18 @@ tui() {
     tui_error "The downloaded TUI menu is empty."
     return 1
   fi
+  if ! filtered_script="$(inject_reality_tui_menu "$filtered_script")"; then
+    tui_error "The upstream TUI menu changed and the Reality manager could not be inserted safely."
+    return 1
+  fi
   if ! filtered_script="$(inject_xhttp_tui_menu "$filtered_script")"; then
     tui_error "The upstream TUI menu changed and the XHTTP item could not be inserted safely."
     return 1
   fi
 
-  source /dev/stdin <<<"$filtered_script"
+  # Source the downloaded menu from FD 3 so stdin remains attached to the
+  # terminal.  Otherwise link screens immediately consume EOF and disappear.
+  source /dev/fd/3 3<<<"$filtered_script"
   status=$?
   exit "$status"
 }
