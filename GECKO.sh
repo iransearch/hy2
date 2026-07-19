@@ -1054,6 +1054,45 @@ csf_require_install() {
   fi
 }
 
+csf_apply_install_port_defaults_c() {
+  local port
+
+  [ -f /etc/csf/csf.conf ] || {
+    csf_err_c "Cannot apply default ports: /etc/csf/csf.conf was not found."
+    return 1
+  }
+
+  csf_info_c "Applying GECKO default CSF ports..."
+
+  # Keep inbound SSH available, but prevent new outbound SSH connections.
+  if csf_port_exists_in_conf "TCP_OUT" "22"; then
+    csf_remove_port_from_conf "TCP_OUT" "22"
+    csf_ok_c "Removed 22 from TCP_OUT."
+  fi
+
+  for port in 443 500 1701 4500 4443 8443 8095; do
+    if ! csf_port_exists_in_conf "UDP_OUT" "$port"; then
+      csf_add_port_to_conf "UDP_OUT" "$port"
+    fi
+  done
+
+  if ! csf_port_exists_in_conf "TCP_OUT" "40000"; then
+    csf_add_port_to_conf "TCP_OUT" "40000"
+  fi
+
+  for port in 8443 2096 2083 2087; do
+    if ! csf_port_exists_in_conf "TCP_IN" "$port"; then
+      csf_add_port_to_conf "TCP_IN" "$port"
+    fi
+  done
+
+  if ! csf_port_exists_in_conf "UDP_IN" "900"; then
+    csf_add_port_to_conf "UDP_IN" "900"
+  fi
+
+  csf_ok_c "Default TCP/UDP IN/OUT ports applied."
+}
+
 # ---- 1) Install ----
 
 csf_install_c() {
@@ -1064,6 +1103,8 @@ csf_install_c() {
   if csf_is_installed; then
     csf_warn_c "CSF is already installed."
     csf --version 2>/dev/null || true
+    csf_apply_install_port_defaults_c || return 1
+    csf -r >/dev/null 2>&1 && csf_ok_c "CSF rules reloaded."
     return 0
   fi
 
@@ -1096,6 +1137,8 @@ csf_install_c() {
   # Disable TESTING mode
   csf_info_c "Setting TESTING = 0 in csf.conf..."
   sed -i 's/^TESTING = "1"/TESTING = "0"/' /etc/csf/csf.conf
+
+  csf_apply_install_port_defaults_c || return 1
 
   # Start and enable services
   systemctl start csf
