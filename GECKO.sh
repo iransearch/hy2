@@ -2814,7 +2814,9 @@ enable_gecko_real_outbound_via_warp() {
   echo
   echo "Testing SOCKS5 proxy at $WARP_PROXY_ADDR ..."
   if command -v curl >/dev/null 2>&1; then
-    if curl --socks5 "$WARP_PROXY_ADDR" --max-time 12 -fsSL https://www.cloudflare.com/cdn-cgi/trace >/tmp/gecko-warp-trace.txt 2>/tmp/gecko-warp-curl.err; then
+    # Let the SOCKS server resolve the hostname.  Resolving it locally can
+    # select an IPv6 address which a WARP proxy running in IPv4 mode cannot use.
+    if curl --socks5-hostname "$WARP_PROXY_ADDR" --max-time 12 -fsSL https://www.cloudflare.com/cdn-cgi/trace >/tmp/gecko-warp-trace.txt 2>/tmp/gecko-warp-curl.err; then
       echo "Proxy test OK:"
       grep -E '^(ip|colo|warp)=' /tmp/gecko-warp-trace.txt || true
     else
@@ -2936,13 +2938,34 @@ test_gecko_warp_proxy() {
   DETECTED_PORT="$(gecko_warp_detect_proxy_port)"
   read -rp "Local WARP SOCKS5 proxy port [$DETECTED_PORT]: " WARP_PROXY_PORT
   WARP_PROXY_PORT="${WARP_PROXY_PORT:-$DETECTED_PORT}"
+  if ! [[ "$WARP_PROXY_PORT" =~ ^[0-9]+$ ]] || [ "$WARP_PROXY_PORT" -lt 1 ] || [ "$WARP_PROXY_PORT" -gt 65535 ]; then
+    echo "Invalid proxy port."
+    return 1
+  fi
   WARP_PROXY_ADDR="127.0.0.1:$WARP_PROXY_PORT"
   echo
   echo "Direct server trace:"
   curl --max-time 12 -fsSL https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(ip|colo|warp)=' || echo "Direct trace failed."
   echo
   echo "Via WARP SOCKS5 $WARP_PROXY_ADDR:"
-  curl --socks5 "$WARP_PROXY_ADDR" --max-time 15 -fsSL https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(ip|colo|warp)=' || echo "WARP SOCKS5 trace failed. Check fscarmen WARP Proxy mode."
+  if ! ss -lntp 2>/dev/null | grep -Eq "(127\\.0\\.0\\.1|\\[::1\\]|0\\.0\\.0\\.0):$WARP_PROXY_PORT\\b"; then
+    echo "Nothing is listening on $WARP_PROXY_ADDR."
+    echo "Install/start fscarmen in WARP Client Proxy mode, then use its actual SOCKS5 port."
+    return 1
+  fi
+
+  # socks5-hostname makes the WARP proxy resolve www.cloudflare.com itself.
+  # This avoids a false failure when the server's local DNS returns IPv6.
+  if curl --socks5-hostname "$WARP_PROXY_ADDR" --max-time 15 -fsS https://www.cloudflare.com/cdn-cgi/trace \
+    >/tmp/gecko-warp-trace.txt 2>/tmp/gecko-warp-curl.err; then
+    grep -E '^(ip|colo|warp)=' /tmp/gecko-warp-trace.txt || cat /tmp/gecko-warp-trace.txt
+  else
+    echo "WARP SOCKS5 trace failed. curl reported:"
+    cat /tmp/gecko-warp-curl.err
+    echo
+    echo "Check that fscarmen was installed in WARP Client Proxy mode and that this is its SOCKS5 port."
+    return 1
+  fi
 }
 
 edit_gecko_warp_routes() {
