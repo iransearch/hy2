@@ -30,8 +30,10 @@ tui_error() {
 # TUI-Menu.sh will therefore use sing-box-extended for every TUI protocol.
 install_core() {
   local Protocol="${1:-}"
-  local machine arch latest_url latest_tag version archive_name download_url
-  local tmp_dir binary_path cronet_path installed_version
+  local machine arch releases_api release_data latest_tag version
+  local archive_name download_url asset_digest expected_sha actual_sha
+  local tmp_dir binary_path cronet_path downloaded_version
+  local installed_line installed_version newest_version
 
   if [[ -z "$Protocol" || ! "$Protocol" =~ ^[A-Za-z0-9._-]+$ ]]; then
     tui_error "Invalid protocol name for sing-box installation."
@@ -45,35 +47,102 @@ install_core() {
     i386 | i486 | i586 | i686) arch="386" ;;
     armv7l | armv7) arch="armv7" ;;
     armv6l | armv6) arch="armv6" ;;
-    armv5l | armv5) arch="armv5" ;;
     mips64el) arch="mips64le" ;;
     mipsel) arch="mipsle" ;;
-    riscv64 | s390x | ppc64le) arch="$machine" ;;
-    loongarch64 | loong64) arch="loong64" ;;
+    riscv64 | s390x) arch="$machine" ;;
     *)
       tui_error "Unsupported CPU architecture: $machine"
       return 1
       ;;
   esac
 
-  echo "Checking the latest ${TUI_EXTENDED_REPO} release..."
-  if ! latest_url="$(curl -fsSL --retry 3 --connect-timeout 15 \
-    -o /dev/null -w '%{url_effective}' \
-    "https://github.com/${TUI_EXTENDED_REPO}/releases/latest")"; then
-    tui_error "Could not determine the latest sing-box-extended release."
+  command -v jq >/dev/null 2>&1 || {
+    tui_error "jq is required to select the latest sing-box-extended release."
+    return 1
+  }
+
+  # /releases/latest may remain stale after a new release. Select the newest
+  # stable release that actually contains the required Linux architecture.
+  releases_api="https://api.github.com/repos/${TUI_EXTENDED_REPO}/releases?per_page=20"
+  echo "Checking GitHub for the newest ${TUI_EXTENDED_REPO} linux-${arch} release..."
+  if ! release_data="$(
+    curl -fsSL --retry 3 --connect-timeout 15 \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      -H 'Cache-Control: no-cache' \
+      -H 'User-Agent: GECKO-sing-box-installer' \
+      "$releases_api" |
+      jq -r --arg arch "$arch" '
+        [
+          .[]
+          | select(.draft == false and .prerelease == false)
+          | . as $release
+          | ($release.tag_name | sub("^v"; "")) as $version
+          | ("sing-box-" + $version + "-linux-" + $arch + ".tar.gz") as $asset_name
+          | $release.assets[]?
+          | select(.name == $asset_name)
+          | {
+              published_at: $release.published_at,
+              tag: $release.tag_name,
+              name: .name,
+              url: .browser_download_url,
+              digest: (.digest // "")
+            }
+        ]
+        | sort_by(.published_at)
+        | reverse
+        | first
+        | select(. != null)
+        | [.tag, .name, .url, .digest]
+        | @tsv
+      '
+  )"; then
+    tui_error "Could not query or parse the GitHub Releases API."
     return 1
   fi
 
-  latest_url="${latest_url%/}"
-  latest_tag="${latest_url##*/}"
-  if [[ ! "$latest_tag" =~ ^v[0-9] ]]; then
-    tui_error "GitHub returned an invalid latest release tag: $latest_tag"
+  if [[ -z "$release_data" ]]; then
+    tui_error "No stable sing-box-extended release contains the linux-${arch} archive."
+    return 1
+  fi
+  IFS=$'\t' read -r latest_tag archive_name download_url asset_digest <<<"$release_data"
+  if [[ ! "$latest_tag" =~ ^v[0-9] ]] ||
+    [[ "$archive_name" != "sing-box-${latest_tag#v}-linux-${arch}.tar.gz" ]] ||
+    [[ "$download_url" != "https://github.com/${TUI_EXTENDED_REPO}/releases/download/${latest_tag}/${archive_name}" ]]; then
+    tui_error "GitHub returned invalid release metadata for linux-${arch}."
     return 1
   fi
 
   version="${latest_tag#v}"
-  archive_name="sing-box-${version}-linux-${arch}.tar.gz"
-  download_url="https://github.com/${TUI_EXTENDED_REPO}/releases/download/${latest_tag}/${archive_name}"
+
+  # Avoid downloading the same core every time a config is created. Also do
+  # not downgrade a manually installed version that is newer than GitHub's
+  # newest compatible stable release.
+  installed_version=""
+  if [[ -x "/usr/bin/$Protocol" ]]; then
+    installed_line="$("/usr/bin/$Protocol" version 2>/dev/null | head -n 1)"
+    if [[ "$installed_line" =~ ^sing-box[[:space:]]+version[[:space:]]+(.+)$ ]]; then
+      installed_version="${BASH_REMATCH[1]}"
+    fi
+  fi
+
+  if [[ -n "$installed_version" ]]; then
+    if [[ "$installed_version" == "$version" ]]; then
+      echo "sing-box-extended $installed_version is already the latest compatible release; download skipped."
+      return 0
+    fi
+
+    newest_version="$(printf '%s\n%s\n' "$installed_version" "$version" | sort -V | tail -n 1)"
+    if [[ "$newest_version" == "$installed_version" ]]; then
+      echo "Installed sing-box-extended $installed_version is newer than GitHub release $version; downgrade skipped."
+      return 0
+    fi
+
+    echo "Updating sing-box-extended: $installed_version -> $version"
+  else
+    echo "No valid sing-box-extended binary found at /usr/bin/$Protocol; installation required."
+  fi
+
   tmp_dir="$(mktemp -d /tmp/sing-box-extended.XXXXXX)" || {
     tui_error "Could not create a temporary download directory."
     return 1
@@ -87,6 +156,19 @@ install_core() {
     return 1
   fi
 
+  if [[ "$asset_digest" =~ ^sha256:([0-9A-Fa-f]{64})$ ]]; then
+    expected_sha="${BASH_REMATCH[1],,}"
+    actual_sha="$(sha256sum "$tmp_dir/$archive_name" | awk '{print $1}')"
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+      rm -rf "$tmp_dir"
+      tui_error "SHA-256 verification failed for $archive_name."
+      return 1
+    fi
+    echo "SHA-256 verified: $actual_sha"
+  else
+    echo "Warning: GitHub did not provide a SHA-256 digest for $archive_name."
+  fi
+
   if ! tar --no-same-owner -xzf "$tmp_dir/$archive_name" -C "$tmp_dir"; then
     rm -rf "$tmp_dir"
     tui_error "The downloaded sing-box-extended archive is invalid."
@@ -97,6 +179,13 @@ install_core() {
   if [[ -z "$binary_path" || ! -f "$binary_path" ]]; then
     rm -rf "$tmp_dir"
     tui_error "The sing-box binary was not found in the release archive."
+    return 1
+  fi
+
+  downloaded_version="$("$binary_path" version 2>/dev/null | head -n 1)"
+  if [[ "$downloaded_version" != *"$version"* ]]; then
+    rm -rf "$tmp_dir"
+    tui_error "The downloaded binary version does not match $latest_tag."
     return 1
   fi
 
@@ -113,15 +202,15 @@ install_core() {
     command -v ldconfig >/dev/null 2>&1 && ldconfig >/dev/null 2>&1 || true
   fi
 
-  installed_version="$("/usr/bin/$Protocol" version 2>/dev/null | head -n 1)"
+  installed_line="$("/usr/bin/$Protocol" version 2>/dev/null | head -n 1)"
   rm -rf "$tmp_dir"
 
-  if [[ -z "$installed_version" ]]; then
+  if [[ "$installed_line" != *"$version"* ]]; then
     tui_error "sing-box-extended was copied, but the installed binary did not run correctly."
     return 1
   fi
 
-  echo "Installed: $installed_version"
+  echo "Installed: $installed_line"
 }
 
 # -----------------------------------------------------------------------------
