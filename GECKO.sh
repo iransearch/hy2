@@ -2721,6 +2721,16 @@ csf_require_install() {
   fi
 }
 
+csf_set_conf_value_c() {
+  local key="$1" value="$2"
+
+  if grep -q "^${key} = " /etc/csf/csf.conf; then
+    sed -i "s|^${key} = .*|${key} = \"${value}\"|" /etc/csf/csf.conf
+  else
+    printf '%s = "%s"\n' "$key" "$value" >> /etc/csf/csf.conf
+  fi
+}
+
 csf_apply_install_port_defaults_c() {
   local port
 
@@ -2729,7 +2739,7 @@ csf_apply_install_port_defaults_c() {
     return 1
   }
 
-  csf_info_c "Applying GECKO default CSF ports..."
+  csf_info_c "Applying GECKO default CSF ports and ICMP settings..."
 
   # Keep inbound SSH available, but prevent new outbound SSH connections.
   if csf_port_exists_in_conf "TCP_OUT" "22"; then
@@ -2757,7 +2767,15 @@ csf_apply_install_port_defaults_c() {
     csf_add_port_to_conf "UDP_IN" "900"
   fi
 
-  csf_ok_c "Default TCP/UDP IN/OUT ports applied."
+  # Keep external monitoring and normal PING checks reliable. CSF's default
+  # ICMP rate limit can create artificial packet loss when several probes run.
+  csf_set_conf_value_c "ICMP_IN" "1"
+  csf_set_conf_value_c "ICMP_IN_RATE" "0"
+  csf_set_conf_value_c "ICMP_OUT" "1"
+  csf_set_conf_value_c "ICMP_OUT_RATE" "0"
+
+  csf_ok_c "PING enabled without ICMP rate limiting."
+  csf_ok_c "Default TCP/UDP IN/OUT ports and ICMP settings applied."
 }
 
 # ---- 1) Install ----
@@ -3146,9 +3164,11 @@ csf_ping_block_c() {
   echo " CSF Firewall — PING Block (ICMP_IN)"
   echo "======================================================="
   csf_require_install || return 1
-  local current
+  local current current_rate
   current="$(grep "^ICMP_IN = " /etc/csf/csf.conf | head -1 | grep -oP '"[01]"' | tr -d '"')"
-  echo "Current ICMP_IN = \"${current}\""
+  current_rate="$(grep "^ICMP_IN_RATE = " /etc/csf/csf.conf | head -1 | grep -oP '"\K[^"]+')"
+  echo "Current ICMP_IN      = \"${current}\""
+  echo "Current ICMP_IN_RATE = \"${current_rate:-?}\""
   echo
   echo " 1) Block PING   (ICMP_IN = 0)"
   echo " 2) Allow PING   (ICMP_IN = 1)"
@@ -3162,8 +3182,11 @@ csf_ping_block_c() {
       case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
       ;;
     2)
-      sed -i 's/^ICMP_IN = ".*"/ICMP_IN = "1"/' /etc/csf/csf.conf
-      csf_ok_c "PING allowed (ICMP_IN = 1)."
+      csf_set_conf_value_c "ICMP_IN" "1"
+      csf_set_conf_value_c "ICMP_IN_RATE" "0"
+      csf_set_conf_value_c "ICMP_OUT" "1"
+      csf_set_conf_value_c "ICMP_OUT_RATE" "0"
+      csf_ok_c "PING allowed without ICMP rate limiting."
       read -rp "Reload CSF now? [Y/n]: " rr
       case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
       ;;
