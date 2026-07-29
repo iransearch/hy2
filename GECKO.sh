@@ -5,15 +5,18 @@ source <(curl -sSL https://raw.githubusercontent.com/TheyCallMeSecond/config-exa
 # -----------------------------------------------------------------------------
 # TUI-only overrides
 #   - Install the latest sing-box-extended release instead of the upstream core.
+#   - Let Reality use either the latest Xray-core or sing-box-extended.
 #   - Manage simultaneous TCP/gRPC Reality configs with optional XTLS Vision.
 #   - Add a complete VLESS + XHTTP + TLS manager.
 # The Legacy menu and every custom menu below remain unchanged.
 # -----------------------------------------------------------------------------
 TUI_EXTENDED_REPO="shtorm-7/sing-box-extended"
+TUI_XRAY_REPO="XTLS/Xray-core"
 TUI_MENU_URL="https://raw.githubusercontent.com/TheyCallMeSecond/config-examples/main/Sing-Box_Config_Installer/TUI-Menu.sh"
 REALITY_DIR="/etc/reality"
 REALITY_INSTANCES_DIR="$REALITY_DIR/instances"
 REALITY_SERVICE="RS"
+REALITY_CORE_FILE="$REALITY_DIR/core"
 XHTTP_DIR="/etc/xhttp"
 XHTTP_SERVICE="XH"
 
@@ -213,13 +216,145 @@ install_core() {
   echo "Installed: $installed_line"
 }
 
+install_xray_core() {
+  local Protocol="${1:-}" machine arch latest_release_url latest_tag version
+  local archive_name download_url digest_url digest_data expected_sha actual_sha
+  local tmp_dir binary_path downloaded_line installed_line installed_version newest_version
+
+  if [[ -z "$Protocol" || ! "$Protocol" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    tui_error "Invalid protocol name for Xray installation."
+    return 1
+  fi
+
+  machine="$(uname -m)"
+  case "$machine" in
+    x86_64 | amd64) arch="64" ;;
+    aarch64 | arm64) arch="arm64-v8a" ;;
+    i386 | i486 | i586 | i686) arch="32" ;;
+    armv7l | armv7) arch="arm32-v7a" ;;
+    armv6l | armv6) arch="arm32-v6" ;;
+    mips64el) arch="mips64le" ;;
+    mipsel) arch="mips32le" ;;
+    s390x) arch="s390x" ;;
+    *)
+      tui_error "Unsupported CPU architecture for Xray: $machine"
+      return 1
+      ;;
+  esac
+
+  command -v python3 >/dev/null 2>&1 || {
+    tui_error "python3 is required to extract the Xray release archive."
+    return 1
+  }
+
+  archive_name="Xray-linux-${arch}.zip"
+  echo "Checking GitHub for the newest ${TUI_XRAY_REPO} ${archive_name} release..."
+  if ! latest_release_url="$(
+    curl -fsSIL --retry 3 --connect-timeout 15 \
+      -o /dev/null -w '%{url_effective}' \
+      "https://github.com/${TUI_XRAY_REPO}/releases/latest"
+  )"; then
+    tui_error "Could not resolve the latest stable Xray release."
+    return 1
+  fi
+  latest_tag="${latest_release_url##*/}"
+  if [[ "$latest_release_url" != "https://github.com/${TUI_XRAY_REPO}/releases/tag/${latest_tag}" ]] ||
+    [[ ! "$latest_tag" =~ ^v[0-9]+([.][0-9]+)+$ ]]; then
+    tui_error "GitHub returned an invalid latest Xray release URL."
+    return 1
+  fi
+  version="${latest_tag#v}"
+  download_url="https://github.com/${TUI_XRAY_REPO}/releases/download/${latest_tag}/${archive_name}"
+  digest_url="${download_url}.dgst"
+
+  installed_version=""
+  if [[ -x "/usr/bin/$Protocol" ]]; then
+    installed_line="$("/usr/bin/$Protocol" version 2>/dev/null | head -n 1)"
+    if [[ "$installed_line" =~ ^Xray[[:space:]]+([^[:space:]]+) ]]; then
+      installed_version="${BASH_REMATCH[1]}"
+    fi
+  fi
+
+  if [[ -n "$installed_version" ]]; then
+    if [[ "$installed_version" == "$version" ]]; then
+      echo "Xray $installed_version is already the latest stable release; download skipped."
+      return 0
+    fi
+    newest_version="$(printf '%s\n%s\n' "$installed_version" "$version" | sort -V | tail -n 1)"
+    if [[ "$newest_version" == "$installed_version" ]]; then
+      echo "Installed Xray $installed_version is newer than GitHub release $version; downgrade skipped."
+      return 0
+    fi
+    echo "Updating Xray: $installed_version -> $version"
+  else
+    echo "No valid Xray binary found at /usr/bin/$Protocol; installation required."
+  fi
+
+  tmp_dir="$(mktemp -d /tmp/xray-core.XXXXXX)" || {
+    tui_error "Could not create a temporary Xray download directory."
+    return 1
+  }
+  echo "Downloading Xray ${version} for linux-${arch}..."
+  if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
+    -o "$tmp_dir/$archive_name" "$download_url"; then
+    rm -rf "$tmp_dir"
+    tui_error "Xray download failed:\n$download_url"
+    return 1
+  fi
+
+  if ! digest_data="$(curl -fsSL --retry 3 --connect-timeout 15 "$digest_url")"; then
+    rm -rf "$tmp_dir"
+    tui_error "Could not download the official Xray digest file."
+    return 1
+  fi
+  expected_sha="$(printf '%s\n' "$digest_data" | sed -nE 's/^SHA2-256=[[:space:]]*([0-9A-Fa-f]{64})[[:space:]]*$/\1/p' | head -n 1)"
+  actual_sha="$(sha256sum "$tmp_dir/$archive_name" | awk '{print $1}')"
+  if [[ -z "$expected_sha" || "${actual_sha,,}" != "${expected_sha,,}" ]]; then
+    rm -rf "$tmp_dir"
+    tui_error "SHA-256 verification failed for $archive_name."
+    return 1
+  fi
+  echo "SHA-256 verified: $actual_sha"
+
+  if ! python3 -m zipfile -e "$tmp_dir/$archive_name" "$tmp_dir/extracted"; then
+    rm -rf "$tmp_dir"
+    tui_error "The downloaded Xray archive is invalid."
+    return 1
+  fi
+  binary_path="$(find "$tmp_dir/extracted" -type f -name xray -print -quit)"
+  if [[ -z "$binary_path" || ! -f "$binary_path" ]]; then
+    rm -rf "$tmp_dir"
+    tui_error "The Xray binary was not found in the release archive."
+    return 1
+  fi
+  chmod 0755 "$binary_path"
+  downloaded_line="$("$binary_path" version 2>/dev/null | head -n 1)"
+  if [[ "$downloaded_line" != "Xray $version "* && "$downloaded_line" != "Xray $version" ]]; then
+    rm -rf "$tmp_dir"
+    tui_error "The downloaded Xray binary version does not match $latest_tag."
+    return 1
+  fi
+  if ! install -m 0755 "$binary_path" "/usr/bin/$Protocol"; then
+    rm -rf "$tmp_dir"
+    tui_error "Could not install Xray to /usr/bin/$Protocol."
+    return 1
+  fi
+  installed_line="$("/usr/bin/$Protocol" version 2>/dev/null | head -n 1)"
+  rm -rf "$tmp_dir"
+  if [[ "$installed_line" != "Xray $version "* && "$installed_line" != "Xray $version" ]]; then
+    tui_error "Xray was copied, but the installed binary did not run correctly."
+    return 1
+  fi
+  echo "Installed: $installed_line"
+}
+
 # -----------------------------------------------------------------------------
 # Multi-instance VLESS + Reality manager
 #
-# Each instance is stored independently under /etc/reality/instances.  A single
-# validated sing-box configuration is generated from those records, so TCP and
-# gRPC Reality listeners can run together without competing for /etc/reality or
-# the RS systemd unit.
+# Each instance is stored independently under /etc/reality/instances. A single
+# validated configuration for the selected core is generated from those records,
+# so TCP and gRPC Reality listeners can run together without competing for
+# /etc/reality or the RS systemd unit.
 # -----------------------------------------------------------------------------
 reality_urlencode() {
   jq -rn --arg value "$1" '$value | @uri'
@@ -303,16 +438,98 @@ select_reality_flow() {
   fi
 }
 
-reality_generate_keypair() {
-  local output
-  if ! output="$("/usr/bin/$REALITY_SERVICE" generate reality-keypair 2>&1)"; then
-    tui_error "Could not generate the Reality key pair.\n$output"
-    return 1
+reality_detect_core() {
+  local saved="" version_line=""
+  if [[ -f "$REALITY_CORE_FILE" ]]; then
+    saved="$(tr -d '[:space:]' <"$REALITY_CORE_FILE")"
+    if [[ "$saved" == "xray" || "$saved" == "sing-box" ]]; then
+      printf '%s' "$saved"
+      return 0
+    fi
   fi
-  REALITY_PRIVATE_KEY="$(printf '%s\n' "$output" | sed -n 's/^PrivateKey:[[:space:]]*//p' | head -n 1)"
-  REALITY_PUBLIC_KEY="$(printf '%s\n' "$output" | sed -n 's/^PublicKey:[[:space:]]*//p' | head -n 1)"
+
+  if [[ -x "/usr/bin/$REALITY_SERVICE" ]]; then
+    version_line="$("/usr/bin/$REALITY_SERVICE" version 2>/dev/null | head -n 1)"
+    case "$version_line" in
+      Xray\ *) printf 'xray'; return 0 ;;
+      sing-box\ version\ *) printf 'sing-box'; return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+reality_save_core() {
+  local core="$1"
+  [[ "$core" == "xray" || "$core" == "sing-box" ]] || return 1
+  mkdir -p "$REALITY_DIR" || return 1
+  printf '%s\n' "$core" >"$REALITY_CORE_FILE" || return 1
+  chmod 0600 "$REALITY_CORE_FILE" 2>/dev/null || true
+}
+
+select_reality_core() {
+  local default_core="${1:-sing-box}" default_item choice
+  if [[ "$default_core" == "xray" ]]; then
+    default_item="xray"
+  else
+    default_item="sing-box"
+  fi
+  choice=$(whiptail --clear --title "Reality Core" --default-item "$default_item" \
+    --menu "Select the core for all Reality configs:" 16 76 2 \
+    "xray" "Xray-core (XTLS/Xray-core)" \
+    "sing-box" "sing-box-extended (current core)" \
+    2>&1 >/dev/tty) || return 1
+  printf '%s' "$choice"
+}
+
+reality_install_core() {
+  local core="$1"
+  case "$core" in
+    xray) install_xray_core "$REALITY_SERVICE" ;;
+    sing-box) install_core "$REALITY_SERVICE" ;;
+    *) tui_error "Unknown Reality core: $core"; return 1 ;;
+  esac
+}
+
+reality_ensure_core() {
+  local core
+  core="$(reality_detect_core 2>/dev/null)" || core=""
+  if [[ -z "$core" ]]; then
+    core="$(select_reality_core "sing-box")" || return 1
+  fi
+  reality_install_core "$core" || return 1
+  reality_save_core "$core" || {
+    tui_error "Could not save the selected Reality core."
+    return 1
+  }
+}
+
+reality_generate_keypair() {
+  local output core
+  core="$(reality_detect_core 2>/dev/null)" || core=""
+  case "$core" in
+    xray)
+      if ! output="$("/usr/bin/$REALITY_SERVICE" x25519 2>&1)"; then
+        tui_error "Could not generate the Reality key pair with Xray.\n$output"
+        return 1
+      fi
+      REALITY_PRIVATE_KEY="$(printf '%s\n' "$output" | sed -nE 's/^(PrivateKey|Private[[:space:]]+[Kk]ey):[[:space:]]*//p' | head -n 1)"
+      REALITY_PUBLIC_KEY="$(printf '%s\n' "$output" | sed -nE 's/^(PublicKey|Public[[:space:]]+[Kk]ey|Password([[:space:]]+\(PublicKey\))?):[[:space:]]*//p' | head -n 1)"
+      ;;
+    sing-box)
+      if ! output="$("/usr/bin/$REALITY_SERVICE" generate reality-keypair 2>&1)"; then
+        tui_error "Could not generate the Reality key pair with sing-box-extended.\n$output"
+        return 1
+      fi
+      REALITY_PRIVATE_KEY="$(printf '%s\n' "$output" | sed -n 's/^PrivateKey:[[:space:]]*//p' | head -n 1)"
+      REALITY_PUBLIC_KEY="$(printf '%s\n' "$output" | sed -n 's/^PublicKey:[[:space:]]*//p' | head -n 1)"
+      ;;
+    *)
+      tui_error "Reality core is not selected."
+      return 1
+      ;;
+  esac
   if [[ -z "$REALITY_PRIVATE_KEY" || -z "$REALITY_PUBLIC_KEY" ]]; then
-    tui_error "sing-box-extended returned an invalid Reality key pair."
+    tui_error "The selected core returned an invalid Reality key pair."
     return 1
   fi
 }
@@ -509,7 +726,7 @@ reality_collect_instance_settings() {
   fi
 }
 
-reality_build_combined_config() {
+reality_build_singbox_config() {
   local instances_dir="$1" output_file="$2" tmp_file warp_tag
   local -a instance_files=()
 
@@ -610,11 +827,112 @@ reality_build_combined_config() {
   fi
 }
 
+reality_build_xray_config() {
+  local instances_dir="$1" output_file="$2"
+  local -a instance_files=()
+
+  mapfile -d '' -t instance_files < <(
+    find "$instances_dir" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null | sort -z
+  )
+  ((${#instance_files[@]} > 0)) || return 1
+
+  jq -s '
+    map(select(type == "object")) as $instances
+    | {
+        log: {
+          loglevel: "warning"
+        },
+        inbounds: [
+          $instances[]
+          | . as $instance
+          | {
+              tag: ("reality-" + $instance.id),
+              listen: "::",
+              port: $instance.port,
+              protocol: "vless",
+              settings: {
+                clients: [
+                  $instance.users[]
+                  | {
+                      id: .uuid,
+                      email: .name
+                    }
+                    + if ($instance.transport == "tcp" and ($instance.flow // "") != "") then
+                        {flow: $instance.flow}
+                      else
+                        {}
+                      end
+                ],
+                decryption: "none"
+              },
+              streamSettings: {
+                network: $instance.transport,
+                security: "reality",
+                realitySettings: {
+                  show: false,
+                  target: ($instance.sni + ":443"),
+                  xver: 0,
+                  serverNames: [$instance.sni],
+                  privateKey: $instance.private_key,
+                  shortIds: [$instance.short_id]
+                }
+              }
+              + if $instance.transport == "grpc" then
+                  {
+                    grpcSettings: {
+                      serviceName: $instance.service_name,
+                      multiMode: false
+                    }
+                  }
+                else
+                  {}
+                end
+            }
+        ],
+        outbounds: [
+          {
+            protocol: "freedom",
+            tag: "direct"
+          }
+        ],
+        routing: {
+          domainStrategy: "AsIs",
+          rules: []
+        }
+      }
+  ' "${instance_files[@]}" >"$output_file"
+}
+
+reality_build_combined_config() {
+  local instances_dir="$1" output_file="$2" core
+  core="$(reality_detect_core 2>/dev/null)" || core=""
+  case "$core" in
+    xray)
+      if [[ -f "$REALITY_DIR/warp-enabled" ]]; then
+        tui_error "The current Reality WARP outbound is only compatible with sing-box-extended. Disable WARP before using Xray."
+        return 1
+      fi
+      reality_build_xray_config "$instances_dir" "$output_file"
+      ;;
+    sing-box) reality_build_singbox_config "$instances_dir" "$output_file" ;;
+    *) tui_error "Reality core is not selected."; return 1 ;;
+  esac
+}
+
 reality_write_service() {
+  local core description documentation
+  core="$(reality_detect_core 2>/dev/null)" || return 1
+  if [[ "$core" == "xray" ]]; then
+    description="Multi-instance VLESS Reality (Xray-core)"
+    documentation="https://github.com/XTLS/Xray-core"
+  else
+    description="Multi-instance VLESS Reality (sing-box-extended)"
+    documentation="https://github.com/shtorm-7/sing-box-extended"
+  fi
   cat >"/etc/systemd/system/${REALITY_SERVICE}.service" <<EOF_REALITY_SERVICE
 [Unit]
-Description=Multi-instance VLESS Reality (sing-box-extended)
-Documentation=https://github.com/shtorm-7/sing-box-extended
+Description=$description
+Documentation=$documentation
 After=network-online.target nss-lookup.target
 Wants=network-online.target
 
@@ -647,6 +965,16 @@ reality_stage_instances() {
   printf '%s' "$stage_dir"
 }
 
+reality_check_config() {
+  local config_file="$1" core
+  core="$(reality_detect_core 2>/dev/null)" || return 1
+  case "$core" in
+    xray) "/usr/bin/$REALITY_SERVICE" run -test -c "$config_file" ;;
+    sing-box) "/usr/bin/$REALITY_SERVICE" check -c "$config_file" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Validate the entire combined config before replacing the live files.  If the
 # new service cannot start, both the previous records and service are restored.
 reality_commit_stage() {
@@ -671,7 +999,7 @@ reality_commit_stage() {
     tui_error "Could not build the combined Reality configuration."
     return 1
   fi
-  if ! "/usr/bin/$REALITY_SERVICE" check -c "$candidate" >"$check_log" 2>&1; then
+  if ! reality_check_config "$candidate" >"$check_log" 2>&1; then
     sed -i $'s/\033\\[[0-9;]*m//g' "$check_log" 2>/dev/null || true
     whiptail --title "Reality config error" --textbox "$check_log" 22 84
     rm -f "$candidate" "$check_log"
@@ -863,7 +1191,7 @@ reality_create_instance() {
 
   reality_prepare_manager
   reality_collect_instance_settings "" "$forced_transport" || return 0
-  install_core "$REALITY_SERVICE" || return 1
+  reality_ensure_core || return 1
   reality_generate_keypair || return 1
 
   uuid="$(cat /proc/sys/kernel/random/uuid)"
@@ -914,7 +1242,7 @@ reality_edit_instance() {
   old_id="$(reality_select_instance "Select the Reality config to edit:")" || return 0
   current_file="$(reality_instance_path "$old_id")"
   reality_collect_instance_settings "$current_file" || return 0
-  [[ -x "/usr/bin/$REALITY_SERVICE" ]] || install_core "$REALITY_SERVICE" || return 1
+  reality_ensure_core || return 1
 
   stage_dir="$(reality_stage_instances)" || return 1
   staged_file="$(reality_instance_path "$old_id" "$stage_dir")"
@@ -1069,7 +1397,7 @@ regenerate_keys() {
     "All existing links for '$id' will stop working. Continue?" 12 68; then
     return 0
   fi
-  [[ -x "/usr/bin/$REALITY_SERVICE" ]] || install_core "$REALITY_SERVICE" || return 1
+  reality_ensure_core || return 1
   reality_generate_keypair || return 1
 
   stage_dir="$(reality_stage_instances)" || return 1
@@ -1096,11 +1424,81 @@ regenerate_keys() {
   reality_display_user_link "$id" "$first_user"
 }
 
+change_reality_core() {
+  local old_core new_core backup_dir stage_dir was_active="false" switch_ok="true"
+
+  reality_prepare_manager
+  old_core="$(reality_detect_core 2>/dev/null)" || old_core=""
+  new_core="$(select_reality_core "${old_core:-sing-box}")" || return 0
+
+  if [[ "$new_core" == "xray" && -f "$REALITY_DIR/warp-enabled" ]]; then
+    whiptail --msgbox \
+      "Reality WARP is currently enabled and its outbound format is specific to sing-box-extended. Disable WARP before switching to Xray." \
+      13 76
+    return 0
+  fi
+
+  backup_dir="$(mktemp -d /tmp/reality-core-backup.XXXXXX)" || {
+    tui_error "Could not create a Reality core backup."
+    return 1
+  }
+  [[ -x "/usr/bin/$REALITY_SERVICE" ]] &&
+    cp -a "/usr/bin/$REALITY_SERVICE" "$backup_dir/binary"
+  [[ -f "$REALITY_CORE_FILE" ]] &&
+    cp -a "$REALITY_CORE_FILE" "$backup_dir/core"
+  systemctl is-active --quiet "$REALITY_SERVICE" && was_active="true"
+
+  if ! reality_install_core "$new_core" || ! reality_save_core "$new_core"; then
+    switch_ok="false"
+  fi
+
+  if [[ "$switch_ok" == "true" ]] && reality_have_instances; then
+    stage_dir="$(reality_stage_instances)" || switch_ok="false"
+    if [[ "$switch_ok" == "true" ]] && ! reality_commit_stage "$stage_dir"; then
+      switch_ok="false"
+    fi
+    [[ -n "${stage_dir:-}" ]] && rm -rf "$stage_dir"
+  fi
+
+  if [[ "$switch_ok" != "true" ]]; then
+    if [[ -f "$backup_dir/binary" ]]; then
+      install -m 0755 "$backup_dir/binary" "/usr/bin/$REALITY_SERVICE"
+    else
+      rm -f "/usr/bin/$REALITY_SERVICE"
+    fi
+    if [[ -f "$backup_dir/core" ]]; then
+      cp -a "$backup_dir/core" "$REALITY_CORE_FILE"
+    else
+      rm -f "$REALITY_CORE_FILE"
+    fi
+    systemctl daemon-reload
+    [[ "$was_active" == "true" ]] && systemctl restart "$REALITY_SERVICE" >/dev/null 2>&1 || true
+    rm -rf "$backup_dir"
+    tui_error "Reality core change failed. The previous core and service were restored."
+    return 1
+  fi
+
+  rm -rf "$backup_dir"
+  if [[ "$new_core" == "$old_core" ]]; then
+    whiptail --msgbox "Reality core is already '$new_core'. Its latest compatible version was checked and the service was refreshed." 12 72
+  else
+    whiptail --msgbox "Reality core changed successfully to '$new_core'. All existing Reality configs were converted and restarted." 12 72
+  fi
+  clear
+}
+
 toggle_warp_reality() {
-  local enabling="false" stage_dir
+  local enabling="false" stage_dir core
   reality_prepare_manager
   if ! reality_have_instances; then
     whiptail --msgbox "No Reality configs exist yet." 10 45
+    return 0
+  fi
+  core="$(reality_detect_core 2>/dev/null)" || core=""
+  if [[ "$core" == "xray" ]]; then
+    whiptail --msgbox \
+      "This WARP option imports a sing-box WireGuard outbound and is not compatible with Xray. Switch to sing-box-extended to use it." \
+      12 74
     return 0
   fi
 
@@ -1164,11 +1562,12 @@ modify_reality_config() {
 }
 
 reality_manager_menu() {
-  local choice
+  local choice current_core
   reality_prepare_manager
   while true; do
+    current_core="$(reality_detect_core 2>/dev/null)" || current_core="not selected"
     choice=$(whiptail --clear --title "Reality Multi-Config Manager" \
-      --menu "Create and manage simultaneous TCP/gRPC Reality configs:" 27 72 14 \
+      --menu "Core: $current_core | Create and manage simultaneous TCP/gRPC Reality configs:" 29 78 16 \
       "1" "Create a new config" \
       "2" "Edit an existing config" \
       "3" "Delete a config" \
@@ -1177,7 +1576,8 @@ reality_manager_menu() {
       "6" "Show user links / QR" \
       "7" "Regenerate keys for one config" \
       "8" "Enable / Disable WARP" \
-      "9" "Uninstall all Reality configs" \
+      "9" "Select / update Reality core" \
+      "10" "Uninstall all Reality configs" \
       "0" "Back to Main Menu" 3>&1 1>&2 2>&3) || break
     case "$choice" in
       "1") clear; reality_create_instance ;;
@@ -1188,7 +1588,8 @@ reality_manager_menu() {
       "6") clear; show_reality_config ;;
       "7") clear; regenerate_keys ;;
       "8") clear; toggle_warp_reality ;;
-      "9") clear; uninstall_reality ;;
+      "9") clear; change_reality_core ;;
+      "10") clear; uninstall_reality ;;
       "0") break ;;
       *) whiptail --msgbox "Invalid choice." 10 40 ;;
     esac
