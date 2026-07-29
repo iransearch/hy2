@@ -1186,12 +1186,28 @@ reality_display_user_link() {
   reality_wait_for_enter
 }
 
+reality_choose_core_for_create() {
+  local old_core new_core
+  old_core="$(reality_detect_core 2>/dev/null)" || old_core=""
+  new_core="$(select_reality_core "${old_core:-sing-box}")" || return 1
+
+  if [[ -n "$old_core" && "$new_core" != "$old_core" ]] && reality_have_instances; then
+    if ! whiptail --title "Change Reality Core" --yesno \
+      "The current core is '$old_core'. Selecting '$new_core' will convert and restart ALL existing Reality configs before the new config is created. Continue?" \
+      14 78; then
+      return 1
+    fi
+  fi
+
+  change_reality_core "$new_core" "quiet"
+}
+
 reality_create_instance() {
   local forced_transport="${1:-}" stage_dir uuid short_id user_port
 
   reality_prepare_manager
+  reality_choose_core_for_create || return 0
   reality_collect_instance_settings "" "$forced_transport" || return 0
-  reality_ensure_core || return 1
   reality_generate_keypair || return 1
 
   uuid="$(cat /proc/sys/kernel/random/uuid)"
@@ -1425,17 +1441,27 @@ regenerate_keys() {
 }
 
 change_reality_core() {
+  local requested_core="${1:-}" mode="${2:-interactive}"
   local old_core new_core backup_dir stage_dir was_active="false" switch_ok="true"
 
   reality_prepare_manager
   old_core="$(reality_detect_core 2>/dev/null)" || old_core=""
-  new_core="$(select_reality_core "${old_core:-sing-box}")" || return 0
+  if [[ "$requested_core" == "xray" || "$requested_core" == "sing-box" ]]; then
+    new_core="$requested_core"
+  else
+    new_core="$(select_reality_core "${old_core:-sing-box}")" || return 0
+  fi
 
   if [[ "$new_core" == "xray" && -f "$REALITY_DIR/warp-enabled" ]]; then
-    whiptail --msgbox \
-      "Reality WARP is currently enabled and its outbound format is specific to sing-box-extended. Disable WARP before switching to Xray." \
-      13 76
-    return 0
+    if [[ "$mode" == "quiet" ]]; then
+      tui_error "Reality WARP is enabled. Disable it before selecting Xray."
+      return 1
+    else
+      whiptail --msgbox \
+        "Reality WARP is currently enabled and its outbound format is specific to sing-box-extended. Disable WARP before switching to Xray." \
+        13 76
+      return 0
+    fi
   fi
 
   backup_dir="$(mktemp -d /tmp/reality-core-backup.XXXXXX)" || {
@@ -1479,12 +1505,14 @@ change_reality_core() {
   fi
 
   rm -rf "$backup_dir"
-  if [[ "$new_core" == "$old_core" ]]; then
-    whiptail --msgbox "Reality core is already '$new_core'. Its latest compatible version was checked and the service was refreshed." 12 72
-  else
-    whiptail --msgbox "Reality core changed successfully to '$new_core'. All existing Reality configs were converted and restarted." 12 72
+  if [[ "$mode" != "quiet" ]]; then
+    if [[ "$new_core" == "$old_core" ]]; then
+      whiptail --msgbox "Reality core is already '$new_core'. Its latest compatible version was checked and the service was refreshed." 12 72
+    else
+      whiptail --msgbox "Reality core changed successfully to '$new_core'. All existing Reality configs were converted and restarted." 12 72
+    fi
+    clear
   fi
-  clear
 }
 
 toggle_warp_reality() {
