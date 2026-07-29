@@ -865,28 +865,30 @@ reality_build_xray_config() {
                 ],
                 decryption: "none"
               },
-              streamSettings: {
-                network: $instance.transport,
-                security: "reality",
-                realitySettings: {
-                  show: false,
-                  target: ($instance.sni + ":443"),
-                  xver: 0,
-                  serverNames: [$instance.sni],
-                  privateKey: $instance.private_key,
-                  shortIds: [$instance.short_id]
-                }
-              }
-              + if $instance.transport == "grpc" then
-                  {
-                    grpcSettings: {
-                      serviceName: $instance.service_name,
-                      multiMode: false
-                    }
+              streamSettings: (
+                {
+                  network: $instance.transport,
+                  security: "reality",
+                  realitySettings: {
+                    show: false,
+                    target: ($instance.sni + ":443"),
+                    xver: 0,
+                    serverNames: [$instance.sni],
+                    privateKey: $instance.private_key,
+                    shortIds: [$instance.short_id]
                   }
-                else
-                  {}
-                end
+                }
+                + if $instance.transport == "grpc" then
+                    {
+                      grpcSettings: {
+                        serviceName: $instance.service_name,
+                        multiMode: false
+                      }
+                    }
+                  else
+                    {}
+                  end
+              )
             }
         ],
         outbounds: [
