@@ -971,7 +971,7 @@ reality_check_config() {
   local config_file="$1" core
   core="$(reality_detect_core 2>/dev/null)" || return 1
   case "$core" in
-    xray) "/usr/bin/$REALITY_SERVICE" run -test -c "$config_file" ;;
+    xray) "/usr/bin/$REALITY_SERVICE" run -test -format=json -c "$config_file" ;;
     sing-box) "/usr/bin/$REALITY_SERVICE" check -c "$config_file" ;;
     *) return 1 ;;
   esac
