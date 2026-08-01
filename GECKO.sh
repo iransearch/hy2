@@ -4832,25 +4832,65 @@ remove_gecko_warp_block_from_config() {
 }
 
 write_default_gecko_warp_routes() {
+  local route tmp
+  local -a required_routes=(
+    'suffix:google.com'
+    'suffix:googleapis.com'
+    'suffix:gstatic.com'
+    'suffix:google-analytics.com'
+    'suffix:googleusercontent.com'
+    'suffix:generativelanguage.googleapis.com'
+    'suffix:ai.google.dev'
+    'suffix:bard.google.com'
+    'suffix:gemini.google.com'
+    'suffix:makersuite.google.com'
+    'suffix:aistudio.google.com'
+    'suffix:openai.com'
+    'suffix:chatgpt.com'
+    'suffix:apple.com'
+    'suffix:icloud.com'
+    'suffix:showip.net'
+    'suffix:cdn-apple.com'
+  )
+
   gecko_warp_prepare_storage
-  [[ -f "$GECKO_WARP_ROUTES_FILE" ]] && return 0
-  cat >"$GECKO_WARP_ROUTES_FILE" <<'EOF'
+  if [[ ! -f "$GECKO_WARP_ROUTES_FILE" ]]; then
+    cat >"$GECKO_WARP_ROUTES_FILE" <<'EOF'
 suffix:google.com
-suffix:gstatic.com
 suffix:googleapis.com
-suffix:googleusercontent.com
+suffix:gstatic.com
 suffix:google-analytics.com
+suffix:googleusercontent.com
 suffix:generativelanguage.googleapis.com
 suffix:ai.google.dev
-suffix:apple.com
-suffix:icloud.com
-suffix:cdn-apple.com
+suffix:bard.google.com
+suffix:gemini.google.com
+suffix:makersuite.google.com
+suffix:aistudio.google.com
 suffix:openai.com
 suffix:chatgpt.com
+suffix:apple.com
+suffix:icloud.com
 suffix:showip.net
-*.showip.net
-showip.net
+suffix:cdn-apple.com
 EOF
+  fi
+
+  # Upgrade older route files, remove obsolete equivalents and append only
+  # genuinely missing entries. Keep one copy of every non-empty rule.
+  sed -i '/^keyword:showip$/d;/^geosite:youtube$/d;/^\*\.showip\.net$/d;/^showip\.net$/d' \
+    "$GECKO_WARP_ROUTES_FILE" 2>/dev/null || true
+  for route in "${required_routes[@]}"; do
+    grep -qxF "$route" "$GECKO_WARP_ROUTES_FILE" 2>/dev/null ||
+      printf '%s\n' "$route" >>"$GECKO_WARP_ROUTES_FILE"
+  done
+  tmp="$(mktemp /tmp/gecko-warp-routes.XXXXXX)" || return 1
+  awk 'NF && !seen[$0]++' "$GECKO_WARP_ROUTES_FILE" >"$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  install -m 0600 "$tmp" "$GECKO_WARP_ROUTES_FILE"
+  rm -f "$tmp"
 }
 
 gecko_warp_domain_sets_json() {
@@ -5078,12 +5118,6 @@ enable_gecko_real_outbound_via_warp() {
   echo "======================================================="
   [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
   write_default_gecko_warp_routes
-  # Upgrade route files created by older versions.
-  sed -i '/^keyword:showip$/d;/^geosite:youtube$/d' "$GECKO_WARP_ROUTES_FILE" 2>/dev/null || true
-  grep -qxF 'suffix:showip.net' "$GECKO_WARP_ROUTES_FILE" 2>/dev/null || echo 'suffix:showip.net' >> "$GECKO_WARP_ROUTES_FILE"
-  grep -qxF '*.showip.net' "$GECKO_WARP_ROUTES_FILE" 2>/dev/null || echo '*.showip.net' >> "$GECKO_WARP_ROUTES_FILE"
-  grep -qxF 'showip.net' "$GECKO_WARP_ROUTES_FILE" 2>/dev/null || echo 'showip.net' >> "$GECKO_WARP_ROUTES_FILE"
-
   echo
   echo "Selective WARP route list:"
   echo "-------------------------------------------------------"
