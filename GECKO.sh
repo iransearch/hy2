@@ -727,7 +727,7 @@ reality_collect_instance_settings() {
 }
 
 reality_build_singbox_config() {
-  local instances_dir="$1" output_file="$2" tmp_file warp_tag
+  local instances_dir="$1" output_file="$2"
   local -a instance_files=()
 
   mapfile -d '' -t instance_files < <(
@@ -804,27 +804,7 @@ reality_build_singbox_config() {
     return 1
   fi
 
-  if [[ -f "$REALITY_DIR/warp-enabled" && -f /etc/sbw/proxy.json ]] &&
-    jq -e '.outbounds | type == "array" and length > 0' /etc/sbw/proxy.json >/dev/null 2>&1; then
-    warp_tag="$(jq -r '.outbounds[] | select(.type == "wireguard") | .tag // empty' \
-      /etc/sbw/proxy.json | head -n 1)"
-    if [[ -n "$warp_tag" ]]; then
-      tmp_file="$(mktemp /tmp/reality-warp.XXXXXX)" || return 1
-      if ! jq --slurpfile warp /etc/sbw/proxy.json --arg warp_tag "$warp_tag" '
-        (.inbounds | map(.tag)) as $inbound_tags
-        | .outbounds = $warp[0].outbounds
-        | .route.rules += [{
-            inbound: $inbound_tags,
-            action: "route",
-            outbound: $warp_tag
-          }]
-      ' "$output_file" >"$tmp_file"; then
-        rm -f "$tmp_file"
-        return 1
-      fi
-      mv "$tmp_file" "$output_file"
-    fi
-  fi
+  gecko_warp_apply_singbox_json "$output_file"
 }
 
 reality_build_xray_config() {
@@ -865,6 +845,11 @@ reality_build_xray_config() {
                 ],
                 decryption: "none"
               },
+              sniffing: {
+                enabled: true,
+                destOverride: ["http", "tls", "quic"],
+                routeOnly: true
+              },
               streamSettings: (
                 {
                   network: $instance.transport,
@@ -902,20 +887,16 @@ reality_build_xray_config() {
           rules: []
         }
       }
-  ' "${instance_files[@]}" >"$output_file"
+  ' "${instance_files[@]}" >"$output_file" || return 1
+
+  gecko_warp_apply_xray_json "$output_file"
 }
 
 reality_build_combined_config() {
   local instances_dir="$1" output_file="$2" core
   core="$(reality_detect_core 2>/dev/null)" || core=""
   case "$core" in
-    xray)
-      if [[ -f "$REALITY_DIR/warp-enabled" ]]; then
-        tui_error "The current Reality WARP outbound is only compatible with sing-box-extended. Disable WARP before using Xray."
-        return 1
-      fi
-      reality_build_xray_config "$instances_dir" "$output_file"
-      ;;
+    xray) reality_build_xray_config "$instances_dir" "$output_file" ;;
     sing-box) reality_build_singbox_config "$instances_dir" "$output_file" ;;
     *) tui_error "Reality core is not selected."; return 1 ;;
   esac
@@ -1454,18 +1435,6 @@ change_reality_core() {
     new_core="$(select_reality_core "${old_core:-sing-box}")" || return 0
   fi
 
-  if [[ "$new_core" == "xray" && -f "$REALITY_DIR/warp-enabled" ]]; then
-    if [[ "$mode" == "quiet" ]]; then
-      tui_error "Reality WARP is enabled. Disable it before selecting Xray."
-      return 1
-    else
-      whiptail --msgbox \
-        "Reality WARP is currently enabled and its outbound format is specific to sing-box-extended. Disable WARP before switching to Xray." \
-        13 76
-      return 0
-    fi
-  fi
-
   backup_dir="$(mktemp -d /tmp/reality-core-backup.XXXXXX)" || {
     tui_error "Could not create a Reality core backup."
     return 1
@@ -1517,52 +1486,6 @@ change_reality_core() {
   fi
 }
 
-toggle_warp_reality() {
-  local enabling="false" stage_dir core
-  reality_prepare_manager
-  if ! reality_have_instances; then
-    whiptail --msgbox "No Reality configs exist yet." 10 45
-    return 0
-  fi
-  core="$(reality_detect_core 2>/dev/null)" || core=""
-  if [[ "$core" == "xray" ]]; then
-    whiptail --msgbox \
-      "This WARP option imports a sing-box WireGuard outbound and is not compatible with Xray. Switch to sing-box-extended to use it." \
-      12 74
-    return 0
-  fi
-
-  if [[ -f "$REALITY_DIR/warp-enabled" ]]; then
-    rm -f "$REALITY_DIR/warp-enabled"
-  else
-    if [[ ! -f /etc/sbw/proxy.json ]] ||
-      ! jq -e '.outbounds[] | select(.type == "wireguard")' /etc/sbw/proxy.json >/dev/null 2>&1; then
-      whiptail --msgbox "WARP is not installed or its WireGuard outbound is invalid." 11 68
-      return 0
-    fi
-    touch "$REALITY_DIR/warp-enabled"
-    enabling="true"
-  fi
-
-  stage_dir="$(reality_stage_instances)" || return 1
-  if ! reality_commit_stage "$stage_dir"; then
-    if [[ "$enabling" == "true" ]]; then
-      rm -f "$REALITY_DIR/warp-enabled"
-    else
-      touch "$REALITY_DIR/warp-enabled"
-    fi
-    rm -rf "$stage_dir"
-    return 1
-  fi
-  rm -rf "$stage_dir"
-  if [[ "$enabling" == "true" ]]; then
-    whiptail --msgbox "WARP is enabled for all Reality configs." 10 58
-  else
-    whiptail --msgbox "WARP is disabled for all Reality configs." 10 58
-  fi
-  clear
-}
-
 uninstall_reality() {
   local crontab_file
   if ! whiptail --title "Uninstall Reality" --yesno \
@@ -1597,7 +1520,7 @@ reality_manager_menu() {
   while true; do
     current_core="$(reality_detect_core 2>/dev/null)" || current_core="not selected"
     choice=$(whiptail --clear --title "Reality Multi-Config Manager" \
-      --menu "Core: $current_core | Create and manage simultaneous TCP/gRPC Reality configs:" 29 78 16 \
+      --menu "Core: $current_core | WARP is managed centrally from main menu option 6:" 28 78 15 \
       "1" "Create a new config" \
       "2" "Edit an existing config" \
       "3" "Delete a config" \
@@ -1605,9 +1528,8 @@ reality_manager_menu() {
       "5" "Remove a user" \
       "6" "Show user links / QR" \
       "7" "Regenerate keys for one config" \
-      "8" "Enable / Disable WARP" \
-      "9" "Select / update Reality core" \
-      "10" "Uninstall all Reality configs" \
+      "8" "Select / update Reality core" \
+      "9" "Uninstall all Reality configs" \
       "0" "Back to Main Menu" 3>&1 1>&2 2>&3) || break
     case "$choice" in
       "1") clear; reality_create_instance ;;
@@ -1617,9 +1539,8 @@ reality_manager_menu() {
       "5") clear; remove_reality_user ;;
       "6") clear; show_reality_config ;;
       "7") clear; regenerate_keys ;;
-      "8") clear; toggle_warp_reality ;;
-      "9") clear; change_reality_core ;;
-      "10") clear; uninstall_reality ;;
+      "8") clear; change_reality_core ;;
+      "9") clear; uninstall_reality ;;
       "0") break ;;
       *) whiptail --msgbox "Invalid choice." 10 40 ;;
     esac
@@ -1992,7 +1913,9 @@ xhttp_build_server_config() {
         "final": "direct",
         "auto_detect_interface": true
       }
-    }' >"$output_file"
+    }' >"$output_file" || return 1
+
+  gecko_warp_apply_singbox_json "$output_file"
 }
 
 xhttp_write_metadata() {
@@ -4827,35 +4750,36 @@ gecko_relay_tunnel_menu() {
 
 
 # =======================================================
-# GECKO WARP Proxy Outbound - Kharej only
-# Uses fscarmen/warp Cloudflare Client Proxy mode and routes
-# only Real Gecko server outbound through local SOCKS5 proxy.
+# Unified GECKO WARP selective outbound
+# One state and route list for Hysteria2, Reality (Xray or
+# sing-box) and XHTTP. Managed only from main menu option 6.
 # =======================================================
 
 GECKO_WARP_DEFAULT_PORT="40000"
-GECKO_WARP_ROUTES_FILE="/etc/hysteria2/warp-routes.txt"
+GECKO_WARP_DIR="/etc/gecko-warp"
+GECKO_WARP_ENABLED_FILE="$GECKO_WARP_DIR/enabled"
+GECKO_WARP_PORT_FILE="$GECKO_WARP_DIR/proxy-port"
+GECKO_WARP_ROUTES_FILE="$GECKO_WARP_DIR/routes.txt"
 
-# Auto-detect which Gecko config/service is installed
-gecko_warp_detect_config_and_service() {
-  if [ -f "/etc/hysteria2/server.yaml" ]; then
-    GECKO_WARP_REAL_CONFIG="/etc/hysteria2/server.yaml"
-    GECKO_WARP_REAL_SERVICE="hysteria2-gecko.service"
-    GECKO_WARP_ROUTES_FILE="/etc/hysteria2/warp-routes.txt"
+gecko_warp_is_enabled() {
+  [[ -f "$GECKO_WARP_ENABLED_FILE" ]] &&
+    [[ -f "$GECKO_WARP_PORT_FILE" ]] &&
+    grep -Eq '^[0-9]{1,5}$' "$GECKO_WARP_PORT_FILE"
+}
+
+gecko_warp_proxy_port() {
+  if gecko_warp_is_enabled; then
+    tr -d '[:space:]' <"$GECKO_WARP_PORT_FILE"
   else
-    GECKO_WARP_REAL_CONFIG=""
-    GECKO_WARP_REAL_SERVICE=""
+    printf '%s\n' "$GECKO_WARP_DEFAULT_PORT"
   fi
 }
 
-gecko_warp_require_kharej_config() {
-  gecko_warp_detect_config_and_service
-  [ -n "$GECKO_WARP_REAL_CONFIG" ] && [ -f "$GECKO_WARP_REAL_CONFIG" ] || {
-    echo "No Gecko config found. Expected:"
-    echo "  /etc/hysteria2/server.yaml  (Install Hysteria2 Gecko first, menu option 3)"
-    return 1
-  }
-  echo "Using config : $GECKO_WARP_REAL_CONFIG"
-  echo "Using service: $GECKO_WARP_REAL_SERVICE"
+gecko_warp_prepare_storage() {
+  mkdir -p "$GECKO_WARP_DIR"
+  if [[ ! -f "$GECKO_WARP_ROUTES_FILE" && -f /etc/hysteria2/warp-routes.txt ]]; then
+    cp -a /etc/hysteria2/warp-routes.txt "$GECKO_WARP_ROUTES_FILE"
+  fi
 }
 
 gecko_warp_detect_proxy_port() {
@@ -4893,21 +4817,24 @@ install_cloudflare_warp_proxy_fscarmen_gecko() {
 }
 
 remove_gecko_warp_block_from_config() {
-  CFG="$1"
-  python3 - "$CFG" <<'INNERPY'
-import sys, re, pathlib
-p = pathlib.Path(sys.argv[1])
-text = p.read_text(encoding='utf-8', errors='ignore')
-text = re.sub(r'\n?# BEGIN GECKO WARP PROXY OUTBOUND\n.*?\n# END GECKO WARP PROXY OUTBOUND\n?', '\n', text, flags=re.S)
-text = re.sub(r'\n?# BEGIN GECKO WARP SNI SNIFF\n.*?\n# END GECKO WARP SNI SNIFF\n?', '\n', text, flags=re.S)
-p.write_text(text.rstrip() + '\n', encoding='utf-8')
-INNERPY
+  local cfg="$1" tmp
+  [[ -f "$cfg" ]] || return 0
+  tmp="$(mktemp /tmp/gecko-warp-yaml.XXXXXX)" || return 1
+  awk '
+    /^# BEGIN GECKO WARP (PROXY OUTBOUND|SNI SNIFF)$/ {skip=1; next}
+    /^# END GECKO WARP (PROXY OUTBOUND|SNI SNIFF)$/ {skip=0; next}
+    !skip {print}
+  ' "$cfg" >"$tmp" || { rm -f "$tmp"; return 1; }
+  sed -i '${/^$/d;}' "$tmp"
+  printf '\n' >>"$tmp"
+  install -m 0600 "$tmp" "$cfg"
+  rm -f "$tmp"
 }
 
 write_default_gecko_warp_routes() {
-  gecko_warp_detect_config_and_service
-  mkdir -p "$(dirname "$GECKO_WARP_ROUTES_FILE")"
-  cat > "$GECKO_WARP_ROUTES_FILE" <<'EOF'
+  gecko_warp_prepare_storage
+  [[ -f "$GECKO_WARP_ROUTES_FILE" ]] && return 0
+  cat >"$GECKO_WARP_ROUTES_FILE" <<'EOF'
 suffix:google.com
 suffix:gstatic.com
 suffix:googleapis.com
@@ -4926,6 +4853,94 @@ showip.net
 EOF
 }
 
+gecko_warp_domain_sets_json() {
+  write_default_gecko_warp_routes
+  jq -Rn '
+    def trim: gsub("^[[:space:]]+|[[:space:]]+$"; "");
+    [inputs
+      | split("#")[0] | trim | select(length > 0)
+      | if startswith("suffix:") then {kind:"suffix", value:(.[7:] | trim)}
+        elif startswith("*.") then {kind:"suffix", value:.[2:]}
+        elif startswith("full:") then {kind:"exact", value:(.[5:] | trim)}
+        elif startswith("domain:") then {kind:"suffix", value:(.[7:] | trim)}
+        else {kind:"exact", value:.}
+        end
+      | select(.value | test("^[A-Za-z0-9.-]+$"))
+    ]
+    | {
+        exact: ([.[] | select(.kind == "exact") | .value] | unique),
+        suffix: ([.[] | select(.kind == "suffix") | .value] | unique)
+      }
+  ' <"$GECKO_WARP_ROUTES_FILE"
+}
+
+# Apply or remove the central selective WARP policy from a sing-box JSON file.
+gecko_warp_apply_singbox_json() {
+  local config_file="$1" tmp port domains
+  [[ -s "$config_file" ]] || return 1
+  tmp="$(mktemp /tmp/gecko-warp-singbox.XXXXXX)" || return 1
+
+  if gecko_warp_is_enabled; then
+    port="$(gecko_warp_proxy_port)"
+    domains="$(gecko_warp_domain_sets_json)" || { rm -f "$tmp"; return 1; }
+    jq --argjson port "$port" --argjson domains "$domains" '
+      .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
+      | .outbounds += [{type:"socks", tag:"warp", server:"127.0.0.1", server_port:$port, version:"5"}]
+      | .route.rules = ((.route.rules // []) | map(select(.outbound != "warp")))
+      | if (($domains.exact | length) + ($domains.suffix | length)) > 0 then
+          .route.rules += [
+            ({action:"route", outbound:"warp"}
+             + if ($domains.exact | length) > 0 then {domain:$domains.exact} else {} end
+             + if ($domains.suffix | length) > 0 then {domain_suffix:$domains.suffix} else {} end)
+          ]
+        else . end
+    ' "$config_file" >"$tmp"
+  else
+    jq '
+      .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
+      | .route.rules = ((.route.rules // []) | map(select(.outbound != "warp")))
+    ' "$config_file" >"$tmp"
+  fi
+  local status=$?
+  if ((status == 0)); then
+    install -m 0600 "$tmp" "$config_file"
+  fi
+  rm -f "$tmp"
+  return "$status"
+}
+
+# Apply or remove the same policy from an Xray Reality JSON file.
+gecko_warp_apply_xray_json() {
+  local config_file="$1" tmp port domains
+  [[ -s "$config_file" ]] || return 1
+  tmp="$(mktemp /tmp/gecko-warp-xray.XXXXXX)" || return 1
+
+  if gecko_warp_is_enabled; then
+    port="$(gecko_warp_proxy_port)"
+    domains="$(gecko_warp_domain_sets_json)" || { rm -f "$tmp"; return 1; }
+    jq --argjson port "$port" --argjson domains "$domains" '
+      .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
+      | .outbounds += [{protocol:"socks", tag:"warp", settings:{address:"127.0.0.1", port:$port}}]
+      | .routing.rules = ((.routing.rules // []) | map(select(.outboundTag != "warp")))
+      | (($domains.exact | map("full:" + .)) + ($domains.suffix | map("domain:" + .))) as $xdomains
+      | if ($xdomains | length) > 0 then
+          .routing.rules += [{type:"field", domain:$xdomains, outboundTag:"warp"}]
+        else . end
+    ' "$config_file" >"$tmp"
+  else
+    jq '
+      .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
+      | .routing.rules = ((.routing.rules // []) | map(select(.outboundTag != "warp")))
+    ' "$config_file" >"$tmp"
+  fi
+  local status=$?
+  if ((status == 0)); then
+    install -m 0600 "$tmp" "$config_file"
+  fi
+  rm -f "$tmp"
+  return "$status"
+}
+
 build_gecko_warp_acl_rules() {
   [ -f "$GECKO_WARP_ROUTES_FILE" ] || write_default_gecko_warp_routes
   while IFS= read -r RULE; do
@@ -4941,17 +4956,127 @@ show_default_gecko_warp_routes() {
   cat "$GECKO_WARP_ROUTES_FILE"
 }
 
+gecko_warp_patch_hysteria() {
+  local config="${1:-/etc/hysteria2/server.yaml}" port
+  [[ -f "$config" ]] || return 0
+  remove_gecko_warp_block_from_config "$config" || return 1
+  gecko_warp_is_enabled || return 0
+
+  if grep -Eq '^[[:space:]]*(outbounds|acl|sniff):[[:space:]]*$' "$config"; then
+    echo "Hysteria2 already has a custom top-level outbounds/acl/sniff section; unified WARP cannot merge it safely."
+    return 1
+  fi
+  port="$(gecko_warp_proxy_port)"
+  {
+    echo "# BEGIN GECKO WARP SNI SNIFF"
+    echo "sniff:"
+    echo "  enable: true"
+    echo "  timeout: 2s"
+    echo "  rewriteDomain: true"
+    echo "  tcpPorts: 80,443"
+    echo "  udpPorts: 443"
+    echo "# END GECKO WARP SNI SNIFF"
+    echo
+    echo "# BEGIN GECKO WARP PROXY OUTBOUND"
+    echo "outbounds:"
+    echo "  - name: direct"
+    echo "    type: direct"
+    echo "  - name: warp"
+    echo "    type: socks5"
+    echo "    socks5:"
+    echo "      addr: 127.0.0.1:$port"
+    echo "acl:"
+    echo "  inline:"
+    build_gecko_warp_acl_rules
+    echo "# END GECKO WARP PROXY OUTBOUND"
+  } >>"$config"
+}
+
+gecko_warp_refresh_reality() {
+  local stage_dir
+  reality_have_instances || return 0
+  stage_dir="$(reality_stage_instances)" || return 1
+  if ! reality_commit_stage "$stage_dir"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  rm -rf "$stage_dir"
+}
+
+gecko_warp_refresh_xhttp() {
+  local candidate check_log
+  [[ -f "$XHTTP_DIR/config.json" ]] || return 0
+  [[ -x "/usr/bin/$XHTTP_SERVICE" ]] || { echo "XHTTP core is missing."; return 1; }
+  candidate="$(mktemp /tmp/xhttp-warp.XXXXXX)" || return 1
+  cp -a "$XHTTP_DIR/config.json" "$candidate" || { rm -f "$candidate"; return 1; }
+  gecko_warp_apply_singbox_json "$candidate" || { rm -f "$candidate"; return 1; }
+  check_log="$(mktemp /tmp/xhttp-warp-check.XXXXXX)" || { rm -f "$candidate"; return 1; }
+  if ! "/usr/bin/$XHTTP_SERVICE" check -c "$candidate" >"$check_log" 2>&1; then
+    echo "XHTTP rejected the unified WARP configuration:"
+    sed $'s/\033\[[0-9;]*m//g' "$check_log"
+    rm -f "$candidate" "$check_log"
+    return 1
+  fi
+  rm -f "$check_log"
+  if ! xhttp_commit_user_config "$candidate"; then
+    rm -f "$candidate"
+    return 1
+  fi
+  rm -f "$candidate"
+}
+
+gecko_warp_refresh_all() {
+  local failed="false"
+  if [[ -f /etc/hysteria2/server.yaml ]]; then
+    echo "Applying to Hysteria2..."
+    if ! gecko_warp_patch_hysteria || ! systemctl restart hysteria2-gecko.service; then
+      echo "Hysteria2 update failed."
+      failed="true"
+    fi
+  fi
+  if reality_have_instances; then
+    echo "Applying to Reality ($(reality_detect_core 2>/dev/null || echo unknown))..."
+    gecko_warp_refresh_reality || { echo "Reality update failed."; failed="true"; }
+  fi
+  if [[ -f "$XHTTP_DIR/config.json" ]]; then
+    echo "Applying to XHTTP..."
+    gecko_warp_refresh_xhttp || { echo "XHTTP update failed."; failed="true"; }
+  fi
+  [[ "$failed" == "false" ]]
+}
+
+gecko_warp_backup_all() {
+  local backup_dir="$1"
+  mkdir -p "$backup_dir"
+  [[ -d "$GECKO_WARP_DIR" ]] && cp -a "$GECKO_WARP_DIR" "$backup_dir/gecko-warp"
+  [[ -f /etc/hysteria2/server.yaml ]] && cp -a /etc/hysteria2/server.yaml "$backup_dir/hysteria.yaml"
+  [[ -f "$REALITY_DIR/config.json" ]] && cp -a "$REALITY_DIR/config.json" "$backup_dir/reality.json"
+  [[ -f "$XHTTP_DIR/config.json" ]] && cp -a "$XHTTP_DIR/config.json" "$backup_dir/xhttp.json"
+  return 0
+}
+
+gecko_warp_restore_all() {
+  local backup_dir="$1"
+  rm -rf "$GECKO_WARP_DIR"
+  [[ -d "$backup_dir/gecko-warp" ]] && cp -a "$backup_dir/gecko-warp" "$GECKO_WARP_DIR"
+  [[ -f "$backup_dir/hysteria.yaml" ]] && cp -a "$backup_dir/hysteria.yaml" /etc/hysteria2/server.yaml
+  [[ -f "$backup_dir/reality.json" ]] && cp -a "$backup_dir/reality.json" "$REALITY_DIR/config.json"
+  [[ -f "$backup_dir/xhttp.json" ]] && cp -a "$backup_dir/xhttp.json" "$XHTTP_DIR/config.json"
+  systemctl restart hysteria2-gecko.service >/dev/null 2>&1 || true
+  systemctl restart "$REALITY_SERVICE" >/dev/null 2>&1 || true
+  systemctl restart "$XHTTP_SERVICE" >/dev/null 2>&1 || true
+}
+
 enable_gecko_real_outbound_via_warp() {
+  local detected_port proxy_port backup_dir
   clear
   echo "======================================================="
-  echo " Enable SELECTIVE Real Gecko Outbound via WARP Proxy"
+  echo " Enable unified SELECTIVE outbound via WARP Proxy"
   echo "======================================================="
-  echo "Only selected domains/rules will use WARP. SNI/Host sniffing will be enabled for domain matching."
-  echo "Everything else will use DIRECT outbound."
+  echo "The same routes will be applied to installed Hysteria2, Reality and XHTTP services."
+  echo "Everything not listed will continue through DIRECT."
   echo "======================================================="
   [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
-  gecko_warp_require_kharej_config || return 1
-
   write_default_gecko_warp_routes
   # Upgrade route files created by older versions.
   sed -i '/^keyword:showip$/d;/^geosite:youtube$/d' "$GECKO_WARP_ROUTES_FILE" 2>/dev/null || true
@@ -4967,13 +5092,13 @@ enable_gecko_real_outbound_via_warp() {
   echo "These routes will be converted to warp(rule), then direct(all)."
   echo
 
-  DETECTED_PORT="$(gecko_warp_detect_proxy_port)"
-  read -rp "Local WARP SOCKS5 proxy port [$DETECTED_PORT]: " WARP_PROXY_PORT
-  WARP_PROXY_PORT="${WARP_PROXY_PORT:-$DETECTED_PORT}"
-  if ! [[ "$WARP_PROXY_PORT" =~ ^[0-9]+$ ]] || [ "$WARP_PROXY_PORT" -lt 1 ] || [ "$WARP_PROXY_PORT" -gt 65535 ]; then
+  detected_port="$(gecko_warp_detect_proxy_port)"
+  read -rp "Local WARP SOCKS5 proxy port [$detected_port]: " proxy_port
+  proxy_port="${proxy_port:-$detected_port}"
+  if ! [[ "$proxy_port" =~ ^[0-9]+$ ]] || ((proxy_port < 1 || proxy_port > 65535)); then
     echo "Invalid proxy port."; return 1
   fi
-  WARP_PROXY_ADDR="127.0.0.1:$WARP_PROXY_PORT"
+  WARP_PROXY_ADDR="127.0.0.1:$proxy_port"
 
   echo
   echo "Testing SOCKS5 proxy at $WARP_PROXY_ADDR ..."
@@ -4985,76 +5110,48 @@ enable_gecko_real_outbound_via_warp() {
       grep -E '^(ip|colo|warp)=' /tmp/gecko-warp-trace.txt || true
     else
       echo "WARNING: SOCKS5 proxy test failed."
-      echo "You can still enable it, but selected Hysteria outbound may fail until WARP Proxy is working."
+      echo "You can still enable it, but selected service traffic may fail until WARP Proxy is working."
       [ -s /tmp/gecko-warp-curl.err ] && cat /tmp/gecko-warp-curl.err
       read -rp "Continue anyway? [y/N]: " CONT_WARP
       case "$CONT_WARP" in y|Y|yes|YES|Yes) ;; *) echo "Cancelled."; return 1 ;; esac
     fi
   fi
 
-  TS="$(date +%Y%m%d-%H%M%S)"
-  cp -a "$GECKO_WARP_REAL_CONFIG" "$GECKO_WARP_REAL_CONFIG.bak-before-selective-warp-$TS"
-  remove_gecko_warp_block_from_config "$GECKO_WARP_REAL_CONFIG"
-
-  if grep -Eq '^[[:space:]]*(outbounds|acl|sniff):[[:space:]]*$' "$GECKO_WARP_REAL_CONFIG"; then
-    echo
-    echo "WARNING: Existing top-level outbounds/acl/sniff detected in real Gecko config."
-    echo "To avoid duplicate YAML keys, this automatic patch will not continue."
-    echo "Backup saved: $GECKO_WARP_REAL_CONFIG.bak-before-selective-warp-$TS"
+  backup_dir="$(mktemp -d /tmp/gecko-warp-backup.XXXXXX)" || return 1
+  gecko_warp_backup_all "$backup_dir" || { rm -rf "$backup_dir"; return 1; }
+  gecko_warp_prepare_storage
+  printf '%s\n' "$proxy_port" >"$GECKO_WARP_PORT_FILE"
+  touch "$GECKO_WARP_ENABLED_FILE"
+  rm -f "$REALITY_DIR/warp-enabled"
+  if ! gecko_warp_refresh_all; then
+    echo "Unified WARP update failed; restoring every previous configuration."
+    gecko_warp_restore_all "$backup_dir"
+    rm -rf "$backup_dir"
     return 1
   fi
-
-  {
-    echo
-    echo "# BEGIN GECKO WARP SNI SNIFF"
-    echo "sniff:"
-    echo "  enable: true"
-    echo "  timeout: 2s"
-    echo "  rewriteDomain: true"
-    echo "  tcpPorts: 80,443"
-    echo "  udpPorts: 443"
-    echo "# END GECKO WARP SNI SNIFF"
-    echo
-    echo "# BEGIN GECKO WARP PROXY OUTBOUND"
-    echo "outbounds:"
-    echo "  - name: direct"
-    echo "    type: direct"
-    echo
-    echo "  - name: warp"
-    echo "    type: socks5"
-    echo "    socks5:"
-    echo "      addr: $WARP_PROXY_ADDR"
-    echo
-    echo "acl:"
-    echo "  inline:"
-    build_gecko_warp_acl_rules
-    echo "# END GECKO WARP PROXY OUTBOUND"
-  } >> "$GECKO_WARP_REAL_CONFIG"
-
-  systemctl restart "$GECKO_WARP_REAL_SERVICE"
-  sleep 1
-  echo
-  systemctl status "$GECKO_WARP_REAL_SERVICE" --no-pager || true
-  echo
-  echo "Selective WARP outbound enabled for Real Gecko server."
-  echo "Only rules in $GECKO_WARP_ROUTES_FILE use WARP; everything else is direct. Sniffing is enabled for TUN/IP-only clients."
-  echo "Backup: $GECKO_WARP_REAL_CONFIG.bak-before-selective-warp-$TS"
+  rm -rf "$backup_dir"
+  echo "Unified selective WARP enabled successfully."
+  echo "Routes: $GECKO_WARP_ROUTES_FILE"
 }
 
 disable_gecko_real_outbound_via_warp() {
+  local backup_dir
   clear
   echo "======================================================="
-  echo " Disable Real Gecko Outbound via WARP Proxy"
+  echo " Disable unified WARP outbound"
   echo "======================================================="
   [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
-  gecko_warp_require_kharej_config || return 1
-  TS="$(date +%Y%m%d-%H%M%S)"
-  cp -a "$GECKO_WARP_REAL_CONFIG" "$GECKO_WARP_REAL_CONFIG.bak-disable-warp-$TS"
-  remove_gecko_warp_block_from_config "$GECKO_WARP_REAL_CONFIG"
-  systemctl restart "$GECKO_WARP_REAL_SERVICE" >/dev/null 2>&1 || true
-  echo "WARP outbound block removed from Real Gecko config."
-  echo "Backup: $GECKO_WARP_REAL_CONFIG.bak-disable-warp-$TS"
-  systemctl status "$GECKO_WARP_REAL_SERVICE" --no-pager || true
+  backup_dir="$(mktemp -d /tmp/gecko-warp-backup.XXXXXX)" || return 1
+  gecko_warp_backup_all "$backup_dir" || { rm -rf "$backup_dir"; return 1; }
+  rm -f "$GECKO_WARP_ENABLED_FILE" "$REALITY_DIR/warp-enabled"
+  if ! gecko_warp_refresh_all; then
+    echo "Could not disable WARP cleanly; restoring every previous configuration."
+    gecko_warp_restore_all "$backup_dir"
+    rm -rf "$backup_dir"
+    return 1
+  fi
+  rm -rf "$backup_dir"
+  echo "Unified WARP disabled. The route list and local WARP installation were kept."
 }
 
 show_gecko_warp_status() {
@@ -5062,20 +5159,24 @@ show_gecko_warp_status() {
   echo "======================================================="
   echo " GECKO WARP Proxy Status"
   echo "======================================================="
-  gecko_warp_detect_config_and_service
-  echo
-  echo "[Real Gecko config]"
-  if [ -f "$GECKO_WARP_REAL_CONFIG" ]; then
-    if grep -q "BEGIN GECKO WARP PROXY OUTBOUND" "$GECKO_WARP_REAL_CONFIG"; then
-      echo "WARP outbound block: ENABLED"
-      sed -n '/BEGIN GECKO WARP SNI SNIFF/,/END GECKO WARP SNI SNIFF/p' "$GECKO_WARP_REAL_CONFIG"
-      sed -n '/BEGIN GECKO WARP PROXY OUTBOUND/,/END GECKO WARP PROXY OUTBOUND/p' "$GECKO_WARP_REAL_CONFIG"
-    else
-      echo "WARP outbound block: DISABLED"
-    fi
+  if gecko_warp_is_enabled; then
+    echo "Unified state: ENABLED (SOCKS5 127.0.0.1:$(gecko_warp_proxy_port))"
   else
-    echo "Config not found: $GECKO_WARP_REAL_CONFIG"
+    echo "Unified state: DISABLED"
   fi
+  echo
+  printf 'Hysteria2: '
+  if [[ -f /etc/hysteria2/server.yaml ]]; then
+    grep -q 'BEGIN GECKO WARP PROXY OUTBOUND' /etc/hysteria2/server.yaml && echo 'installed - warp: enabled' || echo 'installed - warp: disabled'
+  else echo 'not installed'; fi
+  printf 'Reality:   '
+  if [[ -f "$REALITY_DIR/config.json" ]]; then
+    jq -e 'any(.outbounds[]?; (.tag // "") == "warp")' "$REALITY_DIR/config.json" >/dev/null && echo 'installed - warp: enabled' || echo 'installed - warp: disabled'
+  else echo 'not installed'; fi
+  printf 'XHTTP:     '
+  if [[ -f "$XHTTP_DIR/config.json" ]]; then
+    jq -e 'any(.outbounds[]?; (.tag // "") == "warp")' "$XHTTP_DIR/config.json" >/dev/null && echo 'installed - warp: enabled' || echo 'installed - warp: disabled'
+  else echo 'not installed'; fi
   echo
   echo "[Selective WARP routes]"
   if [ -f "$GECKO_WARP_ROUTES_FILE" ]; then
@@ -5090,8 +5191,6 @@ show_gecko_warp_status() {
   echo "[Cloudflare/WARP related services]"
   systemctl --no-pager --type=service --state=running 2>/dev/null | grep -Ei 'warp|cloudflare|wgcf' || true
   echo
-  echo "[Real Gecko service]"
-  systemctl status "$GECKO_WARP_REAL_SERVICE" --no-pager 2>/dev/null || echo "$GECKO_WARP_REAL_SERVICE not installed."
 }
 
 test_gecko_warp_proxy() {
@@ -5133,12 +5232,17 @@ test_gecko_warp_proxy() {
 }
 
 edit_gecko_warp_routes() {
+  local backup_dir
   clear
   echo "======================================================="
   echo " Edit SELECTIVE WARP route list"
   echo "======================================================="
   [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
   write_default_gecko_warp_routes
+  if gecko_warp_is_enabled; then
+    backup_dir="$(mktemp -d /tmp/gecko-warp-backup.XXXXXX)" || return 1
+    gecko_warp_backup_all "$backup_dir" || { rm -rf "$backup_dir"; return 1; }
+  fi
   echo "Routes file: $GECKO_WARP_ROUTES_FILE"
   echo
   echo "Current routes:"
@@ -5152,26 +5256,37 @@ edit_gecko_warp_routes() {
     y|Y|yes|YES|Yes)
       "${EDITOR:-nano}" "$GECKO_WARP_ROUTES_FILE"
       ;;
-    *) return 0 ;;
+    *) [[ -n "$backup_dir" ]] && rm -rf "$backup_dir"; return 0 ;;
   esac
   echo
-  echo "To apply changes, run: Enable SELECTIVE Real Gecko outbound via local WARP SOCKS5"
+  if gecko_warp_is_enabled; then
+    echo "Reapplying the shared route list to all installed services..."
+    if ! gecko_warp_refresh_all; then
+      echo "One or more services rejected the updated route list; restoring all previous configurations."
+      gecko_warp_restore_all "$backup_dir"
+      rm -rf "$backup_dir"
+      return 1
+    fi
+    rm -rf "$backup_dir"
+  else
+    echo "The list will be applied to all installed services when unified WARP is enabled."
+  fi
 }
 
 gecko_warp_proxy_menu() {
   while true; do
     clear
     echo "======================================================="
-    echo " GECKO WARP Proxy Outbound Menu"
+    echo " Unified GECKO WARP Proxy Outbound Menu"
     echo "======================================================="
     echo "Purpose: Client -> Gecko Server -> WARP Proxy -> Internet"
-    echo "Auto-detects your installed Hysteria2 Gecko config and service."
+    echo "One route list: Hysteria2 + Reality (Xray/sing-box) + XHTTP."
     echo
     echo " 1) Install Cloudflare WARP Proxy using fscarmen script"
-    echo " 2) Enable SELECTIVE Real Gecko outbound via local WARP SOCKS5"
+    echo " 2) Enable unified SELECTIVE WARP for all installed services"
     echo " 3) Edit selective WARP route list"
-    echo " 4) Disable Real Gecko outbound via WARP"
-    echo " 5) Show WARP/Gecko status"
+    echo " 4) Disable unified WARP for all installed services"
+    echo " 5) Show unified WARP/service status"
     echo " 6) Test local WARP SOCKS5 proxy"
     echo " 0) Back"
     echo "======================================================="
