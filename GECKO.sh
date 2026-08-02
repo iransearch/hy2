@@ -3085,6 +3085,10 @@ csf_set_conf_value_c() {
   fi
 }
 
+# Cloudflare One Client/WARP egress ports. This covers MASQUE plus WireGuard
+# default and fallback UDP transports so WARP can change endpoints safely.
+CSF_CLOUDFLARE_WARP_UDP_OUT_PORTS=(443 500 1701 2408 4443 4500 8095 8443)
+
 csf_apply_install_port_defaults_c() {
   local port
 
@@ -3101,11 +3105,12 @@ csf_apply_install_port_defaults_c() {
     csf_ok_c "Removed 22 from TCP_OUT."
   fi
 
-  for port in 443 500 1701 4500 4443 8443 8095; do
+  for port in "${CSF_CLOUDFLARE_WARP_UDP_OUT_PORTS[@]}"; do
     if ! csf_port_exists_in_conf "UDP_OUT" "$port"; then
       csf_add_port_to_conf "UDP_OUT" "$port"
     fi
   done
+  csf_ok_c "Cloudflare WARP UDP_OUT ports allowed: ${CSF_CLOUDFLARE_WARP_UDP_OUT_PORTS[*]}"
 
   if ! csf_port_exists_in_conf "TCP_OUT" "40000"; then
     csf_add_port_to_conf "TCP_OUT" "40000"
