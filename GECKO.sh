@@ -19,6 +19,185 @@ REALITY_SERVICE="RS"
 REALITY_CORE_FILE="$REALITY_DIR/core"
 XHTTP_DIR="/etc/xhttp"
 XHTTP_SERVICE="XH"
+GECKO_LOG_CLEANUP_JOB="/etc/cron.daily/cleanup-var-log"
+
+# Hysteria's native core uses HYSTERIA_LOG_LEVEL, while the Hysteria inbound
+# installed from the upstream TUI runs on sing-box and uses config.json.
+# Keep both paths quiet and rate-limit their systemd journal output.
+gecko_patch_hysteria_singbox_log_error() {
+  local config_file="/etc/hysteria2/server.json" candidate backup was_active="false"
+  [[ -s "$config_file" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -e 'type == "object"' "$config_file" >/dev/null 2>&1 || return 0
+
+  candidate="$(mktemp /tmp/gecko-hysteria-log.XXXXXX)" || return 1
+  if ! jq '.log = ((.log // {}) + {disabled: false, level: "error", timestamp: true})' \
+    "$config_file" >"$candidate"; then
+    rm -f "$candidate"
+    return 1
+  fi
+  if cmp -s "$candidate" "$config_file"; then
+    rm -f "$candidate"
+    return 0
+  fi
+  if [[ -x /usr/bin/SH ]] &&
+    ! /usr/bin/SH check -c "$candidate" >/dev/null 2>&1; then
+    rm -f "$candidate"
+    return 1
+  fi
+
+  backup="$(mktemp /tmp/gecko-hysteria-log-backup.XXXXXX)" || {
+    rm -f "$candidate"
+    return 1
+  }
+  cp -a "$config_file" "$backup" || {
+    rm -f "$candidate" "$backup"
+    return 1
+  }
+  systemctl is-active --quiet SH.service && was_active="true"
+  if ! install -m 0600 "$candidate" "$config_file"; then
+    rm -f "$candidate" "$backup"
+    return 1
+  fi
+  if [[ "$was_active" == "true" ]] && ! systemctl restart SH.service; then
+    cp -a "$backup" "$config_file"
+    systemctl restart SH.service >/dev/null 2>&1 || true
+    rm -f "$candidate" "$backup"
+    return 1
+  fi
+  rm -f "$candidate" "$backup"
+}
+
+GECKO_HYSTERIA_CHANGED_UNITS=()
+
+gecko_install_hysteria_logging_dropin() {
+  local unit="$1" native_core="$2" unit_file dropin_dir dropin_file candidate
+  unit_file="/etc/systemd/system/$unit"
+  [[ -f "$unit_file" ]] || return 0
+  dropin_dir="/etc/systemd/system/${unit}.d"
+  dropin_file="$dropin_dir/10-gecko-logging.conf"
+  candidate="$(mktemp /tmp/gecko-hysteria-unit.XXXXXX)" || return 1
+
+  {
+    echo '[Service]'
+    [[ "$native_core" == "true" ]] && echo 'Environment=HYSTERIA_LOG_LEVEL=error'
+    echo 'LogRateLimitIntervalSec=30s'
+    echo 'LogRateLimitBurst=100'
+  } >"$candidate"
+
+  if [[ -f "$dropin_file" ]] && cmp -s "$candidate" "$dropin_file"; then
+    rm -f "$candidate"
+    return 0
+  fi
+  install -d -m 0755 "$dropin_dir" || { rm -f "$candidate"; return 1; }
+  install -m 0644 "$candidate" "$dropin_file" || { rm -f "$candidate"; return 1; }
+  rm -f "$candidate"
+  GECKO_HYSTERIA_CHANGED_UNITS+=("$unit")
+}
+
+gecko_configure_hysteria_service_logging() {
+  local unit active_unit
+  GECKO_HYSTERIA_CHANGED_UNITS=()
+  gecko_install_hysteria_logging_dropin "SH.service" "false" || return 1
+  gecko_install_hysteria_logging_dropin "hysteria2-gecko.service" "true" || return 1
+  gecko_install_hysteria_logging_dropin "hysteria2-gtunnel@.service" "true" || return 1
+  ((${#GECKO_HYSTERIA_CHANGED_UNITS[@]} > 0)) || return 0
+
+  systemctl daemon-reload || return 1
+  for unit in "${GECKO_HYSTERIA_CHANGED_UNITS[@]}"; do
+    if [[ "$unit" == "hysteria2-gtunnel@.service" ]]; then
+      while read -r active_unit; do
+        [[ -n "$active_unit" ]] && systemctl try-restart "$active_unit" >/dev/null 2>&1 || true
+      done < <(
+        systemctl list-units --type=service --state=active --no-legend --plain \
+          'hysteria2-gtunnel@*.service' 2>/dev/null | awk '{print $1}'
+      )
+    else
+      systemctl try-restart "$unit" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+install_gecko_log_cleanup_job() {
+  local candidate changed="false"
+  candidate="$(mktemp /tmp/gecko-log-cleanup.XXXXXX)" || return 1
+  cat >"$candidate" <<'EOF_GECKO_LOG_CLEANUP'
+#!/bin/bash
+
+# Empty syslog only if it grows beyond 500 MiB.
+if [[ -f /var/log/syslog ]]; then
+  size="$(stat -c%s /var/log/syslog 2>/dev/null || echo 0)"
+  if [[ "$size" =~ ^[0-9]+$ ]] && ((size > 524288000)); then
+    truncate -s 0 /var/log/syslog
+  fi
+fi
+
+# Keep the persistent systemd journal within both limits.
+if command -v journalctl >/dev/null 2>&1; then
+  journalctl --rotate >/dev/null 2>&1 || true
+  journalctl --vacuum-size=300M >/dev/null 2>&1 || true
+  journalctl --vacuum-time=1d >/dev/null 2>&1 || true
+fi
+
+# Remove rotated archives without crossing into another mounted filesystem.
+find /var/log -xdev -type f \( \
+  -name '*.gz' -o \
+  -name '*.1' -o \
+  -name '*.2' -o \
+  -name '*.old' \
+\) -delete
+EOF_GECKO_LOG_CLEANUP
+
+  if [[ ! -f "$GECKO_LOG_CLEANUP_JOB" ]] ||
+    ! cmp -s "$candidate" "$GECKO_LOG_CLEANUP_JOB"; then
+    changed="true"
+    install -m 0755 "$candidate" "$GECKO_LOG_CLEANUP_JOB" || {
+      rm -f "$candidate"
+      return 1
+    }
+  fi
+  rm -f "$candidate"
+  [[ "$changed" == "true" ]] && "$GECKO_LOG_CLEANUP_JOB"
+  return 0
+}
+
+gecko_apply_log_protection() {
+  install_gecko_log_cleanup_job || return 1
+  gecko_patch_hysteria_singbox_log_error || return 1
+  gecko_configure_hysteria_service_logging || return 1
+}
+
+# Preserve the upstream TUI functions loaded at the top of this script, then
+# apply the GECKO logging policy after each Hysteria install or edit.
+if declare -F install_hysteria >/dev/null 2>&1; then
+  eval "$(declare -f install_hysteria | sed '1s/^install_hysteria[[:space:]]*()/gecko_upstream_install_hysteria()/')"
+  install_hysteria() {
+    local status
+    gecko_upstream_install_hysteria "$@"
+    status=$?
+    ((status == 0)) || return "$status"
+    if ! gecko_patch_hysteria_singbox_log_error ||
+      ! gecko_configure_hysteria_service_logging; then
+      tui_error "Hysteria was installed, but its error-only logging policy could not be applied."
+      return 1
+    fi
+  }
+fi
+
+if declare -F modify_hysteria_config >/dev/null 2>&1; then
+  eval "$(declare -f modify_hysteria_config | sed '1s/^modify_hysteria_config[[:space:]]*()/gecko_upstream_modify_hysteria_config()/')"
+  modify_hysteria_config() {
+    local status
+    gecko_upstream_modify_hysteria_config "$@"
+    status=$?
+    ((status == 0)) || return "$status"
+    if ! gecko_patch_hysteria_singbox_log_error ||
+      ! gecko_configure_hysteria_service_logging; then
+      tui_error "Hysteria was updated, but its error-only logging policy could not be applied."
+      return 1
+    fi
+  }
+fi
 
 tui_error() {
   local message="$1"
@@ -739,7 +918,7 @@ reality_build_singbox_config() {
     map(select(type == "object")) as $instances
     | {
         log: {
-          level: "info",
+          level: "warn",
           timestamp: true
         },
         inbounds: [
@@ -930,6 +1109,8 @@ ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=infinity
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
 
 [Install]
 WantedBy=multi-user.target
@@ -956,6 +1137,112 @@ reality_check_config() {
     sing-box) "/usr/bin/$REALITY_SERVICE" check -c "$config_file" ;;
     *) return 1 ;;
   esac
+}
+
+# Keep routine Reality connection events out of journald/syslog. Existing
+# installations are migrated once the Reality manager is opened, while
+# warnings and errors remain available for troubleshooting. The systemd rate
+# limit is a second guard against log floods caused by scans or repeated
+# failures.
+reality_enforce_safe_logging() {
+  local core config_file service_file candidate backup_dir
+  local config_changed="false" service_changed="false" was_active="false"
+  local had_service="false"
+
+  config_file="$REALITY_DIR/config.json"
+  service_file="/etc/systemd/system/${REALITY_SERVICE}.service"
+  [[ -s "$config_file" ]] || return 0
+  core="$(reality_detect_core 2>/dev/null)" || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  candidate="$(mktemp /tmp/reality-logging.XXXXXX)" || return 1
+  case "$core" in
+    sing-box)
+      jq '.log = ((.log // {}) + {level: "warn", timestamp: true})' \
+        "$config_file" >"$candidate" || { rm -f "$candidate"; return 1; }
+      ;;
+    xray)
+      jq '.log = ((.log // {}) + {loglevel: "warning"})' \
+        "$config_file" >"$candidate" || { rm -f "$candidate"; return 1; }
+      ;;
+    *)
+      rm -f "$candidate"
+      return 0
+      ;;
+  esac
+
+  if ! cmp -s "$candidate" "$config_file"; then
+    config_changed="true"
+    if ! reality_check_config "$candidate" >/dev/null 2>&1; then
+      rm -f "$candidate"
+      return 1
+    fi
+  fi
+  if [[ ! -f "$service_file" ]] ||
+    ! grep -Fxq 'LogRateLimitIntervalSec=30s' "$service_file" ||
+    ! grep -Fxq 'LogRateLimitBurst=100' "$service_file"; then
+    service_changed="true"
+  fi
+  if [[ "$config_changed" != "true" && "$service_changed" != "true" ]]; then
+    rm -f "$candidate"
+    return 0
+  fi
+
+  backup_dir="$(mktemp -d /tmp/reality-logging-backup.XXXXXX)" || {
+    rm -f "$candidate"
+    return 1
+  }
+  cp -a "$config_file" "$backup_dir/config.json" || {
+    rm -f "$candidate"
+    rm -rf "$backup_dir"
+    return 1
+  }
+  if [[ -f "$service_file" ]]; then
+    had_service="true"
+    if ! cp -a "$service_file" "$backup_dir/service"; then
+      rm -f "$candidate"
+      rm -rf "$backup_dir"
+      return 1
+    fi
+  fi
+  systemctl is-active --quiet "$REALITY_SERVICE" && was_active="true"
+
+  if [[ "$config_changed" == "true" ]] &&
+    ! install -m 0600 "$candidate" "$config_file"; then
+    rm -f "$candidate"
+    rm -rf "$backup_dir"
+    return 1
+  fi
+  if [[ "$service_changed" == "true" ]] &&
+    (! reality_write_service || ! systemctl daemon-reload); then
+    cp -a "$backup_dir/config.json" "$config_file"
+    if [[ "$had_service" == "true" ]]; then
+      cp -a "$backup_dir/service" "$service_file"
+    else
+      rm -f "$service_file"
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    rm -f "$candidate"
+    rm -rf "$backup_dir"
+    return 1
+  fi
+  if [[ "$was_active" == "true" ]] &&
+    ! systemctl restart "$REALITY_SERVICE"; then
+    cp -a "$backup_dir/config.json" "$config_file"
+    if [[ "$had_service" == "true" ]]; then
+      cp -a "$backup_dir/service" "$service_file"
+    else
+      rm -f "$service_file"
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl restart "$REALITY_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$candidate"
+    rm -rf "$backup_dir"
+    return 1
+  fi
+
+  rm -f "$candidate"
+  rm -rf "$backup_dir"
 }
 
 # Validate the entire combined config before replacing the live files.  If the
@@ -1517,6 +1804,9 @@ modify_reality_config() {
 reality_manager_menu() {
   local choice current_core
   reality_prepare_manager
+  if ! reality_enforce_safe_logging; then
+    tui_error "Could not safely reduce Reality logging. The existing RS configuration was preserved."
+  fi
   while true; do
     current_core="$(reality_detect_core 2>/dev/null)" || current_core="not selected"
     choice=$(whiptail --clear --title "Reality Multi-Config Manager" \
@@ -2880,10 +3170,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=HYSTERIA_LOG_LEVEL=error
 ExecStart=$HYSTERIA_BIN server -c $HYSTERIA_CONFIG
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
 
 [Install]
 WantedBy=multi-user.target
@@ -4170,10 +4463,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=HYSTERIA_LOG_LEVEL=error
 ExecStart=/bin/bash /etc/hysteria2-gtunnels/%i/run.sh
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
 
 [Install]
 WantedBy=multi-user.target
@@ -6276,6 +6572,10 @@ xboard_socks_routing_menu() {
     esac
   done
 }
+
+if ! gecko_apply_log_protection; then
+  echo "WARNING: GECKO could not fully apply log cleanup and error-only Hysteria logging." >&2
+fi
 
 while true; do
   echo "
