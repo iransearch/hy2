@@ -165,6 +165,7 @@ gecko_apply_log_protection() {
   install_gecko_log_cleanup_job || return 1
   gecko_patch_hysteria_singbox_log_error || return 1
   gecko_configure_hysteria_service_logging || return 1
+  xhttp_disable_logging || return 1
 }
 
 # Preserve the upstream TUI functions loaded at the top of this script, then
@@ -2157,8 +2158,9 @@ xhttp_build_server_config() {
     --argjson users "$users_json" \
     '{
       "log": {
-        "level": "info",
-        "timestamp": true
+        "disabled": true,
+        "level": "error",
+        "timestamp": false
       },
       "inbounds": [
         {
@@ -2295,6 +2297,8 @@ Wants=network-online.target
 Type=simple
 User=root
 ExecStart=/usr/bin/XH run -c /etc/xhttp/config.json
+StandardOutput=null
+StandardError=null
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=infinity
@@ -2302,6 +2306,98 @@ LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
 EOF_XHTTP_SERVICE
+}
+
+# Disable XHTTP logging for existing installations as well as new configs.
+# Both the sing-box logger and the service stdout/stderr are silenced. Any
+# failed migration restores the previous config and unit before returning.
+xhttp_disable_logging() {
+  local config_file="$XHTTP_DIR/config.json"
+  local service_file="/etc/systemd/system/${XHTTP_SERVICE}.service"
+  local candidate backup_dir config_changed="false" service_changed="false"
+  local was_active="false" had_service="false"
+
+  [[ -s "$config_file" ]] || return 0
+  [[ -x "/usr/bin/$XHTTP_SERVICE" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 1
+
+  candidate="$(mktemp /tmp/xhttp-no-log.XXXXXX)" || return 1
+  if ! jq '.log = ((.log // {}) + {disabled: true, level: "error", timestamp: false})' \
+    "$config_file" >"$candidate"; then
+    rm -f "$candidate"
+    return 1
+  fi
+  if ! cmp -s "$candidate" "$config_file"; then
+    config_changed="true"
+    if ! "/usr/bin/$XHTTP_SERVICE" check -c "$candidate" >/dev/null 2>&1; then
+      rm -f "$candidate"
+      return 1
+    fi
+  fi
+  if [[ ! -f "$service_file" ]] ||
+    ! grep -Fxq 'StandardOutput=null' "$service_file" ||
+    ! grep -Fxq 'StandardError=null' "$service_file"; then
+    service_changed="true"
+  fi
+  if [[ "$config_changed" != "true" && "$service_changed" != "true" ]]; then
+    rm -f "$candidate"
+    return 0
+  fi
+
+  backup_dir="$(mktemp -d /tmp/xhttp-no-log-backup.XXXXXX)" || {
+    rm -f "$candidate"
+    return 1
+  }
+  cp -a "$config_file" "$backup_dir/config.json" || {
+    rm -f "$candidate"
+    rm -rf "$backup_dir"
+    return 1
+  }
+  if [[ -f "$service_file" ]]; then
+    had_service="true"
+    if ! cp -a "$service_file" "$backup_dir/service"; then
+      rm -f "$candidate"
+      rm -rf "$backup_dir"
+      return 1
+    fi
+  fi
+  systemctl is-active --quiet "$XHTTP_SERVICE" && was_active="true"
+
+  if [[ "$config_changed" == "true" ]] &&
+    ! install -m 0644 "$candidate" "$config_file"; then
+    rm -f "$candidate"
+    rm -rf "$backup_dir"
+    return 1
+  fi
+  if [[ "$service_changed" == "true" ]] &&
+    (! xhttp_write_service || ! systemctl daemon-reload); then
+    cp -a "$backup_dir/config.json" "$config_file"
+    if [[ "$had_service" == "true" ]]; then
+      cp -a "$backup_dir/service" "$service_file"
+    else
+      rm -f "$service_file"
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    rm -f "$candidate"
+    rm -rf "$backup_dir"
+    return 1
+  fi
+  if [[ "$was_active" == "true" ]] && ! systemctl restart "$XHTTP_SERVICE"; then
+    cp -a "$backup_dir/config.json" "$config_file"
+    if [[ "$had_service" == "true" ]]; then
+      cp -a "$backup_dir/service" "$service_file"
+    else
+      rm -f "$service_file"
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl restart "$XHTTP_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$candidate"
+    rm -rf "$backup_dir"
+    return 1
+  fi
+
+  rm -f "$candidate"
+  rm -rf "$backup_dir"
 }
 
 xhttp_show_config() {
