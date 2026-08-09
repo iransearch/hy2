@@ -3018,13 +3018,165 @@ EOF_HY2_LIMITS
 }
 
 
+hysteria_core_version() {
+  local bin="/usr/local/bin/hysteria" out
+  if [[ ! -x "$bin" ]]; then
+    echo "not-installed"
+    return 0
+  fi
+  out="$("$bin" version 2>/dev/null | head -n 1)"
+  if [[ "$out" =~ v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+    echo "v${BASH_REMATCH[1]}"
+  else
+    echo "unknown"
+  fi
+}
+
+hysteria_latest_release_info() {
+  local arch release_data
+  case "$(uname -m)" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    i386|i486|i586|i686) arch="386" ;;
+    armv7l|armv7) arch="armv7" ;;
+    armv6l|armv6) arch="armv6" ;;
+    riscv64|s390x) arch="$(uname -m)" ;;
+    *) echo "Unsupported CPU architecture: $(uname -m)" >&2; return 1 ;;
+  esac
+
+  command -v jq >/dev/null 2>&1 || { echo "jq is required." >&2; return 1; }
+  release_data="$(
+    curl -fsSL --retry 3 --connect-timeout 15 \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      -H 'Cache-Control: no-cache' \
+      -H 'User-Agent: GECKO-Hysteria-updater' \
+      'https://api.github.com/repos/apernet/hysteria/releases?per_page=20' |
+    jq -r --arg asset "hysteria-linux-${arch}" '
+      [
+        .[]
+        | select(.draft == false and .prerelease == false)
+        | select(.tag_name | startswith("app/v"))
+        | . as $release
+        | $release.assets[]?
+        | select(.name == $asset)
+        | {
+            published_at: $release.published_at,
+            tag: $release.tag_name,
+            url: .browser_download_url,
+            digest: (.digest // "")
+          }
+      ]
+      | sort_by(.published_at)
+      | reverse
+      | first
+      | select(. != null)
+      | [.tag, .url, .digest]
+      | @tsv
+    '
+  )" || return 1
+  [[ -n "$release_data" ]] || { echo "No compatible stable Hysteria release found." >&2; return 1; }
+  printf '%s\n' "$release_data"
+}
+
+hysteria_latest_version() {
+  local info tag url digest
+  info="$(hysteria_latest_release_info)" || return 1
+  IFS=$'\t' read -r tag url digest <<<"$info"
+  [[ "$tag" =~ ^app/v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  echo "${tag#app/}"
+}
+
+update_hysteria2_gecko_core() {
+  local bin="/usr/local/bin/hysteria" info tag url digest latest current
+  local tmp_dir new_bin backup_bin expected_sha actual_sha downloaded_version
+  local was_active="false"
+
+  clear
+  echo "======================================================="
+  echo " Hysteria2 Core Update - Preserve Config / Accounts"
+  echo "======================================================="
+  [[ "$(id -u)" -eq 0 ]] || { echo "Please run as root."; return 1; }
+  [[ -x "$bin" ]] || { echo "Hysteria core is not installed yet."; return 1; }
+
+  current="$(hysteria_core_version)"
+  echo "Current Core: $current"
+  echo "Checking official apernet/hysteria stable releases..."
+
+  info="$(hysteria_latest_release_info)" || { echo "Could not determine latest Hysteria release."; return 1; }
+  IFS=$'\t' read -r tag url digest <<<"$info"
+  latest="${tag#app/}"
+  echo "Latest Core : $latest"
+
+  if [[ "$current" == "$latest" ]]; then
+    echo "Already latest. No files were changed."
+    return 0
+  fi
+
+  tmp_dir="$(mktemp -d /tmp/gecko-hysteria-core.XXXXXX)" || return 1
+  new_bin="$tmp_dir/hysteria.new"
+  backup_bin="$tmp_dir/hysteria.old"
+
+  if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$new_bin" "$url"; then
+    rm -rf "$tmp_dir"
+    echo "Core download failed. Existing installation is unchanged."
+    return 1
+  fi
+  chmod 0755 "$new_bin"
+
+  if [[ "$digest" =~ ^sha256:([0-9A-Fa-f]{64})$ ]]; then
+    expected_sha="${BASH_REMATCH[1],,}"
+    actual_sha="$(sha256sum "$new_bin" | awk '{print $1}')"
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+      rm -rf "$tmp_dir"
+      echo "SHA-256 verification failed. Existing installation is unchanged."
+      return 1
+    fi
+    echo "SHA-256 verified."
+  fi
+
+  downloaded_version="$("$new_bin" version 2>/dev/null | head -n 1)"
+  if [[ ! "$downloaded_version" =~ ${latest#v} ]]; then
+    rm -rf "$tmp_dir"
+    echo "Downloaded binary version check failed. Existing installation is unchanged."
+    return 1
+  fi
+
+  cp -a "$bin" "$backup_bin" || { rm -rf "$tmp_dir"; return 1; }
+  systemctl is-active --quiet hysteria2-gecko.service && was_active="true"
+
+  if ! install -m 0755 "$new_bin" "$bin"; then
+    rm -rf "$tmp_dir"
+    echo "Could not replace Hysteria core. Existing binary is unchanged."
+    return 1
+  fi
+
+  if [[ "$was_active" == "true" ]]; then
+    if ! systemctl restart hysteria2-gecko.service || ! systemctl is-active --quiet hysteria2-gecko.service; then
+      echo "New core failed to start. Rolling back old core..."
+      install -m 0755 "$backup_bin" "$bin" || true
+      systemctl restart hysteria2-gecko.service >/dev/null 2>&1 || true
+      rm -rf "$tmp_dir"
+      echo "Rollback completed. Core: $(hysteria_core_version)"
+      return 1
+    fi
+  fi
+
+  gecko_configure_hysteria_service_logging >/dev/null 2>&1 || true
+  rm -rf "$tmp_dir"
+  echo "Update successful."
+  echo "Core Before: $current"
+  echo "Core After : $(hysteria_core_version)"
+  echo "Config/accounts preserved: /etc/hysteria2 was not modified."
+}
+
 install_hysteria2_gecko_v292() {
   set -e
   HYSTERIA_BIN="/usr/local/bin/hysteria"
   HYSTERIA_DIR="/etc/hysteria2"
   HYSTERIA_CONFIG="$HYSTERIA_DIR/server.yaml"
   HYSTERIA_SERVICE="/etc/systemd/system/hysteria2-gecko.service"
-  HYSTERIA_VERSION="v2.9.2"
+  HYSTERIA_VERSION="$(hysteria_latest_version)" || { echo "Could not determine latest stable Hysteria core."; return 1; }
 
   detect_hysteria_arch() {
     case "$(uname -m)" in
@@ -3046,7 +3198,7 @@ install_hysteria2_gecko_v292() {
   HYSTERIA_URL="https://github.com/apernet/hysteria/releases/download/app%2F${HYSTERIA_VERSION}/hysteria-linux-${HY2_ARCH}"
 
   echo "======================================================="
-  echo " Hysteria2 v2.9.2 + Gecko Obfuscation Installer"
+  echo " Hysteria2 ${HYSTERIA_VERSION} + Gecko Obfuscation Installer"
   echo "======================================================="
 
   if [ "$(id -u)" -ne 0 ]; then
@@ -3325,7 +3477,7 @@ EOF
 uninstall_hysteria2_gecko_v292() {
   clear
   echo "======================================================="
-  echo " Uninstall Hysteria2 v2.9.2 + Gecko"
+  echo " Uninstall Hysteria2 + Gecko"
   echo "======================================================="
   echo "This will remove:"
   echo "  - hysteria2-gecko.service"
@@ -6721,7 +6873,7 @@ while true; do
 
   echo -e "1)  \e[93mTUI Menu\e[0m"
   echo -e "2)  \e[93mLegacy Menu\e[0m"
-  echo -e "3)  \e[96mInstall Hysteria2 v2.9.2 + Gecko + Masquerade\e[0m"
+  echo -e "3)  \e[96mHysteria2 + Gecko + Masquerade [Core: $(hysteria_core_version)]\e[0m"
   echo -e "4)  \e[92mApply Optimize 10 + 12 (Network + System Limits)\e[0m"
   echo -e "5)  \e[96mHysteria2 Gecko Port Hop Menu (Kharej only)\e[0m"
   echo -e "6)  \e[93mGECKO WARP Proxy Outbound Menu\e[0m"
@@ -6751,14 +6903,16 @@ while true; do
       echo "======================================================="
       echo " Hysteria2 Gecko is already installed."
       echo "======================================================="
-      echo " 1) Reinstall (overwrite)"
-      echo " 2) Uninstall"
+      echo " 1) Update Core only (Current: $(hysteria_core_version))"
+      echo " 2) Reinstall / Repair Hysteria2 + Gecko"
+      echo " 3) Uninstall"
       echo " 0) Cancel"
       echo "======================================================="
       read -rp "Choose: " HY2_MANAGE_CHOICE
       case "$HY2_MANAGE_CHOICE" in
-        1) clear; install_hysteria2_gecko_v292 ;;
-        2) clear; uninstall_hysteria2_gecko_v292 ;;
+        1) clear; update_hysteria2_gecko_core ;;
+        2) clear; install_hysteria2_gecko_v292 ;;
+        3) clear; uninstall_hysteria2_gecko_v292 ;;
         *) echo "Cancelled." ;;
       esac
     else
