@@ -1,3 +1,4 @@
+# trigger: fix Hysteria version detection
 name: One-time Hysteria version detection fix
 
 on:
@@ -21,7 +22,6 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
-          import re
 
           p = Path('GECKO.sh')
           s = p.read_text()
@@ -87,7 +87,6 @@ jobs:
           if old_check not in s:
               raise SystemExit('old downloaded version check not found')
           s = s.replace(old_check, new_check, 1)
-
           p.write_text(s)
           PY
 
