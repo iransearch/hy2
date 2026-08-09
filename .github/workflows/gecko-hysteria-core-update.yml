@@ -1,3 +1,4 @@
+# trigger: apply GECKO Hysteria core updater patch
 name: One-time GECKO Hysteria core updater patch
 
 on:
@@ -187,17 +188,14 @@ jobs:
           if 'update_hysteria2_gecko_core() {' not in s:
               s = s.replace(marker, helper + marker, 1)
 
-          # Make fresh installs use the newest official stable Hysteria release.
           old = '  HYSTERIA_VERSION="v2.9.2"'
           new = '  HYSTERIA_VERSION="$(hysteria_latest_version)" || { echo "Could not determine latest stable Hysteria core."; return 1; }'
           if old in s:
               s = s.replace(old, new, 1)
 
-          # The current release URL format accepts app%2FvX.Y.Z.
           s = s.replace('echo " Hysteria2 v2.9.2 + Gecko Obfuscation Installer"', 'echo " Hysteria2 ${HYSTERIA_VERSION} + Gecko Obfuscation Installer"', 1)
           s = s.replace('echo " Uninstall Hysteria2 v2.9.2 + Gecko"', 'echo " Uninstall Hysteria2 + Gecko"', 1)
 
-          # Always show installed core version on option 3 in the main menu.
           main_menu_old = 'echo -e "3)  \\e[96mInstall Hysteria2 v2.9.2 + Gecko + Masquerade\\e[0m"'
           main_menu_new = 'echo -e "3)  \\e[96mHysteria2 + Gecko + Masquerade [Core: $(hysteria_core_version)]\\e[0m"'
           if main_menu_old in s:
@@ -205,7 +203,6 @@ jobs:
           elif '[Core: $(hysteria_core_version)]' not in s:
               raise SystemExit('main option 3 label not found')
 
-          # Replace only the installed-Hysteria management submenu.
           submenu_re = re.compile(
               r'(?P<i>[ \t]*)echo " 1\) [^"\n]*"\n'
               r'(?P=i)echo " 2\) Uninstall"\n'
@@ -243,7 +240,6 @@ jobs:
           PY
 
           bash -n GECKO.sh
-
           grep -F 'update_hysteria2_gecko_core()' GECKO.sh
           grep -F 'HYSTERIA_VERSION="$(hysteria_latest_version)"' GECKO.sh
           grep -F 'Update Core only (Current: $(hysteria_core_version))' GECKO.sh
