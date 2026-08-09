@@ -3034,13 +3034,32 @@ hysteria_version_from_binary() {
   return 1
 }
 
+HYSTERIA_CORE_VERSION_FILE="/var/lib/gecko/hysteria-core-version"
+
 hysteria_core_version() {
-  local bin="/usr/local/bin/hysteria"
+  local bin="/usr/local/bin/hysteria" version
   if [[ ! -x "$bin" ]]; then
     echo "not-installed"
     return 0
   fi
-  hysteria_version_from_binary "$bin" 2>/dev/null || echo "unknown"
+  version="$(hysteria_version_from_binary "$bin" 2>/dev/null || true)"
+  if [[ -n "$version" ]]; then
+    echo "$version"
+    return 0
+  fi
+  if [[ -s "$HYSTERIA_CORE_VERSION_FILE" ]]; then
+    head -n 1 "$HYSTERIA_CORE_VERSION_FILE"
+    return 0
+  fi
+  echo "unknown"
+}
+
+hysteria_record_core_version() {
+  local version="$1"
+  [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  install -d -m 0755 /var/lib/gecko || return 1
+  printf '%s\n' "$version" > "$HYSTERIA_CORE_VERSION_FILE" || return 1
+  chmod 0644 "$HYSTERIA_CORE_VERSION_FILE" 2>/dev/null || true
 }
 
 hysteria_latest_release_info() {
@@ -3100,8 +3119,8 @@ hysteria_latest_version() {
 
 update_hysteria2_gecko_core() {
   local bin="/usr/local/bin/hysteria" info tag url digest latest current
-  local tmp_dir new_bin backup_bin expected_sha actual_sha downloaded_version
-  local was_active="false"
+  local tmp_dir new_bin backup_bin expected_sha actual_sha downloaded_version current_sha
+  local digest_verified="false" was_active="false"
 
   clear
   echo "======================================================="
@@ -3124,6 +3143,17 @@ update_hysteria2_gecko_core() {
     return 0
   fi
 
+  if [[ "$digest" =~ ^sha256:([0-9A-Fa-f]{64})$ ]]; then
+    expected_sha="${BASH_REMATCH[1],,}"
+    current_sha="$(sha256sum "$bin" 2>/dev/null | awk '{print $1}')"
+    if [[ -n "$current_sha" && "$current_sha" == "$expected_sha" ]]; then
+      hysteria_record_core_version "$latest" || true
+      echo "Installed binary SHA-256 already matches $latest."
+      echo "Core version recorded as: $latest"
+      return 0
+    fi
+  fi
+
   tmp_dir="$(mktemp -d /tmp/gecko-hysteria-core.XXXXXX)" || return 1
   new_bin="$tmp_dir/hysteria.new"
   backup_bin="$tmp_dir/hysteria.old"
@@ -3143,14 +3173,23 @@ update_hysteria2_gecko_core() {
       echo "SHA-256 verification failed. Existing installation is unchanged."
       return 1
     fi
+    digest_verified="true"
     echo "SHA-256 verified."
   fi
 
   downloaded_version="$(hysteria_version_from_binary "$new_bin" 2>/dev/null || true)"
-  if [[ "$downloaded_version" != "$latest" ]]; then
+  if [[ -n "$downloaded_version" && "$downloaded_version" != "$latest" ]]; then
     rm -rf "$tmp_dir"
-    echo "Downloaded binary version check failed (got: ${downloaded_version:-unknown}, expected: $latest). Existing installation is unchanged."
+    echo "Downloaded binary reports $downloaded_version but release metadata says $latest. Existing installation is unchanged."
     return 1
+  fi
+  if [[ -z "$downloaded_version" && "$digest_verified" != "true" ]]; then
+    rm -rf "$tmp_dir"
+    echo "Could not verify downloaded core version and GitHub did not provide a SHA-256 digest. Existing installation is unchanged."
+    return 1
+  fi
+  if [[ -z "$downloaded_version" ]]; then
+    echo "Version command is not parseable on this server; trusted official SHA-256 verification instead."
   fi
 
   cp -a "$bin" "$backup_bin" || { rm -rf "$tmp_dir"; return 1; }
@@ -3173,6 +3212,7 @@ update_hysteria2_gecko_core() {
     fi
   fi
 
+  hysteria_record_core_version "$latest" || true
   gecko_configure_hysteria_service_logging >/dev/null 2>&1 || true
   rm -rf "$tmp_dir"
   echo "Update successful."
