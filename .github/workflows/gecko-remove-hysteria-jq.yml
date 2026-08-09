@@ -1,0 +1,35 @@
+name: Remove Hysteria jq dependency
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/gecko-remove-hysteria-jq.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Patch GECKO
+        run: python3 .github/scripts/remove_hysteria_jq_dependency.py
+      - name: Validate shell
+        run: bash -n GECKO.sh
+      - name: Verify jq removal
+        run: |
+          ! grep -F 'jq is required.' GECKO.sh
+          grep -F 'python3 is required to query Hysteria releases.' GECKO.sh
+          grep -F 'asset_name = "hysteria-linux-" + arch' GECKO.sh
+      - name: Commit patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add GECKO.sh
+          git commit -m 'Remove jq dependency from Hysteria core updater'
+          git push origin HEAD:main
