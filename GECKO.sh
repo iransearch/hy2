@@ -3268,7 +3268,7 @@ install_hysteria2_gecko_v292() {
   HYSTERIA_URL="https://github.com/apernet/hysteria/releases/download/app%2F${HYSTERIA_VERSION}/hysteria-linux-${HY2_ARCH}"
 
   echo "======================================================="
-  echo " Hysteria2 ${HYSTERIA_VERSION} + Gecko Obfuscation Installer"
+  echo " Hysteria2 ${HYSTERIA_VERSION} + Gecko / Salamander Obfuscation Installer"
   echo "======================================================="
 
   if [ "$(id -u)" -ne 0 ]; then
@@ -3291,21 +3291,43 @@ install_hysteria2_gecko_v292() {
   read -rp "Auth password [$DEFAULT_AUTH]: " HY2_AUTH
   HY2_AUTH="${HY2_AUTH:-$DEFAULT_AUTH}"
 
+  echo
+  echo "Obfuscation type:"
+  echo "  1) Gecko (default)"
+  echo "  2) Salamander"
+  read -rp "Choose obfuscation type [1]: " HY2_OBFS_CHOICE
+  HY2_OBFS_CHOICE="${HY2_OBFS_CHOICE:-1}"
+  case "$HY2_OBFS_CHOICE" in
+    1)
+      HY2_OBFS_TYPE="gecko"
+      HY2_OBFS_NAME="Gecko"
+      HY2_DEFAULT_REMARK="HY2-GECKO"
+      ;;
+    2)
+      HY2_OBFS_TYPE="salamander"
+      HY2_OBFS_NAME="Salamander"
+      HY2_DEFAULT_REMARK="HY2-SALAMANDER"
+      ;;
+    *)
+      echo "Invalid obfuscation type."
+      return 1
+      ;;
+  esac
+
   DEFAULT_OBFS="$(openssl rand -base64 18 | tr -d '=+/')"
-  read -rp "Gecko obfs password [$DEFAULT_OBFS]: " HY2_OBFS
+  read -rp "$HY2_OBFS_NAME obfs password [$DEFAULT_OBFS]: " HY2_OBFS
   HY2_OBFS="${HY2_OBFS:-$DEFAULT_OBFS}"
 
   read -rp "SNI / certificate CN [www.google.com]: " HY2_SNI
   HY2_SNI="${HY2_SNI:-www.google.com}"
 
-  # Gecko packet sizes are intentionally not asked from the user.
-  # Hysteria defaults are used: minPacketSize=512, maxPacketSize=1200.
-  # The official share URI only carries obfs type + password, not packet sizes.
+  # Gecko packet sizes are intentionally not asked from the user. They do not
+  # apply to Salamander and are not carried by the official share URI.
   GECKO_MIN=512
   GECKO_MAX=1200
 
-  read -rp "Remark [HY2-GECKO]: " HY2_REMARK
-  HY2_REMARK="${HY2_REMARK:-HY2-GECKO}"
+  read -rp "Remark [$HY2_DEFAULT_REMARK]: " HY2_REMARK
+  HY2_REMARK="${HY2_REMARK:-$HY2_DEFAULT_REMARK}"
 
   echo
   echo "Masquerade mode:"
@@ -3415,6 +3437,28 @@ EOF_MASQ
 
   AUTH_YAML="$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$HY2_AUTH")"
   OBFS_YAML="$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$HY2_OBFS")"
+  case "$HY2_OBFS_TYPE" in
+    gecko)
+      OBFS_CONFIG=$(cat <<EOF_OBFS
+obfs:
+  type: gecko
+  gecko:
+    password: $OBFS_YAML
+    minPacketSize: $GECKO_MIN
+    maxPacketSize: $GECKO_MAX
+EOF_OBFS
+)
+      ;;
+    salamander)
+      OBFS_CONFIG=$(cat <<EOF_OBFS
+obfs:
+  type: salamander
+  salamander:
+    password: $OBFS_YAML
+EOF_OBFS
+)
+      ;;
+  esac
 
   echo "Preparing Hysteria binary install..."
   systemctl stop hysteria2-gecko.service >/dev/null 2>&1 || true
@@ -3462,12 +3506,7 @@ auth:
   type: password
   password: $AUTH_YAML
 
-obfs:
-  type: gecko
-  gecko:
-    password: $OBFS_YAML
-    minPacketSize: $GECKO_MIN
-    maxPacketSize: $GECKO_MAX${MASQ_CONFIG}
+${OBFS_CONFIG}${MASQ_CONFIG}
 
 quic:
   initStreamReceiveWindow: 8388608
@@ -3482,7 +3521,7 @@ EOF
 
   cat > "$HYSTERIA_SERVICE" <<EOF
 [Unit]
-Description=Hysteria2 Gecko v2.9.2 Server
+Description=Hysteria2 $HY2_OBFS_NAME Server
 After=network-online.target
 Wants=network-online.target
 
@@ -3519,7 +3558,7 @@ EOF
   EN_OBFS="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_OBFS")"
   EN_SNI="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_SNI")"
   EN_REMARK="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_REMARK")"
-  HY2_LINK="hy2://$EN_AUTH@$SERVER_IP:$HY2_PORT?sni=$EN_SNI&insecure=1&obfs=gecko&obfs-password=$EN_OBFS#$EN_REMARK"
+  HY2_LINK="hy2://$EN_AUTH@$SERVER_IP:$HY2_PORT?sni=$EN_SNI&insecure=1&obfs=$HY2_OBFS_TYPE&obfs-password=$EN_OBFS#$EN_REMARK"
 
   cat > "$HYSTERIA_DIR/client-link.txt" <<EOF
 $HY2_LINK
@@ -3527,11 +3566,13 @@ EOF
 
   echo
   echo "======================================================="
-  echo "Hysteria2 Gecko installed."
+  echo "Hysteria2 $HY2_OBFS_NAME installed."
   echo "Service: hysteria2-gecko.service"
   echo "Config: $HYSTERIA_CONFIG"
   echo "Link saved: $HYSTERIA_DIR/client-link.txt"
-  echo "Note: Gecko packet sizes are server/config defaults and are NOT included in the client URI."
+  if [ "$HY2_OBFS_TYPE" = "gecko" ]; then
+    echo "Note: Gecko packet sizes are server/config defaults and are NOT included in the client URI."
+  fi
   echo "-------------------------------------------------------"
   echo "$HY2_LINK"
   echo "======================================================="
@@ -3547,7 +3588,7 @@ EOF
 uninstall_hysteria2_gecko_v292() {
   clear
   echo "======================================================="
-  echo " Uninstall Hysteria2 + Gecko"
+  echo " Uninstall Hysteria2 + Gecko / Salamander"
   echo "======================================================="
   echo "This will remove:"
   echo "  - hysteria2-gecko.service"
@@ -3570,7 +3611,7 @@ uninstall_hysteria2_gecko_v292() {
   systemctl daemon-reload
 
   echo
-  echo "Hysteria2 Gecko removed."
+  echo "Hysteria2 Gecko / Salamander removed."
   echo "======================================================="
 }
 
@@ -6943,7 +6984,7 @@ while true; do
 
   echo -e "1)  \e[93mTUI Menu\e[0m"
   echo -e "2)  \e[93mLegacy Menu\e[0m"
-  echo -e "3)  \e[96mHysteria2 + Gecko + Masquerade [Core: $(hysteria_core_version)]\e[0m"
+  echo -e "3)  \e[96mHysteria2 + Gecko / Salamander + Masquerade [Core: $(hysteria_core_version)]\e[0m"
   echo -e "4)  \e[92mApply Optimize 10 + 12 (Network + System Limits)\e[0m"
   echo -e "5)  \e[96mHysteria2 Gecko Port Hop Menu (Kharej only)\e[0m"
   echo -e "6)  \e[93mGECKO WARP Proxy Outbound Menu\e[0m"
@@ -6971,10 +7012,10 @@ while true; do
     if [ -f /etc/systemd/system/hysteria2-gecko.service ] || [ -f /etc/hysteria2/server.yaml ]; then
       clear
       echo "======================================================="
-      echo " Hysteria2 Gecko is already installed."
+      echo " Hysteria2 Gecko / Salamander is already installed."
       echo "======================================================="
       echo " 1) Update Core only (Current: $(hysteria_core_version))"
-      echo " 2) Reinstall / Repair Hysteria2 + Gecko"
+      echo " 2) Reinstall / Repair Hysteria2 + Gecko / Salamander"
       echo " 3) Uninstall"
       echo " 0) Cancel"
       echo "======================================================="
