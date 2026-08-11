@@ -3730,8 +3730,8 @@ csf_require_install() {
 csf_set_conf_value_c() {
   local key="$1" value="$2"
 
-  if grep -q "^${key} = " /etc/csf/csf.conf; then
-    sed -i "s|^${key} = .*|${key} = \"${value}\"|" /etc/csf/csf.conf
+  if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" /etc/csf/csf.conf; then
+    sed -i "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = \"${value}\"|" /etc/csf/csf.conf
   else
     printf '%s = "%s"\n' "$key" "$value" >> /etc/csf/csf.conf
   fi
@@ -3742,7 +3742,7 @@ csf_set_conf_value_c() {
 CSF_CLOUDFLARE_WARP_UDP_OUT_PORTS=(443 500 1701 2408 4443 4500 8095 8443)
 
 csf_apply_install_port_defaults_c() {
-  local port
+  local key port
 
   [ -f /etc/csf/csf.conf ] || {
     csf_err_c "Cannot apply default ports: /etc/csf/csf.conf was not found."
@@ -3756,6 +3756,15 @@ csf_apply_install_port_defaults_c() {
     csf_remove_port_from_conf "TCP_OUT" "22"
     csf_ok_c "Removed 22 from TCP_OUT."
   fi
+
+  # SMTP must not be exposed or usable for outbound delivery by default.
+  # Users who intentionally run a mail server can add it again later.
+  for key in TCP_IN TCP_OUT; do
+    if csf_port_exists_in_conf "$key" "25"; then
+      csf_remove_port_from_conf "$key" "25"
+      csf_ok_c "Removed 25 from ${key}."
+    fi
+  done
 
   for port in "${CSF_CLOUDFLARE_WARP_UDP_OUT_PORTS[@]}"; do
     if ! csf_port_exists_in_conf "UDP_OUT" "$port"; then
@@ -3794,7 +3803,7 @@ csf_apply_install_port_defaults_c() {
 csf_install_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Install"
+  echo " CSF Firewall â€” Install"
   echo "======================================================="
   if csf_is_installed; then
     csf_warn_c "CSF is already installed."
@@ -3854,7 +3863,7 @@ csf_install_c() {
 csf_control_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Start / Stop / Reload"
+  echo " CSF Firewall â€” Start / Stop / Reload"
   echo "======================================================="
   csf_require_install || return 1
   echo " 1) Start firewall     (csf -s)"
@@ -3893,30 +3902,68 @@ csf_conf_key() {
   echo "${1^^}_${2^^}"
 }
 
+csf_read_port_list_from_conf() {
+  local key="$1" raw item
+  local raw_ports=() parsed_ports=()
+
+  raw="$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
+    /etc/csf/csf.conf | head -1)"
+  if [ -n "$raw" ]; then
+    IFS=',' read -ra raw_ports <<< "$raw"
+    for item in "${raw_ports[@]}"; do
+      item="$(printf '%s' "$item" | tr -d '[:space:]')"
+      [ -n "$item" ] && parsed_ports+=("$item")
+    done
+  fi
+
+  CSFC_PORT_LIST=("${parsed_ports[@]}")
+}
+
+csf_write_port_list_to_conf() {
+  local key="$1" joined=""
+  shift
+
+  if [ "$#" -gt 0 ]; then
+    local IFS=','
+    joined="$*"
+  fi
+  csf_set_conf_value_c "$key" "$joined"
+}
+
 csf_port_exists_in_conf() {
   local key="$1" port="$2"
-  local val
-  val="$(grep "^${key} = " /etc/csf/csf.conf | head -1 | sed 's/.*= "\(.*\)"/\1/')"
-  echo "$val" | tr ',' '\n' | grep -qxF "$port"
+  local item
+  csf_read_port_list_from_conf "$key"
+  for item in "${CSFC_PORT_LIST[@]}"; do
+    [ "$item" = "$port" ] && return 0
+  done
+  return 1
 }
 
 csf_add_port_to_conf() {
   local key="$1" port="$2"
-  local current
-  current="$(grep "^${key} = " /etc/csf/csf.conf | head -1 | sed 's/.*= "\(.*\)"/\1/')"
-  if [ -z "$current" ]; then
-    sed -i "s/^${key} = \".*\"/${key} = \"${port}\"/" /etc/csf/csf.conf
-  else
-    sed -i "s/^${key} = \".*\"/${key} = \"${current},${port}\"/" /etc/csf/csf.conf
-  fi
+  csf_read_port_list_from_conf "$key"
+  CSFC_PORT_LIST+=("$port")
+  csf_write_port_list_to_conf "$key" "${CSFC_PORT_LIST[@]}"
 }
 
 csf_remove_port_from_conf() {
   local key="$1" port="$2"
-  local current new_val
-  current="$(grep "^${key} = " /etc/csf/csf.conf | head -1 | sed 's/.*= "\(.*\)"/\1/')"
-  new_val="$(echo "$current" | tr ',' '\n' | grep -vxF "$port" | paste -sd ',')"
-  sed -i "s/^${key} = \".*\"/${key} = \"${new_val}\"/" /etc/csf/csf.conf
+  local item found=0
+  local kept_ports=()
+
+  csf_read_port_list_from_conf "$key"
+  for item in "${CSFC_PORT_LIST[@]}"; do
+    if [ "$item" = "$port" ]; then
+      found=1
+    else
+      kept_ports+=("$item")
+    fi
+  done
+  [ "$found" -eq 1 ] || return 1
+
+  csf_write_port_list_to_conf "$key" "${kept_ports[@]}" || return 1
+  ! csf_port_exists_in_conf "$key" "$port"
 }
 
 csf_pick_proto_dir() {
@@ -3945,9 +3992,9 @@ csf_pick_proto_dir() {
 csf_show_all_ports() {
   # Print numbered list for one key, returns count in CSFC_COUNT_<key>
   local key="$1" color="$2"
-  local raw port_list=()
-  raw="$(grep "^${key} = " /etc/csf/csf.conf | head -1 | sed 's/.*= "\(.*\)"/\1/')"
-  [ -n "$raw" ] && IFS=',' read -ra port_list <<< "$raw"
+  local port_list=()
+  csf_read_port_list_from_conf "$key"
+  port_list=("${CSFC_PORT_LIST[@]}")
   echo -e " ${color}${key}\e[0m (${#port_list[@]} ports):"
   if [ ${#port_list[@]} -eq 0 ]; then
     echo "   (none)"
@@ -3962,10 +4009,7 @@ csf_show_all_ports() {
 
 csf_get_port_list() {
   local key="$1"
-  local raw
-  raw="$(grep "^${key} = " /etc/csf/csf.conf | head -1 | sed 's/.*= "\(.*\)"/\1/')"
-  CSFC_PORT_LIST=()
-  [ -n "$raw" ] && IFS=',' read -ra CSFC_PORT_LIST <<< "$raw"
+  csf_read_port_list_from_conf "$key"
 }
 
 csf_port_mgmt_c() {
@@ -3974,7 +4018,7 @@ csf_port_mgmt_c() {
   while true; do
     clear
     echo "======================================================="
-    echo " CSF Firewall — Port Management"
+    echo " CSF Firewall â€” Port Management"
     echo "======================================================="
     csf_show_all_ports "TCP_IN"  "\e[92m"
     echo
@@ -4001,7 +4045,7 @@ csf_port_mgmt_c() {
         case "$dc" in 1) CSFC_DIR="IN" ;; 2) CSFC_DIR="OUT" ;; *) csf_err_c "Invalid."; continue ;; esac
         local key; key="$(csf_conf_key "$CSFC_PROTO" "$CSFC_DIR")"
         echo
-        read -rp " Port(s) to add — comma separated (e.g. 443,8080,9000:9100): " input
+        read -rp " Port(s) to add â€” comma separated (e.g. 443,8080,9000:9100): " input
         [ -n "$input" ] || { csf_err_c "Input required."; continue; }
         local added=0 skipped=0
         IFS=',' read -ra new_ports <<< "$input"
@@ -4009,7 +4053,7 @@ csf_port_mgmt_c() {
           np="$(echo "$np" | tr -d ' ')"
           [ -z "$np" ] && continue
           if csf_port_exists_in_conf "$key" "$np"; then
-            csf_warn_c "Port $np already in ${key} — skipped."
+            csf_warn_c "Port $np already in ${key} â€” skipped."
             skipped=$((skipped+1))
           else
             csf_add_port_to_conf "$key" "$np"
@@ -4042,30 +4086,57 @@ csf_port_mgmt_c() {
           [ -n "$p" ] && { printf "   %3d) %s\n" "$i" "$p"; i=$((i+1)); }
         done
         echo
-        read -rp " Number(s) to remove — comma separated (e.g. 2,5,8): " picks
+        read -rp " Number(s) to remove â€” comma separated (e.g. 2,5,8): " picks
         [ -n "$picks" ] || { csf_err_c "Input required."; continue; }
-        # Collect unique valid indices first
+        # CSFC_PORT_LIST is normalized, so the displayed number always maps to
+        # the same array element. Collect unique valid indices first.
         local to_remove=()
         IFS=',' read -ra pick_arr <<< "$picks"
         for pick in "${pick_arr[@]}"; do
           pick="$(echo "$pick" | tr -d ' ')"
           if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#CSFC_PORT_LIST[@]}" ]; then
-            csf_warn_c "Invalid number: $pick — skipped."
+            csf_warn_c "Invalid number: $pick â€” skipped."
             continue
           fi
           local tp="${CSFC_PORT_LIST[$((pick-1))]}"
-          tp="$(echo "$tp" | tr -d ' ')"
-          to_remove+=("$tp")
+          local duplicate=false existing
+          for existing in "${to_remove[@]}"; do
+            [ "$existing" = "$tp" ] && duplicate=true
+          done
+          [ "$duplicate" = false ] && to_remove+=("$tp")
         done
-        local removed=0
+        [ ${#to_remove[@]} -gt 0 ] || {
+          csf_warn_c "No valid ports selected."
+          continue
+        }
+
+        local conf_backup removed=0
+        conf_backup="$(mktemp /tmp/gecko-csf-conf.XXXXXX)" || {
+          csf_err_c "Could not create a CSF configuration backup."
+          continue
+        }
+        cp -a /etc/csf/csf.conf "$conf_backup" || {
+          rm -f "$conf_backup"
+          csf_err_c "Could not back up csf.conf."
+          continue
+        }
         for tp in "${to_remove[@]}"; do
-          csf_remove_port_from_conf "$key2" "$tp"
-          csf_ok_c "Removed $tp from ${key2}."
-          removed=$((removed+1))
+          if csf_remove_port_from_conf "$key2" "$tp"; then
+            csf_ok_c "Removed $tp from ${key2}."
+            removed=$((removed+1))
+          else
+            csf_warn_c "Port $tp was not removed from ${key2}."
+          fi
         done
-        echo " Done: $removed port(s) removed."
-        read -rp " Reload CSF now? [Y/n]: " rr
-        case "$rr" in n|N) ;; *) csf -r && csf_ok_c "Rules reloaded." ;; esac
+        if [ "$removed" -gt 0 ] && csf -r >/dev/null 2>&1; then
+          rm -f "$conf_backup"
+          csf_ok_c "Applied $removed removal(s) and reloaded CSF."
+        else
+          cp -a "$conf_backup" /etc/csf/csf.conf
+          rm -f "$conf_backup"
+          csf -r >/dev/null 2>&1 || true
+          csf_err_c "CSF reload failed; previous configuration restored."
+        fi
         ;;
       0) return ;;
       *) csf_err_c "Invalid choice."; sleep 1 ;;
@@ -4078,7 +4149,7 @@ csf_port_mgmt_c() {
 csf_block_ip_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Block IP (add to deny list)"
+  echo " CSF Firewall â€” Block IP (add to deny list)"
   echo "======================================================="
   csf_require_install || return 1
   read -rp "IP to block: " ip
@@ -4091,7 +4162,7 @@ csf_block_ip_c() {
 csf_unblock_ip_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Unblock IP (remove from deny list)"
+  echo " CSF Firewall â€” Unblock IP (remove from deny list)"
   echo "======================================================="
   csf_require_install || return 1
   echo "Current deny list:"
@@ -4107,7 +4178,7 @@ csf_unblock_ip_c() {
 csf_allow_ip_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Allow IP (whitelist)"
+  echo " CSF Firewall â€” Allow IP (whitelist)"
   echo "======================================================="
   csf_require_install || return 1
   read -rp "IP to allow (or comma-separated list): " ips
@@ -4125,7 +4196,7 @@ csf_allow_ip_c() {
 csf_remove_allow_ip_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Remove IP from Whitelist"
+  echo " CSF Firewall â€” Remove IP from Whitelist"
   echo "======================================================="
   csf_require_install || return 1
   echo "Current allow list:"
@@ -4141,7 +4212,7 @@ csf_remove_allow_ip_c() {
 csf_show_rules_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Current Rules"
+  echo " CSF Firewall â€” Current Rules"
   echo "======================================================="
   csf_require_install || return 1
   csf -l 2>/dev/null | head -80
@@ -4152,7 +4223,7 @@ csf_show_rules_c() {
 csf_show_logs_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — LFD Logs (last 40 lines)"
+  echo " CSF Firewall â€” LFD Logs (last 40 lines)"
   echo "======================================================="
   csf_require_install || return 1
   local logfile=""
@@ -4172,7 +4243,7 @@ csf_show_logs_c() {
 csf_ping_block_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — PING Block (ICMP_IN)"
+  echo " CSF Firewall â€” PING Block (ICMP_IN)"
   echo "======================================================="
   csf_require_install || return 1
   local current current_rate
@@ -4211,7 +4282,7 @@ csf_ping_block_c() {
 csf_uninstall_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Uninstall"
+  echo " CSF Firewall â€” Uninstall"
   echo "======================================================="
   csf_require_install || return 1
   read -rp "Uninstall CSF completely? [y/N]: " c
@@ -4239,7 +4310,7 @@ csf_lfd_ssh_mgmt_c() {
   while true; do
     clear
     echo "======================================================="
-    echo " CSF — LFD SSH Brute-Force Settings"
+    echo " CSF â€” LFD SSH Brute-Force Settings"
     echo "======================================================="
 
     # Read current values
@@ -4287,9 +4358,9 @@ csf_lfd_ssh_mgmt_c() {
       2)
         echo
         echo " Block mode:"
-        echo "   1) Permanent  — blocked IP never auto-unblocked"
-        echo "   2) Temporary  — blocked IP unblocked after LF_TEMP_BLOCK seconds"
-        echo "   3) Both       — block permanently AND add temporary rule"
+        echo "   1) Permanent  â€” blocked IP never auto-unblocked"
+        echo "   2) Temporary  â€” blocked IP unblocked after LF_TEMP_BLOCK seconds"
+        echo "   3) Both       â€” block permanently AND add temporary rule"
         read -rp " Choose: " bm
         case "$bm" in
           1)
@@ -4365,7 +4436,7 @@ csf_menu() {
     echo "======================================================="
     echo " 1)  Install CSF"
     echo " 2)  Start / Stop / Reload"
-    echo " 3)  Port Management (TCP/UDP · IN/OUT)"
+    echo " 3)  Port Management (TCP/UDP Â· IN/OUT)"
     echo " 4)  Block IP   (add to deny list)"
     echo " 5)  Unblock IP (remove from deny list)"
     echo " 6)  Allow IP   (whitelist)"
@@ -4373,7 +4444,7 @@ csf_menu() {
     echo " 8)  Show firewall rules"
     echo " 9)  Show LFD logs"
     echo " 10) PING block (ICMP_IN)"
-    echo " 11) LFD — SSH Brute-Force Settings"
+    echo " 11) LFD â€” SSH Brute-Force Settings"
     echo " 12) Uninstall CSF"
     echo " 0)  Back"
     echo "======================================================="
@@ -4439,7 +4510,7 @@ gost_ensure_bin_m() {
 gost_create_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel — Create New"
+  echo " GOST Multi-Tunnel â€” Create New"
   echo "======================================================="
   echo " Forwards this-server:PORT -> destination:PORT (same port)"
   echo "======================================================="
@@ -4536,7 +4607,7 @@ EOF
 gost_list_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel — List"
+  echo " GOST Multi-Tunnel â€” List"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4561,7 +4632,7 @@ gost_list_m() {
 gost_delete_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel — Delete"
+  echo " GOST Multi-Tunnel â€” Delete"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4591,7 +4662,7 @@ gost_delete_m() {
 gost_status_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel — Status / Logs"
+  echo " GOST Multi-Tunnel â€” Status / Logs"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4628,7 +4699,7 @@ gost_status_m() {
 gost_restart_all_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel — Restart ALL"
+  echo " GOST Multi-Tunnel â€” Restart ALL"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4645,7 +4716,7 @@ gost_restart_all_m() {
 gost_uninstall_all_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel — Uninstall ALL"
+  echo " GOST Multi-Tunnel â€” Uninstall ALL"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4667,7 +4738,7 @@ gost_uninstall_all_m() {
 gost_auto_clear_cache_m() {
   clear
   echo "======================================================="
-  echo " GOST — Auto Clear Cache"
+  echo " GOST â€” Auto Clear Cache"
   echo "======================================================="
   echo " 1) Enable Auto Clear Cache"
   echo " 2) Disable Auto Clear Cache"
@@ -4703,7 +4774,7 @@ gost_multi_menu() {
     echo "======================================================="
     echo " Forward this-server:PORT -> destination:PORT (same port)"
     echo " Each tunnel is its own systemd service (gostm_<name>)"
-    echo " Supports TCP / UDP / gRPC · IPv4 and IPv6"
+    echo " Supports TCP / UDP / gRPC Â· IPv4 and IPv6"
     echo "======================================================="
     echo " 1) Create tunnel"
     echo " 2) List tunnels"
@@ -5024,7 +5095,7 @@ gtun_make_link() {
 gtun_setup_kharej() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Kharej (Exit) Setup"
+  echo " GECKO Relay Tunnel â€” Kharej (Exit) Setup"
   echo "======================================================="
   echo "This server will be the EXIT node."
   echo "Run setup on Iran (entry) after this completes."
@@ -5121,7 +5192,7 @@ gtun_setup_kharej() {
 gtun_setup_iran() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Iran (Entry) Setup"
+  echo " GECKO Relay Tunnel â€” Iran (Entry) Setup"
   echo "======================================================="
   echo "This server will be the ENTRY node."
   echo "You need the hy2://... link from the Kharej setup."
@@ -5146,7 +5217,7 @@ gtun_setup_iran() {
   local link
   read -rp "Paste hy2://... link from Kharej: " link
   if [[ ! "$link" =~ ^hy2:// ]]; then
-    echo "Invalid link — must start with hy2://"; rm -rf "$(gtun_idir "$name")"; return 1
+    echo "Invalid link â€” must start with hy2://"; rm -rf "$(gtun_idir "$name")"; return 1
   fi
 
   # Parse link: hy2://AUTH@IP:PORT?sni=...&obfs=gecko&obfs-password=...
@@ -5265,7 +5336,7 @@ gtun_pick() {
 gtun_show_status() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Status"
+  echo " GECKO Relay Tunnel â€” Status"
   echo "======================================================="
   gtun_pick || return 1
   local name="$GTUN_PICKED"
@@ -5289,7 +5360,7 @@ gtun_show_status() {
 gtun_restart_one() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Restart"
+  echo " GECKO Relay Tunnel â€” Restart"
   echo "======================================================="
   gtun_pick || return 1
   gtun_start "$GTUN_PICKED"
@@ -5298,7 +5369,7 @@ gtun_restart_one() {
 gtun_restart_all() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Restart ALL"
+  echo " GECKO Relay Tunnel â€” Restart ALL"
   echo "======================================================="
   local name any=0
   while IFS= read -r name; do
@@ -5312,7 +5383,7 @@ gtun_restart_all() {
 gtun_show_link() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Show Link"
+  echo " GECKO Relay Tunnel â€” Show Link"
   echo "======================================================="
   gtun_pick || return 1
   local name="$GTUN_PICKED"
@@ -5336,7 +5407,7 @@ gtun_show_link() {
 gtun_delete_one() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Delete"
+  echo " GECKO Relay Tunnel â€” Delete"
   echo "======================================================="
   gtun_pick || return 1
   local name="$GTUN_PICKED"
@@ -5351,7 +5422,7 @@ gtun_delete_one() {
 gtun_uninstall_all() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Uninstall ALL"
+  echo " GECKO Relay Tunnel â€” Uninstall ALL"
   echo "======================================================="
   local names=() name
   while IFS= read -r name; do [ -n "$name" ] && names+=("$name"); done < <(gtun_instances)
@@ -6938,14 +7009,14 @@ fi
 
 while true; do
   echo "
-╭━━━╮╱╱╱╱╱╱╱╱╱╭━━╮╱╱╱╱╱╱╱╭━━━╮╱╱╱╱╱╭━╮╱╱╱╱╭━━╮╱╱╱╱╱╭╮╱╱╱╭╮╭╮
-┃╭━╮┃╱╱╱╱╱╱╱╱╱┃╭╮┃╱╱╱╱╱╱╱┃╭━╮┃╱╱╱╱╱┃╭╯╱╱╱╱╰┫┣╯╱╱╱╱╭╯╰╮╱╱┃┃┃┃
-┃╰━━┳┳━╮╭━━╮╱╱┃╰╯╰┳━━┳╮╭╮┃┃╱╰╋━━┳━┳╯╰┳┳━━╮╱┃┃╭━╮╭━┻╮╭╋━━┫┃┃┃╭━━┳━╮
-╰━━╮┣┫╭╮┫╭╮┣━━┫╭━╮┃╭╮┣╋╋╯┃┃╱╭┫╭╮┃╭╋╮╭╋┫╭╮┃╱┃┃┃╭╮┫━━┫┃┃╭╮┃┃┃┃┃┃━┫╭╯
-┃╰━╯┃┃┃┃┃╰╯┣━━┫╰━╯┃╰╯┣╋╋╮┃╰━╯┃╰╯┃┃┃┃┃┃┃╰╯┃╭┫┣┫┃┃┣━━┃╰┫╭╮┃╰┫╰┫┃━┫┃
-╰━━━┻┻╯╰┻━╮┃╱╱╰━━━┻━━┻╯╰╯╰━━━┻━━┻╯╰┻╯╰┻━╮┃╰━━┻╯╰┻━━┻━┻╯╰┻━┻━┻━━┻╯
-╱╱╱╱╱╱╱╱╭━╯┃╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╭━╯┃
-╱╱╱╱╱╱╱╱╰━━╯╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╰━━╯V6.1.0"
+â•­â”â”â”â•®â•±â•±â•±â•±â•±â•±â•±â•±â•±â•­â”â”â•®â•±â•±â•±â•±â•±â•±â•±â•­â”â”â”â•®â•±â•±â•±â•±â•±â•­â”â•®â•±â•±â•±â•±â•­â”â”â•®â•±â•±â•±â•±â•±â•­â•®â•±â•±â•±â•­â•®â•­â•®
+â”ƒâ•­â”â•®â”ƒâ•±â•±â•±â•±â•±â•±â•±â•±â•±â”ƒâ•­â•®â”ƒâ•±â•±â•±â•±â•±â•±â•±â”ƒâ•­â”â•®â”ƒâ•±â•±â•±â•±â•±â”ƒâ•­â•¯â•±â•±â•±â•±â•°â”«â”£â•¯â•±â•±â•±â•±â•­â•¯â•°â•®â•±â•±â”ƒâ”ƒâ”ƒâ”ƒ
+â”ƒâ•°â”â”â”³â”³â”â•®â•­â”â”â•®â•±â•±â”ƒâ•°â•¯â•°â”³â”â”â”³â•®â•­â•®â”ƒâ”ƒâ•±â•°â•‹â”â”â”³â”â”³â•¯â•°â”³â”³â”â”â•®â•±â”ƒâ”ƒâ•­â”â•®â•­â”â”»â•®â•­â•‹â”â”â”«â”ƒâ”ƒâ”ƒâ•­â”â”â”³â”â•®
+â•°â”â”â•®â”£â”«â•­â•®â”«â•­â•®â”£â”â”â”«â•­â”â•®â”ƒâ•­â•®â”£â•‹â•‹â•¯â”ƒâ”ƒâ•±â•­â”«â•­â•®â”ƒâ•­â•‹â•®â•­â•‹â”«â•­â•®â”ƒâ•±â”ƒâ”ƒâ”ƒâ•­â•®â”«â”â”â”«â”ƒâ”ƒâ•­â•®â”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ”â”«â•­â•¯
+â”ƒâ•°â”â•¯â”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ•°â•¯â”£â”â”â”«â•°â”â•¯â”ƒâ•°â•¯â”£â•‹â•‹â•®â”ƒâ•°â”â•¯â”ƒâ•°â•¯â”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ•°â•¯â”ƒâ•­â”«â”£â”«â”ƒâ”ƒâ”£â”â”â”ƒâ•°â”«â•­â•®â”ƒâ•°â”«â•°â”«â”ƒâ”â”«â”ƒ
+â•°â”â”â”â”»â”»â•¯â•°â”»â”â•®â”ƒâ•±â•±â•°â”â”â”â”»â”â”â”»â•¯â•°â•¯â•°â”â”â”â”»â”â”â”»â•¯â•°â”»â•¯â•°â”»â”â•®â”ƒâ•°â”â”â”»â•¯â•°â”»â”â”â”»â”â”»â•¯â•°â”»â”â”»â”â”»â”â”â”»â•¯
+â•±â•±â•±â•±â•±â•±â•±â•±â•­â”â•¯â”ƒâ•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•­â”â•¯â”ƒ
+â•±â•±â•±â•±â•±â•±â•±â•±â•°â”â”â•¯â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•°â”â”â•¯V6.1.0"
 
   echo "By theTCS"
 
@@ -6974,9 +7045,9 @@ while true; do
   echo
 
   echo "
-▒█▀▀▀█ █▀▀ █░░ █▀▀ █▀▀ ▀▀█▀▀ 　 █▀▄▀█ █▀▀ █▀▀▄ █░░█ 　 ▄ 
-░▀▀▀▄▄ █▀▀ █░░ █▀▀ █░░ ░░█░░ 　 █░▀░█ █▀▀ █░░█ █░░█ 　 ░ 
-▒█▄▄▄█ ▀▀▀ ▀▀▀ ▀▀▀ ▀▀▀ ░░▀░░ 　 ▀░░░▀ ▀▀▀ ▀░░▀ ░▀▀▀ 　 ▀"
+â–’â–ˆâ–€â–€â–€â–ˆ â–ˆâ–€â–€ â–ˆâ–‘â–‘ â–ˆâ–€â–€ â–ˆâ–€â–€ â–€â–€â–ˆâ–€â–€ ã€€ â–ˆâ–€â–„â–€â–ˆ â–ˆâ–€â–€ â–ˆâ–€â–€â–„ â–ˆâ–‘â–‘â–ˆ ã€€ â–„ 
+â–‘â–€â–€â–€â–„â–„ â–ˆâ–€â–€ â–ˆâ–‘â–‘ â–ˆâ–€â–€ â–ˆâ–‘â–‘ â–‘â–‘â–ˆâ–‘â–‘ ã€€ â–ˆâ–‘â–€â–‘â–ˆ â–ˆâ–€â–€ â–ˆâ–‘â–‘â–ˆ â–ˆâ–‘â–‘â–ˆ ã€€ â–‘ 
+â–’â–ˆâ–„â–„â–„â–ˆ â–€â–€â–€ â–€â–€â–€ â–€â–€â–€ â–€â–€â–€ â–‘â–‘â–€â–‘â–‘ ã€€ â–€â–‘â–‘â–‘â–€ â–€â–€â–€ â–€â–‘â–‘â–€ â–‘â–€â–€â–€ ã€€ â–€"
 
   echo
 
