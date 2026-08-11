@@ -3803,7 +3803,7 @@ csf_apply_install_port_defaults_c() {
 csf_install_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall â€” Install"
+  echo " CSF Firewall — Install"
   echo "======================================================="
   if csf_is_installed; then
     csf_warn_c "CSF is already installed."
@@ -3863,7 +3863,7 @@ csf_install_c() {
 csf_control_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall â€” Start / Stop / Reload"
+  echo " CSF Firewall — Start / Stop / Reload"
   echo "======================================================="
   csf_require_install || return 1
   echo " 1) Start firewall     (csf -s)"
@@ -4018,7 +4018,7 @@ csf_port_mgmt_c() {
   while true; do
     clear
     echo "======================================================="
-    echo " CSF Firewall â€” Port Management"
+    echo " CSF Firewall — Port Management"
     echo "======================================================="
     csf_show_all_ports "TCP_IN"  "\e[92m"
     echo
@@ -4045,7 +4045,7 @@ csf_port_mgmt_c() {
         case "$dc" in 1) CSFC_DIR="IN" ;; 2) CSFC_DIR="OUT" ;; *) csf_err_c "Invalid."; continue ;; esac
         local key; key="$(csf_conf_key "$CSFC_PROTO" "$CSFC_DIR")"
         echo
-        read -rp " Port(s) to add â€” comma separated (e.g. 443,8080,9000:9100): " input
+        read -rp " Port(s) to add — comma separated (e.g. 443,8080,9000:9100): " input
         [ -n "$input" ] || { csf_err_c "Input required."; continue; }
         local added=0 skipped=0
         IFS=',' read -ra new_ports <<< "$input"
@@ -4053,7 +4053,7 @@ csf_port_mgmt_c() {
           np="$(echo "$np" | tr -d ' ')"
           [ -z "$np" ] && continue
           if csf_port_exists_in_conf "$key" "$np"; then
-            csf_warn_c "Port $np already in ${key} â€” skipped."
+            csf_warn_c "Port $np already in ${key} — skipped."
             skipped=$((skipped+1))
           else
             csf_add_port_to_conf "$key" "$np"
@@ -4086,7 +4086,7 @@ csf_port_mgmt_c() {
           [ -n "$p" ] && { printf "   %3d) %s\n" "$i" "$p"; i=$((i+1)); }
         done
         echo
-        read -rp " Number(s) to remove â€” comma separated (e.g. 2,5,8): " picks
+        read -rp " Number(s) to remove — comma separated (e.g. 2,5,8): " picks
         [ -n "$picks" ] || { csf_err_c "Input required."; continue; }
         # CSFC_PORT_LIST is normalized, so the displayed number always maps to
         # the same array element. Collect unique valid indices first.
@@ -4095,7 +4095,7 @@ csf_port_mgmt_c() {
         for pick in "${pick_arr[@]}"; do
           pick="$(echo "$pick" | tr -d ' ')"
           if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#CSFC_PORT_LIST[@]}" ]; then
-            csf_warn_c "Invalid number: $pick â€” skipped."
+            csf_warn_c "Invalid number: $pick — skipped."
             continue
           fi
           local tp="${CSFC_PORT_LIST[$((pick-1))]}"
@@ -4149,7 +4149,7 @@ csf_port_mgmt_c() {
 csf_block_ip_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall â€” Block IP (add to deny list)"
+  echo " CSF Firewall — Block IP (add to deny list)"
   echo "======================================================="
   csf_require_install || return 1
   read -rp "IP to block: " ip
@@ -4162,7 +4162,7 @@ csf_block_ip_c() {
 csf_unblock_ip_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall â€” Unblock IP (remove from deny list)"
+  echo " CSF Firewall — Unblock IP (remove from deny list)"
   echo "======================================================="
   csf_require_install || return 1
   echo "Current deny list:"
@@ -4178,7 +4178,7 @@ csf_unblock_ip_c() {
 csf_allow_ip_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall â€” Allow IP (whitelist)"
+  echo " CSF Firewall — Allow IP (whitelist)"
   echo "======================================================="
   csf_require_install || return 1
   read -rp "IP to allow (or comma-separated list): " ips
@@ -4196,7 +4196,7 @@ csf_allow_ip_c() {
 csf_remove_allow_ip_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall â€” Remove IP from Whitelist"
+  echo " CSF Firewall — Remove IP from Whitelist"
   echo "======================================================="
   csf_require_install || return 1
   echo "Current allow list:"
@@ -4212,7 +4212,7 @@ csf_remove_allow_ip_c() {
 csf_show_rules_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall â€” Current Rules"
+  echo " CSF Firewall — Current Rules"
   echo "======================================================="
   csf_require_install || return 1
   csf -l 2>/dev/null | head -80
@@ -4223,7 +4223,7 @@ csf_show_rules_c() {
 csf_show_logs_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall â€” LFD Logs (last 40 lines)"
+  echo " CSF Firewall — LFD Logs (last 40 lines)"
   echo "======================================================="
   csf_require_install || return 1
   local logfile=""
@@ -4243,7 +4243,7 @@ csf_show_logs_c() {
 csf_ping_block_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall â€” PING Block (ICMP_IN)"
+  echo " CSF Firewall — PING Block (ICMP_IN)"
   echo "======================================================="
   csf_require_install || return 1
   local current current_rate
@@ -4282,7 +4282,7 @@ csf_ping_block_c() {
 csf_uninstall_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall â€” Uninstall"
+  echo " CSF Firewall — Uninstall"
   echo "======================================================="
   csf_require_install || return 1
   read -rp "Uninstall CSF completely? [y/N]: " c
@@ -4310,7 +4310,7 @@ csf_lfd_ssh_mgmt_c() {
   while true; do
     clear
     echo "======================================================="
-    echo " CSF â€” LFD SSH Brute-Force Settings"
+    echo " CSF — LFD SSH Brute-Force Settings"
     echo "======================================================="
 
     # Read current values
@@ -4358,9 +4358,9 @@ csf_lfd_ssh_mgmt_c() {
       2)
         echo
         echo " Block mode:"
-        echo "   1) Permanent  â€” blocked IP never auto-unblocked"
-        echo "   2) Temporary  â€” blocked IP unblocked after LF_TEMP_BLOCK seconds"
-        echo "   3) Both       â€” block permanently AND add temporary rule"
+        echo "   1) Permanent  — blocked IP never auto-unblocked"
+        echo "   2) Temporary  — blocked IP unblocked after LF_TEMP_BLOCK seconds"
+        echo "   3) Both       — block permanently AND add temporary rule"
         read -rp " Choose: " bm
         case "$bm" in
           1)
@@ -4436,7 +4436,7 @@ csf_menu() {
     echo "======================================================="
     echo " 1)  Install CSF"
     echo " 2)  Start / Stop / Reload"
-    echo " 3)  Port Management (TCP/UDP Â· IN/OUT)"
+    echo " 3)  Port Management (TCP/UDP · IN/OUT)"
     echo " 4)  Block IP   (add to deny list)"
     echo " 5)  Unblock IP (remove from deny list)"
     echo " 6)  Allow IP   (whitelist)"
@@ -4444,7 +4444,7 @@ csf_menu() {
     echo " 8)  Show firewall rules"
     echo " 9)  Show LFD logs"
     echo " 10) PING block (ICMP_IN)"
-    echo " 11) LFD â€” SSH Brute-Force Settings"
+    echo " 11) LFD — SSH Brute-Force Settings"
     echo " 12) Uninstall CSF"
     echo " 0)  Back"
     echo "======================================================="
@@ -4510,7 +4510,7 @@ gost_ensure_bin_m() {
 gost_create_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel â€” Create New"
+  echo " GOST Multi-Tunnel — Create New"
   echo "======================================================="
   echo " Forwards this-server:PORT -> destination:PORT (same port)"
   echo "======================================================="
@@ -4607,7 +4607,7 @@ EOF
 gost_list_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel â€” List"
+  echo " GOST Multi-Tunnel — List"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4632,7 +4632,7 @@ gost_list_m() {
 gost_delete_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel â€” Delete"
+  echo " GOST Multi-Tunnel — Delete"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4662,7 +4662,7 @@ gost_delete_m() {
 gost_status_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel â€” Status / Logs"
+  echo " GOST Multi-Tunnel — Status / Logs"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4699,7 +4699,7 @@ gost_status_m() {
 gost_restart_all_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel â€” Restart ALL"
+  echo " GOST Multi-Tunnel — Restart ALL"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4716,7 +4716,7 @@ gost_restart_all_m() {
 gost_uninstall_all_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel â€” Uninstall ALL"
+  echo " GOST Multi-Tunnel — Uninstall ALL"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4738,7 +4738,7 @@ gost_uninstall_all_m() {
 gost_auto_clear_cache_m() {
   clear
   echo "======================================================="
-  echo " GOST â€” Auto Clear Cache"
+  echo " GOST — Auto Clear Cache"
   echo "======================================================="
   echo " 1) Enable Auto Clear Cache"
   echo " 2) Disable Auto Clear Cache"
@@ -4774,7 +4774,7 @@ gost_multi_menu() {
     echo "======================================================="
     echo " Forward this-server:PORT -> destination:PORT (same port)"
     echo " Each tunnel is its own systemd service (gostm_<name>)"
-    echo " Supports TCP / UDP / gRPC Â· IPv4 and IPv6"
+    echo " Supports TCP / UDP / gRPC · IPv4 and IPv6"
     echo "======================================================="
     echo " 1) Create tunnel"
     echo " 2) List tunnels"
@@ -5095,7 +5095,7 @@ gtun_make_link() {
 gtun_setup_kharej() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel â€” Kharej (Exit) Setup"
+  echo " GECKO Relay Tunnel — Kharej (Exit) Setup"
   echo "======================================================="
   echo "This server will be the EXIT node."
   echo "Run setup on Iran (entry) after this completes."
@@ -5192,7 +5192,7 @@ gtun_setup_kharej() {
 gtun_setup_iran() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel â€” Iran (Entry) Setup"
+  echo " GECKO Relay Tunnel — Iran (Entry) Setup"
   echo "======================================================="
   echo "This server will be the ENTRY node."
   echo "You need the hy2://... link from the Kharej setup."
@@ -5217,7 +5217,7 @@ gtun_setup_iran() {
   local link
   read -rp "Paste hy2://... link from Kharej: " link
   if [[ ! "$link" =~ ^hy2:// ]]; then
-    echo "Invalid link â€” must start with hy2://"; rm -rf "$(gtun_idir "$name")"; return 1
+    echo "Invalid link — must start with hy2://"; rm -rf "$(gtun_idir "$name")"; return 1
   fi
 
   # Parse link: hy2://AUTH@IP:PORT?sni=...&obfs=gecko&obfs-password=...
@@ -5336,7 +5336,7 @@ gtun_pick() {
 gtun_show_status() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel â€” Status"
+  echo " GECKO Relay Tunnel — Status"
   echo "======================================================="
   gtun_pick || return 1
   local name="$GTUN_PICKED"
@@ -5360,7 +5360,7 @@ gtun_show_status() {
 gtun_restart_one() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel â€” Restart"
+  echo " GECKO Relay Tunnel — Restart"
   echo "======================================================="
   gtun_pick || return 1
   gtun_start "$GTUN_PICKED"
@@ -5369,7 +5369,7 @@ gtun_restart_one() {
 gtun_restart_all() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel â€” Restart ALL"
+  echo " GECKO Relay Tunnel — Restart ALL"
   echo "======================================================="
   local name any=0
   while IFS= read -r name; do
@@ -5383,7 +5383,7 @@ gtun_restart_all() {
 gtun_show_link() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel â€” Show Link"
+  echo " GECKO Relay Tunnel — Show Link"
   echo "======================================================="
   gtun_pick || return 1
   local name="$GTUN_PICKED"
@@ -5407,7 +5407,7 @@ gtun_show_link() {
 gtun_delete_one() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel â€” Delete"
+  echo " GECKO Relay Tunnel — Delete"
   echo "======================================================="
   gtun_pick || return 1
   local name="$GTUN_PICKED"
@@ -5422,7 +5422,7 @@ gtun_delete_one() {
 gtun_uninstall_all() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel â€” Uninstall ALL"
+  echo " GECKO Relay Tunnel — Uninstall ALL"
   echo "======================================================="
   local names=() name
   while IFS= read -r name; do [ -n "$name" ] && names+=("$name"); done < <(gtun_instances)
@@ -7003,20 +7003,188 @@ xboard_socks_routing_menu() {
   done
 }
 
+# ---- Swap management ----
+GECKO_SWAP_FILE="/swapfile"
+GECKO_SWAP_SYSCTL="/etc/sysctl.d/99-zz-gecko-swap.conf"
+
+gecko_swap_is_active() {
+  swapon --noheadings --raw --output NAME 2>/dev/null | grep -Fxq "$GECKO_SWAP_FILE"
+}
+
+gecko_swap_status() {
+  clear
+  echo "======================================================="
+  echo " GECKO Swap Status"
+  echo "======================================================="
+  free -h
+  echo
+  swapon --show 2>/dev/null || true
+  echo
+  echo "vm.swappiness: $(sysctl -n vm.swappiness 2>/dev/null || echo unknown)"
+  if [ -f "$GECKO_SWAP_FILE" ]; then
+    echo "Managed file : $GECKO_SWAP_FILE ($(du -h "$GECKO_SWAP_FILE" 2>/dev/null | awk '{print $1}'))"
+  else
+    echo "Managed file : not installed"
+  fi
+}
+
+gecko_swap_create() {
+  clear
+  echo "======================================================="
+  echo " Create GECKO Swap File"
+  echo "======================================================="
+  echo "Swap will use vm.swappiness=10, so Linux strongly prefers"
+  echo "physical RAM and uses swap only under heavy memory pressure."
+  echo "======================================================="
+
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
+  command -v mkswap >/dev/null 2>&1 || { echo "mkswap is not installed (package: util-linux)."; return 1; }
+
+  if gecko_swap_is_active; then
+    echo "$GECKO_SWAP_FILE is already active. Remove it from this menu before changing its size."
+    return 1
+  fi
+  if [ -e "$GECKO_SWAP_FILE" ]; then
+    echo "$GECKO_SWAP_FILE already exists but is not an active GECKO swap file."
+    echo "It was not overwritten. Move or remove it manually, then try again."
+    return 1
+  fi
+
+  local size_gb size_bytes available_bytes reserve_bytes backup_fstab=""
+  read -rp "Enter swap size in GB (whole number, e.g. 2): " size_gb
+  if ! [[ "$size_gb" =~ ^[1-9][0-9]*$ ]] || [ "$size_gb" -gt 1024 ]; then
+    echo "Invalid size. Enter a whole number from 1 to 1024 GB."
+    return 1
+  fi
+  size_bytes=$((size_gb * 1024 * 1024 * 1024))
+  available_bytes=$(df --output=avail -B1 / | awk 'NR==2 {print $1}')
+  reserve_bytes=$((512 * 1024 * 1024))
+  if ! [[ "$available_bytes" =~ ^[0-9]+$ ]] || [ "$available_bytes" -lt $((size_bytes + reserve_bytes)) ]; then
+    echo "Not enough free disk space. At least ${size_gb} GB plus 512 MB reserve is required."
+    return 1
+  fi
+
+  echo "Creating ${size_gb} GB swap file..."
+  if ! fallocate -l "${size_gb}G" "$GECKO_SWAP_FILE" 2>/dev/null; then
+    dd if=/dev/zero of="$GECKO_SWAP_FILE" bs=1M count=$((size_gb * 1024)) status=progress || {
+      rm -f "$GECKO_SWAP_FILE"
+      echo "Could not allocate the swap file."
+      return 1
+    }
+  fi
+  chmod 600 "$GECKO_SWAP_FILE"
+  if ! mkswap "$GECKO_SWAP_FILE" >/dev/null || ! swapon "$GECKO_SWAP_FILE"; then
+    swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
+    rm -f "$GECKO_SWAP_FILE"
+    echo "Could not initialize or activate swap. Changes were rolled back."
+    return 1
+  fi
+
+  backup_fstab="/etc/fstab.gecko-swap.$(date +%Y%m%d-%H%M%S).bak"
+  if ! cp -a /etc/fstab "$backup_fstab"; then
+    swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
+    rm -f "$GECKO_SWAP_FILE"
+    echo "Could not back up /etc/fstab. Changes were rolled back."
+    return 1
+  fi
+  if ! grep -Eq '^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap([[:space:]]|$)' /etc/fstab; then
+    if ! printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab; then
+      cp -a "$backup_fstab" /etc/fstab
+      swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
+      rm -f "$GECKO_SWAP_FILE"
+      echo "Could not update /etc/fstab. Changes were rolled back."
+      return 1
+    fi
+  fi
+  if ! cat > "$GECKO_SWAP_SYSCTL" <<'EOF_GECKO_SWAP_SYSCTL'
+# Prefer physical RAM; keep a small safety margin before severe memory pressure.
+vm.swappiness = 10
+EOF_GECKO_SWAP_SYSCTL
+  then
+    cp -a "$backup_fstab" /etc/fstab
+    swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
+    rm -f "$GECKO_SWAP_FILE" "$GECKO_SWAP_SYSCTL"
+    echo "Could not save the swappiness setting. Changes were rolled back."
+    return 1
+  fi
+  if ! sysctl -w vm.swappiness=10 >/dev/null; then
+    cp -a "$backup_fstab" /etc/fstab
+    swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
+    rm -f "$GECKO_SWAP_FILE" "$GECKO_SWAP_SYSCTL"
+    echo "Could not apply swappiness. Changes were rolled back."
+    return 1
+  fi
+
+  echo "Swap created and enabled successfully."
+  echo "Size          : ${size_gb} GB"
+  echo "Swappiness    : 10"
+  echo "fstab backup  : $backup_fstab"
+}
+
+gecko_swap_remove() {
+  clear
+  echo "======================================================="
+  echo " Remove GECKO Swap File"
+  echo "======================================================="
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
+  [ -e "$GECKO_SWAP_FILE" ] || { echo "GECKO swap file is not installed."; return 0; }
+  read -rp "Disable and remove $GECKO_SWAP_FILE? [y/N]: " confirm
+  case "$confirm" in y|Y|yes|YES|Yes) ;; *) echo "Cancelled."; return 0 ;; esac
+
+  if gecko_swap_is_active && ! swapoff "$GECKO_SWAP_FILE"; then
+    echo "Swap could not be disabled, usually because RAM is insufficient. Nothing was removed."
+    return 1
+  fi
+  local remove_backup
+  remove_backup="/etc/fstab.gecko-swap-remove.$(date +%Y%m%d-%H%M%S).bak"
+  if ! cp -a /etc/fstab "$remove_backup" ||
+     ! sed -Ei '\#^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap([[:space:]]|$)#d' /etc/fstab; then
+    [ -f "$remove_backup" ] && cp -a "$remove_backup" /etc/fstab
+    swapon "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
+    echo "Could not update /etc/fstab. The swap file was not removed."
+    return 1
+  fi
+  rm -f "$GECKO_SWAP_FILE" "$GECKO_SWAP_SYSCTL"
+  sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+  echo "GECKO swap file was removed."
+}
+
+gecko_swap_menu() {
+  while true; do
+    clear
+    echo "======================================================="
+    echo " GECKO Swap RAM Menu"
+    echo "======================================================="
+    echo " 1) Create swap with a custom size"
+    echo " 2) Show swap and memory status"
+    echo " 3) Remove GECKO swap"
+    echo " 0) Back"
+    echo "======================================================="
+    read -rp "Choose: " GECKO_SWAP_CHOICE
+    case "$GECKO_SWAP_CHOICE" in
+      1) gecko_swap_create; read -rp "Press Enter to return to menu..." ;;
+      2) gecko_swap_status; read -rp "Press Enter to return to menu..." ;;
+      3) gecko_swap_remove; read -rp "Press Enter to return to menu..." ;;
+      0) return ;;
+      *) echo "Invalid choice."; sleep 1 ;;
+    esac
+  done
+}
+
 if ! gecko_apply_log_protection; then
   echo "WARNING: GECKO could not fully apply log cleanup and error-only Hysteria logging." >&2
 fi
 
 while true; do
   echo "
-â•­â”â”â”â•®â•±â•±â•±â•±â•±â•±â•±â•±â•±â•­â”â”â•®â•±â•±â•±â•±â•±â•±â•±â•­â”â”â”â•®â•±â•±â•±â•±â•±â•­â”â•®â•±â•±â•±â•±â•­â”â”â•®â•±â•±â•±â•±â•±â•­â•®â•±â•±â•±â•­â•®â•­â•®
-â”ƒâ•­â”â•®â”ƒâ•±â•±â•±â•±â•±â•±â•±â•±â•±â”ƒâ•­â•®â”ƒâ•±â•±â•±â•±â•±â•±â•±â”ƒâ•­â”â•®â”ƒâ•±â•±â•±â•±â•±â”ƒâ•­â•¯â•±â•±â•±â•±â•°â”«â”£â•¯â•±â•±â•±â•±â•­â•¯â•°â•®â•±â•±â”ƒâ”ƒâ”ƒâ”ƒ
-â”ƒâ•°â”â”â”³â”³â”â•®â•­â”â”â•®â•±â•±â”ƒâ•°â•¯â•°â”³â”â”â”³â•®â•­â•®â”ƒâ”ƒâ•±â•°â•‹â”â”â”³â”â”³â•¯â•°â”³â”³â”â”â•®â•±â”ƒâ”ƒâ•­â”â•®â•­â”â”»â•®â•­â•‹â”â”â”«â”ƒâ”ƒâ”ƒâ•­â”â”â”³â”â•®
-â•°â”â”â•®â”£â”«â•­â•®â”«â•­â•®â”£â”â”â”«â•­â”â•®â”ƒâ•­â•®â”£â•‹â•‹â•¯â”ƒâ”ƒâ•±â•­â”«â•­â•®â”ƒâ•­â•‹â•®â•­â•‹â”«â•­â•®â”ƒâ•±â”ƒâ”ƒâ”ƒâ•­â•®â”«â”â”â”«â”ƒâ”ƒâ•­â•®â”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ”â”«â•­â•¯
-â”ƒâ•°â”â•¯â”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ•°â•¯â”£â”â”â”«â•°â”â•¯â”ƒâ•°â•¯â”£â•‹â•‹â•®â”ƒâ•°â”â•¯â”ƒâ•°â•¯â”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ•°â•¯â”ƒâ•­â”«â”£â”«â”ƒâ”ƒâ”£â”â”â”ƒâ•°â”«â•­â•®â”ƒâ•°â”«â•°â”«â”ƒâ”â”«â”ƒ
-â•°â”â”â”â”»â”»â•¯â•°â”»â”â•®â”ƒâ•±â•±â•°â”â”â”â”»â”â”â”»â•¯â•°â•¯â•°â”â”â”â”»â”â”â”»â•¯â•°â”»â•¯â•°â”»â”â•®â”ƒâ•°â”â”â”»â•¯â•°â”»â”â”â”»â”â”»â•¯â•°â”»â”â”»â”â”»â”â”â”»â•¯
-â•±â•±â•±â•±â•±â•±â•±â•±â•­â”â•¯â”ƒâ•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•­â”â•¯â”ƒ
-â•±â•±â•±â•±â•±â•±â•±â•±â•°â”â”â•¯â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•°â”â”â•¯V6.1.0"
+╭━━━╮╱╱╱╱╱╱╱╱╱╭━━╮╱╱╱╱╱╱╱╭━━━╮╱╱╱╱╱╭━╮╱╱╱╱╭━━╮╱╱╱╱╱╭╮╱╱╱╭╮╭╮
+┃╭━╮┃╱╱╱╱╱╱╱╱╱┃╭╮┃╱╱╱╱╱╱╱┃╭━╮┃╱╱╱╱╱┃╭╯╱╱╱╱╰┫┣╯╱╱╱╱╭╯╰╮╱╱┃┃┃┃
+┃╰━━┳┳━╮╭━━╮╱╱┃╰╯╰┳━━┳╮╭╮┃┃╱╰╋━━┳━┳╯╰┳┳━━╮╱┃┃╭━╮╭━┻╮╭╋━━┫┃┃┃╭━━┳━╮
+╰━━╮┣┫╭╮┫╭╮┣━━┫╭━╮┃╭╮┣╋╋╯┃┃╱╭┫╭╮┃╭╋╮╭╋┫╭╮┃╱┃┃┃╭╮┫━━┫┃┃╭╮┃┃┃┃┃┃━┫╭╯
+┃╰━╯┃┃┃┃┃╰╯┣━━┫╰━╯┃╰╯┣╋╋╮┃╰━╯┃╰╯┃┃┃┃┃┃┃╰╯┃╭┫┣┫┃┃┣━━┃╰┫╭╮┃╰┫╰┫┃━┫┃
+╰━━━┻┻╯╰┻━╮┃╱╱╰━━━┻━━┻╯╰╯╰━━━┻━━┻╯╰┻╯╰┻━╮┃╰━━┻╯╰┻━━┻━┻╯╰┻━┻━┻━━┻╯
+╱╱╱╱╱╱╱╱╭━╯┃╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╭━╯┃
+╱╱╱╱╱╱╱╱╰━━╯╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╰━━╯V6.1.0"
 
   echo "By theTCS"
 
@@ -7045,9 +7213,9 @@ while true; do
   echo
 
   echo "
-â–’â–ˆâ–€â–€â–€â–ˆ â–ˆâ–€â–€ â–ˆâ–‘â–‘ â–ˆâ–€â–€ â–ˆâ–€â–€ â–€â–€â–ˆâ–€â–€ ã€€ â–ˆâ–€â–„â–€â–ˆ â–ˆâ–€â–€ â–ˆâ–€â–€â–„ â–ˆâ–‘â–‘â–ˆ ã€€ â–„ 
-â–‘â–€â–€â–€â–„â–„ â–ˆâ–€â–€ â–ˆâ–‘â–‘ â–ˆâ–€â–€ â–ˆâ–‘â–‘ â–‘â–‘â–ˆâ–‘â–‘ ã€€ â–ˆâ–‘â–€â–‘â–ˆ â–ˆâ–€â–€ â–ˆâ–‘â–‘â–ˆ â–ˆâ–‘â–‘â–ˆ ã€€ â–‘ 
-â–’â–ˆâ–„â–„â–„â–ˆ â–€â–€â–€ â–€â–€â–€ â–€â–€â–€ â–€â–€â–€ â–‘â–‘â–€â–‘â–‘ ã€€ â–€â–‘â–‘â–‘â–€ â–€â–€â–€ â–€â–‘â–‘â–€ â–‘â–€â–€â–€ ã€€ â–€"
+▒█▀▀▀█ █▀▀ █░░ █▀▀ █▀▀ ▀▀█▀▀ 　 █▀▄▀█ █▀▀ █▀▀▄ █░░█ 　 ▄ 
+░▀▀▀▄▄ █▀▀ █░░ █▀▀ █░░ ░░█░░ 　 █░▀░█ █▀▀ █░░█ █░░█ 　 ░ 
+▒█▄▄▄█ ▀▀▀ ▀▀▀ ▀▀▀ ▀▀▀ ░░▀░░ 　 ▀░░░▀ ▀▀▀ ▀░░▀ ░▀▀▀ 　 ▀"
 
   echo
 
@@ -7063,6 +7231,7 @@ while true; do
   echo -e "8)  \e[93mGOST Multi-Tunnel Menu\e[0m"
   echo -e "9)  \e[91mCSF Firewall Menu\e[0m"
   echo -e "10) \e[96mXboard ISP Dedicated Proxies Local Bridge Menu\e[0m"
+  echo -e "11) \e[92mSwap RAM Management (custom size, RAM-first)\e[0m"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -7131,6 +7300,10 @@ while true; do
   10)
     clear
     xboard_socks_routing_menu
+    ;;
+  11)
+    clear
+    gecko_swap_menu
     ;;
   0)
     clear
