@@ -7010,9 +7010,98 @@ MIERU_META="$MIERU_DIR/meta.json"
 MIERU_CLIENT_DIR="$MIERU_DIR/clients"
 MIERU_BINARY="/usr/bin/MI"
 MIERU_SERVICE="MI.service"
+MIERU_OFFICIAL_TRAFFIC_PATTERN="GgQIARAK"
 
 mieru_installed() {
   [[ -x "$MIERU_BINARY" && -s "$MIERU_CONFIG" && -f "/etc/systemd/system/$MIERU_SERVICE" ]]
+}
+
+# Mieru only needs normal OS tools. Do not call the upstream check_dep here:
+# it installs Python modules with pip and fails on PEP 668 protected systems.
+mieru_check_dependencies() {
+  local command_name missing="false"
+  local required_commands=(curl jq tar sha256sum find sort awk grep base64 install systemctl ss)
+  for command_name in "${required_commands[@]}"; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      missing="true"
+      break
+    fi
+  done
+  [[ "$missing" == "false" ]] && return 0
+
+  echo "Installing Mieru system dependencies (Python/pip is not used)..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      ca-certificates coreutils curl findutils gawk grep iproute2 jq tar
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y ca-certificates coreutils curl findutils gawk grep iproute jq tar
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y ca-certificates coreutils curl findutils gawk grep iproute jq tar
+  else
+    echo "Unsupported package manager. Install curl, jq, tar, coreutils, findutils and iproute2 manually."
+    return 1
+  fi
+
+  for command_name in "${required_commands[@]}"; do
+    command -v "$command_name" >/dev/null 2>&1 || {
+      echo "Required command is still missing: $command_name"
+      return 1
+    }
+  done
+}
+
+mieru_traffic_pattern_valid() {
+  local value="$1"
+  [[ -z "$value" ]] && return 0
+  [[ "$value" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+  printf '%s' "$value" | base64 -d >/dev/null 2>&1
+}
+
+mieru_prompt_multiplexing() {
+  local current="${1:-MULTIPLEXING_LOW}" choice
+  echo "Multiplexing:"
+  echo " 1) LOW (recommended)"
+  echo " 2) DEFAULT"
+  echo " 3) OFF"
+  echo " 4) MIDDLE"
+  echo " 5) HIGH"
+  read -rp "Choose [1-5] (Enter keeps $current): " choice
+  case "${choice:-keep}" in
+    keep) MIERU_SELECTED_MULTIPLEXING="$current" ;;
+    1) MIERU_SELECTED_MULTIPLEXING="MULTIPLEXING_LOW" ;;
+    2) MIERU_SELECTED_MULTIPLEXING="MULTIPLEXING_DEFAULT" ;;
+    3) MIERU_SELECTED_MULTIPLEXING="MULTIPLEXING_OFF" ;;
+    4) MIERU_SELECTED_MULTIPLEXING="MULTIPLEXING_MIDDLE" ;;
+    5) MIERU_SELECTED_MULTIPLEXING="MULTIPLEXING_HIGH" ;;
+    *) echo "Invalid Multiplexing choice."; return 1 ;;
+  esac
+}
+
+mieru_prompt_traffic_pattern() {
+  local current="${1:-}" choice custom current_label
+  if [[ -z "$current" ]]; then
+    current_label="core default"
+  elif [[ "$current" == "$MIERU_OFFICIAL_TRAFFIC_PATTERN" ]]; then
+    current_label="official example"
+  else
+    current_label="custom"
+  fi
+  echo "Traffic Pattern (applied to the server and generated clients):"
+  echo " 1) Core default / no custom pattern (recommended)"
+  echo " 2) Official sing-box-extended example"
+  echo " 3) Custom encoded Base64 pattern"
+  read -rp "Choose [1-3] (Enter keeps $current_label): " choice
+  case "${choice:-keep}" in
+    keep) MIERU_SELECTED_TRAFFIC_PATTERN="$current" ;;
+    1) MIERU_SELECTED_TRAFFIC_PATTERN="" ;;
+    2) MIERU_SELECTED_TRAFFIC_PATTERN="$MIERU_OFFICIAL_TRAFFIC_PATTERN" ;;
+    3)
+      read -rp "Encoded Traffic Pattern Base64: " custom
+      mieru_traffic_pattern_valid "$custom" || { echo "Invalid Base64 Traffic Pattern."; return 1; }
+      MIERU_SELECTED_TRAFFIC_PATTERN="$custom"
+      ;;
+    *) echo "Invalid Traffic Pattern choice."; return 1 ;;
+  esac
 }
 
 mieru_port_spec_valid() {
@@ -7054,39 +7143,47 @@ mieru_csf_port() {
 }
 
 mieru_write_server_config() {
-  local transport="$1" spec="$2" users_json="$3" first tmp
+  local transport="$1" spec="$2" users_json="$3" traffic_pattern="${4:-}" first tmp
   first="$(mieru_first_port "$spec")"; tmp="$(mktemp /tmp/mieru-server.XXXXXX)" || return 1
   if [[ "$spec" == *-* ]]; then
-    jq -n --arg transport "$transport" --argjson port "$first" --arg range "$spec" --argjson users "$users_json" '
-      {log:{level:"error"},inbounds:[{type:"mieru",tag:"mieru-in",listen:"::",listen_port:$port,listen_ports:[$range],transport:$transport,users:$users}],outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}' >"$tmp"
+    jq -n --arg transport "$transport" --argjson port "$first" --arg range "$spec" --argjson users "$users_json" --arg pattern "$traffic_pattern" '
+      {log:{level:"error"},inbounds:[{type:"mieru",tag:"mieru-in",listen:"::",listen_port:$port,listen_ports:[$range],transport:$transport,users:$users}],outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}
+      | if $pattern == "" then . else .inbounds[0].traffic_pattern = $pattern end' >"$tmp"
   else
-    jq -n --arg transport "$transport" --argjson port "$first" --argjson users "$users_json" '
-      {log:{level:"error"},inbounds:[{type:"mieru",tag:"mieru-in",listen:"::",listen_port:$port,transport:$transport,users:$users}],outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}' >"$tmp"
+    jq -n --arg transport "$transport" --argjson port "$first" --argjson users "$users_json" --arg pattern "$traffic_pattern" '
+      {log:{level:"error"},inbounds:[{type:"mieru",tag:"mieru-in",listen:"::",listen_port:$port,transport:$transport,users:$users}],outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}
+      | if $pattern == "" then . else .inbounds[0].traffic_pattern = $pattern end' >"$tmp"
   fi
   "$MIERU_BINARY" check -c "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
   install -m 0600 "$tmp" "$MIERU_CONFIG"; local status=$?; rm -f "$tmp"; return "$status"
 }
 
 mieru_write_meta() {
-  local address="$1" transport="$2" spec="$3" tmp
+  local address="$1" transport="$2" spec="$3" multiplexing="${4:-MULTIPLEXING_LOW}"
+  local traffic_pattern="${5:-}" remark="${6:-Mieru}" tmp
   tmp="$(mktemp /tmp/mieru-meta.XXXXXX)" || return 1
   jq -n --arg address "$address" --arg transport "$transport" --arg ports "$spec" \
-    '{address:$address,transport:$transport,ports:$ports,multiplexing:"MULTIPLEXING_LOW"}' >"$tmp" &&
+    --arg multiplexing "$multiplexing" --arg traffic_pattern "$traffic_pattern" --arg remark "$remark" \
+    '{address:$address,transport:$transport,ports:$ports,multiplexing:$multiplexing,traffic_pattern:$traffic_pattern,remark:$remark}' >"$tmp" &&
     install -m 0600 "$tmp" "$MIERU_META"
   local status=$?; rm -f "$tmp"; return "$status"
 }
 
 mieru_make_client() {
-  local username="$1" password="$2" address transport spec first file
+  local username="$1" password="$2" address transport spec first file multiplexing traffic_pattern
   address="$(jq -r '.address' "$MIERU_META")"; transport="$(jq -r '.transport' "$MIERU_META")"
   spec="$(jq -r '.ports' "$MIERU_META")"; first="$(mieru_first_port "$spec")"
+  multiplexing="$(jq -r '.multiplexing // "MULTIPLEXING_LOW"' "$MIERU_META")"
+  traffic_pattern="$(jq -r '.traffic_pattern // ""' "$MIERU_META")"
   file="$MIERU_CLIENT_DIR/${username}.json"
   if [[ "$spec" == *-* ]]; then
-    jq -n --arg address "$address" --arg transport "$transport" --argjson port "$first" --arg range "$spec" --arg user "$username" --arg pass "$password" '
-      {log:{level:"error"},dns:{servers:[{type:"local",tag:"default"}]},inbounds:[{type:"mixed",tag:"mixed-in",listen:"127.0.0.1",listen_port:7897}],outbounds:[{type:"direct",tag:"direct"},{type:"mieru",tag:"mieru-out",server:$address,server_port:$port,server_ports:[$range],transport:$transport,username:$user,password:$pass,multiplexing:"MULTIPLEXING_LOW"}],route:{final:"mieru-out",default_domain_resolver:"default",auto_detect_interface:true}}' >"$file"
+    jq -n --arg address "$address" --arg transport "$transport" --argjson port "$first" --arg range "$spec" --arg user "$username" --arg pass "$password" --arg multiplexing "$multiplexing" --arg pattern "$traffic_pattern" '
+      {log:{level:"error"},dns:{servers:[{type:"local",tag:"default"}]},inbounds:[{type:"mixed",tag:"mixed-in",listen:"127.0.0.1",listen_port:7897}],outbounds:[{type:"direct",tag:"direct"},{type:"mieru",tag:"mieru-out",server:$address,server_port:$port,server_ports:[$range],transport:$transport,username:$user,password:$pass,multiplexing:$multiplexing}],route:{final:"mieru-out",default_domain_resolver:"default",auto_detect_interface:true}}
+      | if $pattern == "" then . else .outbounds[1].traffic_pattern = $pattern end' >"$file"
   else
-    jq -n --arg address "$address" --arg transport "$transport" --argjson port "$first" --arg user "$username" --arg pass "$password" '
-      {log:{level:"error"},dns:{servers:[{type:"local",tag:"default"}]},inbounds:[{type:"mixed",tag:"mixed-in",listen:"127.0.0.1",listen_port:7897}],outbounds:[{type:"direct",tag:"direct"},{type:"mieru",tag:"mieru-out",server:$address,server_port:$port,transport:$transport,username:$user,password:$pass,multiplexing:"MULTIPLEXING_LOW"}],route:{final:"mieru-out",default_domain_resolver:"default",auto_detect_interface:true}}' >"$file"
+    jq -n --arg address "$address" --arg transport "$transport" --argjson port "$first" --arg user "$username" --arg pass "$password" --arg multiplexing "$multiplexing" --arg pattern "$traffic_pattern" '
+      {log:{level:"error"},dns:{servers:[{type:"local",tag:"default"}]},inbounds:[{type:"mixed",tag:"mixed-in",listen:"127.0.0.1",listen_port:7897}],outbounds:[{type:"direct",tag:"direct"},{type:"mieru",tag:"mieru-out",server:$address,server_port:$port,transport:$transport,username:$user,password:$pass,multiplexing:$multiplexing}],route:{final:"mieru-out",default_domain_resolver:"default",auto_detect_interface:true}}
+      | if $pattern == "" then . else .outbounds[1].traffic_pattern = $pattern end' >"$file"
   fi
   chmod 600 "$file" && "$MIERU_BINARY" check -c "$file" >/dev/null 2>&1
 }
@@ -7099,6 +7196,24 @@ mieru_regenerate_clients() {
     pass="$(printf '%s' "$encoded" | base64 -d | jq -r '.password')"
     mieru_make_client "$name" "$pass" || return 1
   done < <(jq -r '.inbounds[0].users[] | @base64' "$MIERU_CONFIG")
+}
+
+mieru_print_client() {
+  local name="$1" file remark
+  file="$MIERU_CLIENT_DIR/$name.json"
+  [[ -f "$file" ]] || { echo "Client configuration was not found: $file"; return 1; }
+  remark="$(jq -r '.remark // "Mieru"' "$MIERU_META")"
+  echo
+  echo "======================================================="
+  echo " Mieru client configuration"
+  echo "======================================================="
+  echo "Remark: $remark"
+  echo "Saved:  $file"
+  echo "--- client.json ---"
+  jq . "$file"
+  echo "--- Base64 ---"
+  base64 -w0 "$file"; echo
+  echo "Linux: MI run -c $name.json"
 }
 
 mieru_install_service() {
@@ -7133,10 +7248,10 @@ EOF_MIERU_SERVICE
 }
 
 mieru_install() {
-  local address transport spec username password users
+  local address transport spec username password users multiplexing traffic_pattern remark
   [[ "$(id -u)" -eq 0 ]] || { echo "Please run as root."; return 1; }
   mieru_installed && { echo "Mieru is already installed. Use the management options to change it."; return 1; }
-  check_dep
+  mieru_check_dependencies || return 1
   read -rp "Server IP or domain: " address
   [[ "$address" =~ ^[A-Za-z0-9._:-]+$ ]] || { echo "Invalid server address."; return 1; }
   read -rp "Transport [TCP/UDP] (default TCP): " transport; transport="${transport:-TCP}"; transport="${transport^^}"
@@ -7148,25 +7263,35 @@ mieru_install() {
   [[ "$username" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || { echo "Invalid username."; return 1; }
   read -rsp "Password (minimum 8 characters): " password; echo
   ((${#password} >= 8)) || { echo "Password is too short."; return 1; }
+  mieru_prompt_multiplexing "MULTIPLEXING_LOW" || return 1
+  multiplexing="$MIERU_SELECTED_MULTIPLEXING"
+  mieru_prompt_traffic_pattern "" || return 1
+  traffic_pattern="$MIERU_SELECTED_TRAFFIC_PATTERN"
+  read -rp "Remark (default Mieru-$username): " remark; remark="${remark:-Mieru-$username}"
+  ((${#remark} <= 100)) || { echo "Remark is too long (maximum 100 characters)."; return 1; }
 
   install_core MI || return 1
   install -d -m 0700 "$MIERU_DIR" "$MIERU_CLIENT_DIR" || return 1
   users="$(jq -n --arg n "$username" --arg p "$password" '[{name:$n,password:$p}]')"
-  mieru_write_server_config "$transport" "$spec" "$users" || { echo "Mieru configuration validation failed."; return 1; }
-  mieru_write_meta "$address" "$transport" "$spec" || return 1
+  mieru_write_server_config "$transport" "$spec" "$users" "$traffic_pattern" || { echo "Mieru configuration validation failed."; return 1; }
+  mieru_write_meta "$address" "$transport" "$spec" "$multiplexing" "$traffic_pattern" "$remark" || return 1
   mieru_regenerate_clients || return 1
   mieru_install_service || return 1
   systemctl daemon-reload && systemctl enable --now "$MIERU_SERVICE" || { echo "Mieru failed to start."; return 1; }
   sleep 1
   systemctl is-active --quiet "$MIERU_SERVICE" || { journalctl -u "$MIERU_SERVICE" -n 20 --no-pager; return 1; }
   mieru_csf_port add "$transport" "$spec"
-  echo "Mieru installed successfully. Client: $MIERU_CLIENT_DIR/$username.json"
+  echo "Mieru installed successfully."
+  echo "Service: active"
+  echo "Listening: $transport $spec"
+  mieru_print_client "$username"
 }
 
 mieru_apply_users() {
-  local users="$1" backup
+  local users="$1" backup traffic_pattern
   backup="$(mktemp /tmp/mieru-config-backup.XXXXXX)" || return 1; cp -a "$MIERU_CONFIG" "$backup" || return 1
-  if ! mieru_write_server_config "$(jq -r '.transport' "$MIERU_META")" "$(jq -r '.ports' "$MIERU_META")" "$users" ||
+  traffic_pattern="$(jq -r '.traffic_pattern // ""' "$MIERU_META")"
+  if ! mieru_write_server_config "$(jq -r '.transport' "$MIERU_META")" "$(jq -r '.ports' "$MIERU_META")" "$users" "$traffic_pattern" ||
      ! systemctl restart "$MIERU_SERVICE" || ! systemctl is-active --quiet "$MIERU_SERVICE"; then
     cp -a "$backup" "$MIERU_CONFIG"; systemctl restart "$MIERU_SERVICE" >/dev/null 2>&1 || true; rm -f "$backup"; return 1
   fi
@@ -7194,33 +7319,49 @@ mieru_remove_user() {
 }
 
 mieru_show_clients() {
-  local name file
+  local name
   mieru_installed || { echo "Mieru is not installed."; return 1; }
   mieru_regenerate_clients || return 1
   jq -r '.inbounds[0].users[].name' "$MIERU_CONFIG"; read -rp "Username: " name
-  file="$MIERU_CLIENT_DIR/$name.json"; [[ -f "$file" ]] || { echo "User not found."; return 1; }
-  echo "--- client.json ---"; jq . "$file"; echo "--- Base64 ---"; base64 -w0 "$file"; echo; echo "Linux: MI run -c $name.json"
+  [[ -f "$MIERU_CLIENT_DIR/$name.json" ]] || { echo "User not found."; return 1; }
+  mieru_print_client "$name"
 }
 
 mieru_change_connection() {
   local old_transport old_spec transport spec users address new_address backup_config backup_meta
+  local old_multiplexing multiplexing old_traffic_pattern traffic_pattern old_remark remark new_remark
   mieru_installed || { echo "Mieru is not installed."; return 1; }
   old_transport="$(jq -r '.transport' "$MIERU_META")"; old_spec="$(jq -r '.ports' "$MIERU_META")"
+  old_multiplexing="$(jq -r '.multiplexing // "MULTIPLEXING_LOW"' "$MIERU_META")"
+  old_traffic_pattern="$(jq -r '.traffic_pattern // ""' "$MIERU_META")"
+  old_remark="$(jq -r '.remark // "Mieru"' "$MIERU_META")"
   read -rp "Transport [TCP/UDP] (current $old_transport): " transport; transport="${transport:-$old_transport}"; transport="${transport^^}"
   [[ "$transport" == TCP || "$transport" == UDP ]] || { echo "Invalid transport."; return 1; }
   read -rp "Port/range (current $old_spec): " spec; spec="${spec:-$old_spec}"; mieru_port_spec_valid "$spec" || { echo "Invalid port/range."; return 1; }
   address="$(jq -r '.address' "$MIERU_META")"; read -rp "Server IP/domain for client configs (current $address): " new_address; address="${new_address:-$address}"
   [[ "$address" =~ ^[A-Za-z0-9._:-]+$ ]] || { echo "Invalid server address."; return 1; }
+  mieru_prompt_multiplexing "$old_multiplexing" || return 1
+  multiplexing="$MIERU_SELECTED_MULTIPLEXING"
+  mieru_prompt_traffic_pattern "$old_traffic_pattern" || return 1
+  traffic_pattern="$MIERU_SELECTED_TRAFFIC_PATTERN"
+  read -rp "Remark (current $old_remark): " new_remark; remark="${new_remark:-$old_remark}"
+  ((${#remark} <= 100)) || { echo "Remark is too long (maximum 100 characters)."; return 1; }
   if [[ "$spec" != "$old_spec" || "$transport" != "$old_transport" ]]; then
     systemctl stop "$MIERU_SERVICE" || return 1
     if mieru_port_busy "$spec" "$transport"; then systemctl start "$MIERU_SERVICE" >/dev/null 2>&1 || true; echo "At least one selected port is already in use."; return 1; fi
   fi
   users="$(jq '.inbounds[0].users' "$MIERU_CONFIG")"
   backup_config="$(mktemp /tmp/mieru-config.XXXXXX)"; backup_meta="$(mktemp /tmp/mieru-meta.XXXXXX)"; cp -a "$MIERU_CONFIG" "$backup_config"; cp -a "$MIERU_META" "$backup_meta"
-  if ! mieru_write_server_config "$transport" "$spec" "$users" || ! mieru_write_meta "$address" "$transport" "$spec" || ! systemctl restart "$MIERU_SERVICE"; then
-    cp -a "$backup_config" "$MIERU_CONFIG"; cp -a "$backup_meta" "$MIERU_META"; systemctl restart "$MIERU_SERVICE" >/dev/null 2>&1 || true; rm -f "$backup_config" "$backup_meta"; echo "Change failed; rolled back."; return 1
+  if ! mieru_write_server_config "$transport" "$spec" "$users" "$traffic_pattern" ||
+     ! mieru_write_meta "$address" "$transport" "$spec" "$multiplexing" "$traffic_pattern" "$remark" ||
+     ! mieru_regenerate_clients || ! systemctl restart "$MIERU_SERVICE" ||
+     ! systemctl is-active --quiet "$MIERU_SERVICE"; then
+    cp -a "$backup_config" "$MIERU_CONFIG"; cp -a "$backup_meta" "$MIERU_META"
+    mieru_regenerate_clients >/dev/null 2>&1 || true
+    systemctl restart "$MIERU_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$backup_config" "$backup_meta"; echo "Change failed; rolled back."; return 1
   fi
-  rm -f "$backup_config" "$backup_meta"; mieru_regenerate_clients; mieru_csf_port remove "$old_transport" "$old_spec"; mieru_csf_port add "$transport" "$spec"; echo "Connection settings updated."
+  rm -f "$backup_config" "$backup_meta"; mieru_csf_port remove "$old_transport" "$old_spec"; mieru_csf_port add "$transport" "$spec"; echo "Connection and client settings updated."
 }
 
 mieru_update_core() {
@@ -7238,6 +7379,9 @@ mieru_status() {
   if mieru_installed; then
     systemctl --no-pager --full status "$MIERU_SERVICE" 2>/dev/null | head -15
     echo "Core: $($MIERU_BINARY version 2>/dev/null | head -1)"; echo "Transport/ports: $(jq -r '.transport+" / "+.ports' "$MIERU_META")"
+    echo "Multiplexing: $(jq -r '.multiplexing // "MULTIPLEXING_LOW"' "$MIERU_META")"
+    echo "Traffic Pattern: $(jq -r 'if (.traffic_pattern // "") == "" then "core default" else .traffic_pattern end' "$MIERU_META")"
+    echo "Remark: $(jq -r '.remark // "Mieru"' "$MIERU_META")"
     echo "Users: $(jq -r '[.inbounds[0].users[].name] | join(", ")' "$MIERU_CONFIG")"; ss -lntup 2>/dev/null | grep -F MI || true
   else echo "Mieru is not installed."; fi
 }
@@ -7253,7 +7397,7 @@ mieru_uninstall() {
 mieru_menu() {
   while true; do
     clear; echo "======================================================="; echo " Mieru Protocol [Core: sing-box-extended]"; echo "======================================================="
-    echo " 1) Install Mieru"; echo " 2) Add user"; echo " 3) Remove user"; echo " 4) Show client configuration"; echo " 5) Change transport / ports"; echo " 6) Update sing-box-extended core"; echo " 7) Status and diagnostics"; echo " 8) Uninstall"; echo " 0) Back"
+    echo " 1) Install Mieru"; echo " 2) Add user"; echo " 3) Remove user"; echo " 4) Show client configuration"; echo " 5) Change connection / client options"; echo " 6) Update sing-box-extended core"; echo " 7) Status and diagnostics"; echo " 8) Uninstall"; echo " 0) Back"
     read -rp "Choose: " MIERU_CHOICE
     case "$MIERU_CHOICE" in
       1) mieru_install ;; 2) mieru_add_user ;; 3) mieru_remove_user ;; 4) mieru_show_clients ;; 5) mieru_change_connection ;; 6) mieru_update_core ;; 7) mieru_status ;; 8) mieru_uninstall ;; 0) return ;; *) echo "Invalid choice." ;;
