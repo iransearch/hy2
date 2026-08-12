@@ -7003,6 +7003,433 @@ xboard_socks_routing_menu() {
   done
 }
 
+# ---- Mieru protocol manager ----
+MIERU_DIR="/etc/mieru"
+MIERU_CONFIG="$MIERU_DIR/config.json"
+MIERU_META="$MIERU_DIR/meta.json"
+MIERU_CLIENT_DIR="$MIERU_DIR/clients"
+MIERU_BINARY="/usr/bin/MI"
+MIERU_SERVICE="MI.service"
+
+mieru_installed() {
+  [[ -x "$MIERU_BINARY" && -s "$MIERU_CONFIG" && -f "/etc/systemd/system/$MIERU_SERVICE" ]]
+}
+
+mieru_port_spec_valid() {
+  local spec="$1" first last
+  if [[ "$spec" =~ ^([0-9]{1,5})$ ]]; then
+    ((10#${BASH_REMATCH[1]} >= 1 && 10#${BASH_REMATCH[1]} <= 65535))
+  elif [[ "$spec" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+    first=$((10#${BASH_REMATCH[1]})); last=$((10#${BASH_REMATCH[2]}))
+    ((first >= 1 && last <= 65535 && first < last && last - first <= 1000))
+  else
+    return 1
+  fi
+}
+
+mieru_first_port() { printf '%s\n' "${1%%-*}"; }
+
+mieru_port_busy() {
+  local spec="$1" transport="$2" first last port ss_flag
+  first="${spec%%-*}"; last="${spec#*-}"
+  [[ "$last" == "$spec" ]] && last="$first"
+  [[ "$transport" == "TCP" ]] && ss_flag="-lnt" || ss_flag="-lnu"
+  for ((port=first; port<=last; port++)); do
+    if ss -H "$ss_flag" 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+mieru_csf_port() {
+  local action="$1" transport="$2" spec="$3" key csf_spec
+  [[ -f /etc/csf/csf.conf ]] || return 0
+  key="${transport^^}_IN"; csf_spec="${spec/-/:}"
+  case "$action" in
+    add) csf_port_exists_in_conf "$key" "$csf_spec" || csf_add_port_to_conf "$key" "$csf_spec" ;;
+    remove) csf_port_exists_in_conf "$key" "$csf_spec" && csf_remove_port_from_conf "$key" "$csf_spec" || true ;;
+  esac
+  command -v csf >/dev/null 2>&1 && csf -r >/dev/null 2>&1 || true
+}
+
+mieru_write_server_config() {
+  local transport="$1" spec="$2" users_json="$3" first tmp
+  first="$(mieru_first_port "$spec")"; tmp="$(mktemp /tmp/mieru-server.XXXXXX)" || return 1
+  if [[ "$spec" == *-* ]]; then
+    jq -n --arg transport "$transport" --argjson port "$first" --arg range "$spec" --argjson users "$users_json" '
+      {log:{level:"error"},inbounds:[{type:"mieru",tag:"mieru-in",listen:"::",listen_port:$port,listen_ports:[$range],transport:$transport,users:$users}],outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}' >"$tmp"
+  else
+    jq -n --arg transport "$transport" --argjson port "$first" --argjson users "$users_json" '
+      {log:{level:"error"},inbounds:[{type:"mieru",tag:"mieru-in",listen:"::",listen_port:$port,transport:$transport,users:$users}],outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}' >"$tmp"
+  fi
+  "$MIERU_BINARY" check -c "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+  install -m 0600 "$tmp" "$MIERU_CONFIG"; local status=$?; rm -f "$tmp"; return "$status"
+}
+
+mieru_write_meta() {
+  local address="$1" transport="$2" spec="$3" tmp
+  tmp="$(mktemp /tmp/mieru-meta.XXXXXX)" || return 1
+  jq -n --arg address "$address" --arg transport "$transport" --arg ports "$spec" \
+    '{address:$address,transport:$transport,ports:$ports,multiplexing:"MULTIPLEXING_LOW"}' >"$tmp" &&
+    install -m 0600 "$tmp" "$MIERU_META"
+  local status=$?; rm -f "$tmp"; return "$status"
+}
+
+mieru_make_client() {
+  local username="$1" password="$2" address transport spec first file
+  address="$(jq -r '.address' "$MIERU_META")"; transport="$(jq -r '.transport' "$MIERU_META")"
+  spec="$(jq -r '.ports' "$MIERU_META")"; first="$(mieru_first_port "$spec")"
+  file="$MIERU_CLIENT_DIR/${username}.json"
+  if [[ "$spec" == *-* ]]; then
+    jq -n --arg address "$address" --arg transport "$transport" --argjson port "$first" --arg range "$spec" --arg user "$username" --arg pass "$password" '
+      {log:{level:"error"},dns:{servers:[{type:"local",tag:"default"}]},inbounds:[{type:"mixed",tag:"mixed-in",listen:"127.0.0.1",listen_port:7897}],outbounds:[{type:"direct",tag:"direct"},{type:"mieru",tag:"mieru-out",server:$address,server_port:$port,server_ports:[$range],transport:$transport,username:$user,password:$pass,multiplexing:"MULTIPLEXING_LOW"}],route:{final:"mieru-out",default_domain_resolver:"default",auto_detect_interface:true}}' >"$file"
+  else
+    jq -n --arg address "$address" --arg transport "$transport" --argjson port "$first" --arg user "$username" --arg pass "$password" '
+      {log:{level:"error"},dns:{servers:[{type:"local",tag:"default"}]},inbounds:[{type:"mixed",tag:"mixed-in",listen:"127.0.0.1",listen_port:7897}],outbounds:[{type:"direct",tag:"direct"},{type:"mieru",tag:"mieru-out",server:$address,server_port:$port,transport:$transport,username:$user,password:$pass,multiplexing:"MULTIPLEXING_LOW"}],route:{final:"mieru-out",default_domain_resolver:"default",auto_detect_interface:true}}' >"$file"
+  fi
+  chmod 600 "$file" && "$MIERU_BINARY" check -c "$file" >/dev/null 2>&1
+}
+
+mieru_regenerate_clients() {
+  local encoded name pass
+  mkdir -p "$MIERU_CLIENT_DIR"; chmod 700 "$MIERU_CLIENT_DIR"; rm -f "$MIERU_CLIENT_DIR"/*.json
+  while IFS= read -r encoded; do
+    name="$(printf '%s' "$encoded" | base64 -d | jq -r '.name')"
+    pass="$(printf '%s' "$encoded" | base64 -d | jq -r '.password')"
+    mieru_make_client "$name" "$pass" || return 1
+  done < <(jq -r '.inbounds[0].users[] | @base64' "$MIERU_CONFIG")
+}
+
+mieru_install_service() {
+  local tmp
+  tmp="$(mktemp /tmp/mieru-service.XXXXXX)" || return 1
+  cat >"$tmp" <<'EOF_MIERU_SERVICE'
+[Unit]
+Description=GECKO Mieru Server (sing-box-extended)
+Documentation=https://github.com/shtorm-7/sing-box-extended
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/MI run -c /etc/mieru/config.json
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/mieru
+PrivateTmp=true
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+
+[Install]
+WantedBy=multi-user.target
+EOF_MIERU_SERVICE
+  install -m 0644 "$tmp" "/etc/systemd/system/$MIERU_SERVICE"; local status=$?; rm -f "$tmp"; return "$status"
+}
+
+mieru_install() {
+  local address transport spec username password users
+  [[ "$(id -u)" -eq 0 ]] || { echo "Please run as root."; return 1; }
+  mieru_installed && { echo "Mieru is already installed. Use the management options to change it."; return 1; }
+  check_dep
+  read -rp "Server IP or domain: " address
+  [[ "$address" =~ ^[A-Za-z0-9._:-]+$ ]] || { echo "Invalid server address."; return 1; }
+  read -rp "Transport [TCP/UDP] (default TCP): " transport; transport="${transport:-TCP}"; transport="${transport^^}"
+  [[ "$transport" == TCP || "$transport" == UDP ]] || { echo "Transport must be TCP or UDP."; return 1; }
+  read -rp "Port or range (example 27017 or 27017-27019): " spec
+  mieru_port_spec_valid "$spec" || { echo "Invalid port/range (maximum range size: 1001 ports)."; return 1; }
+  if mieru_port_busy "$spec" "$transport"; then echo "At least one selected port is already in use."; return 1; fi
+  read -rp "First username: " username
+  [[ "$username" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || { echo "Invalid username."; return 1; }
+  read -rsp "Password (minimum 8 characters): " password; echo
+  ((${#password} >= 8)) || { echo "Password is too short."; return 1; }
+
+  install_core MI || return 1
+  install -d -m 0700 "$MIERU_DIR" "$MIERU_CLIENT_DIR" || return 1
+  users="$(jq -n --arg n "$username" --arg p "$password" '[{name:$n,password:$p}]')"
+  mieru_write_server_config "$transport" "$spec" "$users" || { echo "Mieru configuration validation failed."; return 1; }
+  mieru_write_meta "$address" "$transport" "$spec" || return 1
+  mieru_regenerate_clients || return 1
+  mieru_install_service || return 1
+  systemctl daemon-reload && systemctl enable --now "$MIERU_SERVICE" || { echo "Mieru failed to start."; return 1; }
+  sleep 1
+  systemctl is-active --quiet "$MIERU_SERVICE" || { journalctl -u "$MIERU_SERVICE" -n 20 --no-pager; return 1; }
+  mieru_csf_port add "$transport" "$spec"
+  echo "Mieru installed successfully. Client: $MIERU_CLIENT_DIR/$username.json"
+}
+
+mieru_apply_users() {
+  local users="$1" backup
+  backup="$(mktemp /tmp/mieru-config-backup.XXXXXX)" || return 1; cp -a "$MIERU_CONFIG" "$backup" || return 1
+  if ! mieru_write_server_config "$(jq -r '.transport' "$MIERU_META")" "$(jq -r '.ports' "$MIERU_META")" "$users" ||
+     ! systemctl restart "$MIERU_SERVICE" || ! systemctl is-active --quiet "$MIERU_SERVICE"; then
+    cp -a "$backup" "$MIERU_CONFIG"; systemctl restart "$MIERU_SERVICE" >/dev/null 2>&1 || true; rm -f "$backup"; return 1
+  fi
+  rm -f "$backup"; mieru_regenerate_clients
+}
+
+mieru_add_user() {
+  local name pass users
+  mieru_installed || { echo "Mieru is not installed."; return 1; }
+  read -rp "New username: " name; [[ "$name" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || { echo "Invalid username."; return 1; }
+  jq -e --arg n "$name" '.inbounds[0].users[] | select(.name==$n)' "$MIERU_CONFIG" >/dev/null && { echo "User already exists."; return 1; }
+  read -rsp "Password (minimum 8 characters): " pass; echo; ((${#pass} >= 8)) || { echo "Password is too short."; return 1; }
+  users="$(jq --arg n "$name" --arg p "$pass" '.inbounds[0].users + [{name:$n,password:$p}]' "$MIERU_CONFIG")"
+  mieru_apply_users "$users" && echo "User added. Client: $MIERU_CLIENT_DIR/$name.json"
+}
+
+mieru_remove_user() {
+  local name count users
+  mieru_installed || { echo "Mieru is not installed."; return 1; }
+  jq -r '.inbounds[0].users[].name' "$MIERU_CONFIG"; read -rp "Username to remove: " name
+  count="$(jq '.inbounds[0].users | length' "$MIERU_CONFIG")"; ((count > 1)) || { echo "The last user cannot be removed; add another user first."; return 1; }
+  jq -e --arg n "$name" '.inbounds[0].users[] | select(.name==$n)' "$MIERU_CONFIG" >/dev/null || { echo "User not found."; return 1; }
+  users="$(jq --arg n "$name" '[.inbounds[0].users[] | select(.name!=$n)]' "$MIERU_CONFIG")"
+  mieru_apply_users "$users" && echo "User removed."
+}
+
+mieru_show_clients() {
+  local name file
+  mieru_installed || { echo "Mieru is not installed."; return 1; }
+  mieru_regenerate_clients || return 1
+  jq -r '.inbounds[0].users[].name' "$MIERU_CONFIG"; read -rp "Username: " name
+  file="$MIERU_CLIENT_DIR/$name.json"; [[ -f "$file" ]] || { echo "User not found."; return 1; }
+  echo "--- client.json ---"; jq . "$file"; echo "--- Base64 ---"; base64 -w0 "$file"; echo; echo "Linux: MI run -c $name.json"
+}
+
+mieru_change_connection() {
+  local old_transport old_spec transport spec users address new_address backup_config backup_meta
+  mieru_installed || { echo "Mieru is not installed."; return 1; }
+  old_transport="$(jq -r '.transport' "$MIERU_META")"; old_spec="$(jq -r '.ports' "$MIERU_META")"
+  read -rp "Transport [TCP/UDP] (current $old_transport): " transport; transport="${transport:-$old_transport}"; transport="${transport^^}"
+  [[ "$transport" == TCP || "$transport" == UDP ]] || { echo "Invalid transport."; return 1; }
+  read -rp "Port/range (current $old_spec): " spec; spec="${spec:-$old_spec}"; mieru_port_spec_valid "$spec" || { echo "Invalid port/range."; return 1; }
+  address="$(jq -r '.address' "$MIERU_META")"; read -rp "Server IP/domain for client configs (current $address): " new_address; address="${new_address:-$address}"
+  [[ "$address" =~ ^[A-Za-z0-9._:-]+$ ]] || { echo "Invalid server address."; return 1; }
+  if [[ "$spec" != "$old_spec" || "$transport" != "$old_transport" ]]; then
+    systemctl stop "$MIERU_SERVICE" || return 1
+    if mieru_port_busy "$spec" "$transport"; then systemctl start "$MIERU_SERVICE" >/dev/null 2>&1 || true; echo "At least one selected port is already in use."; return 1; fi
+  fi
+  users="$(jq '.inbounds[0].users' "$MIERU_CONFIG")"
+  backup_config="$(mktemp /tmp/mieru-config.XXXXXX)"; backup_meta="$(mktemp /tmp/mieru-meta.XXXXXX)"; cp -a "$MIERU_CONFIG" "$backup_config"; cp -a "$MIERU_META" "$backup_meta"
+  if ! mieru_write_server_config "$transport" "$spec" "$users" || ! mieru_write_meta "$address" "$transport" "$spec" || ! systemctl restart "$MIERU_SERVICE"; then
+    cp -a "$backup_config" "$MIERU_CONFIG"; cp -a "$backup_meta" "$MIERU_META"; systemctl restart "$MIERU_SERVICE" >/dev/null 2>&1 || true; rm -f "$backup_config" "$backup_meta"; echo "Change failed; rolled back."; return 1
+  fi
+  rm -f "$backup_config" "$backup_meta"; mieru_regenerate_clients; mieru_csf_port remove "$old_transport" "$old_spec"; mieru_csf_port add "$transport" "$spec"; echo "Connection settings updated."
+}
+
+mieru_update_core() {
+  local backup
+  mieru_installed || { echo "Mieru is not installed."; return 1; }
+  backup="$(mktemp /tmp/MI-backup.XXXXXX)" || return 1; cp -a "$MIERU_BINARY" "$backup" || return 1
+  install_core MI || { rm -f "$backup"; return 1; }
+  if ! "$MIERU_BINARY" check -c "$MIERU_CONFIG" >/dev/null 2>&1 || ! systemctl restart "$MIERU_SERVICE"; then
+    install -m 0755 "$backup" "$MIERU_BINARY"; systemctl restart "$MIERU_SERVICE" >/dev/null 2>&1 || true; rm -f "$backup"; echo "Core update failed; rolled back."; return 1
+  fi
+  rm -f "$backup"; echo "Mieru core is up to date."
+}
+
+mieru_status() {
+  if mieru_installed; then
+    systemctl --no-pager --full status "$MIERU_SERVICE" 2>/dev/null | head -15
+    echo "Core: $($MIERU_BINARY version 2>/dev/null | head -1)"; echo "Transport/ports: $(jq -r '.transport+" / "+.ports' "$MIERU_META")"
+    echo "Users: $(jq -r '[.inbounds[0].users[].name] | join(", ")' "$MIERU_CONFIG")"; ss -lntup 2>/dev/null | grep -F MI || true
+  else echo "Mieru is not installed."; fi
+}
+
+mieru_uninstall() {
+  local transport spec confirm
+  mieru_installed || { echo "Mieru is not installed."; return 0; }
+  read -rp "Remove Mieru, its users and client configs? [y/N]: " confirm; [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 0; }
+  transport="$(jq -r '.transport' "$MIERU_META")"; spec="$(jq -r '.ports' "$MIERU_META")"
+  systemctl disable --now "$MIERU_SERVICE" >/dev/null 2>&1 || true; rm -f "/etc/systemd/system/$MIERU_SERVICE" "$MIERU_BINARY"; rm -rf "$MIERU_DIR"; systemctl daemon-reload; mieru_csf_port remove "$transport" "$spec"; echo "Mieru was removed."
+}
+
+mieru_menu() {
+  while true; do
+    clear; echo "======================================================="; echo " Mieru Protocol [Core: sing-box-extended]"; echo "======================================================="
+    echo " 1) Install Mieru"; echo " 2) Add user"; echo " 3) Remove user"; echo " 4) Show client configuration"; echo " 5) Change transport / ports"; echo " 6) Update sing-box-extended core"; echo " 7) Status and diagnostics"; echo " 8) Uninstall"; echo " 0) Back"
+    read -rp "Choose: " MIERU_CHOICE
+    case "$MIERU_CHOICE" in
+      1) mieru_install ;; 2) mieru_add_user ;; 3) mieru_remove_user ;; 4) mieru_show_clients ;; 5) mieru_change_connection ;; 6) mieru_update_core ;; 7) mieru_status ;; 8) mieru_uninstall ;; 0) return ;; *) echo "Invalid choice." ;;
+    esac
+    read -rp "Press Enter to return to menu..."
+  done
+}
+
+# ---- Swap management ----
+GECKO_SWAP_FILE="/swapfile"
+GECKO_SWAP_SYSCTL="/etc/sysctl.d/99-zz-gecko-swap.conf"
+
+gecko_swap_is_active() {
+  swapon --noheadings --raw --output NAME 2>/dev/null | grep -Fxq "$GECKO_SWAP_FILE"
+}
+
+gecko_swap_status() {
+  clear
+  echo "======================================================="
+  echo " GECKO Swap Status"
+  echo "======================================================="
+  free -h
+  echo
+  swapon --show 2>/dev/null || true
+  echo
+  echo "vm.swappiness: $(sysctl -n vm.swappiness 2>/dev/null || echo unknown)"
+  if [ -f "$GECKO_SWAP_FILE" ]; then
+    echo "Managed file : $GECKO_SWAP_FILE ($(du -h "$GECKO_SWAP_FILE" 2>/dev/null | awk '{print $1}'))"
+  else
+    echo "Managed file : not installed"
+  fi
+}
+
+gecko_swap_create() {
+  clear
+  echo "======================================================="
+  echo " Create GECKO Swap File"
+  echo "======================================================="
+  echo "Swap will use vm.swappiness=10, so Linux strongly prefers"
+  echo "physical RAM and uses swap only under heavy memory pressure."
+  echo "======================================================="
+
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
+  command -v mkswap >/dev/null 2>&1 || { echo "mkswap is not installed (package: util-linux)."; return 1; }
+
+  if gecko_swap_is_active; then
+    echo "$GECKO_SWAP_FILE is already active. Remove it from this menu before changing its size."
+    return 1
+  fi
+  if [ -e "$GECKO_SWAP_FILE" ]; then
+    echo "$GECKO_SWAP_FILE already exists but is not an active GECKO swap file."
+    echo "It was not overwritten. Move or remove it manually, then try again."
+    return 1
+  fi
+
+  local size_gb size_bytes available_bytes reserve_bytes backup_fstab=""
+  read -rp "Enter swap size in GB (whole number, e.g. 2): " size_gb
+  if ! [[ "$size_gb" =~ ^[1-9][0-9]*$ ]] || [ "$size_gb" -gt 1024 ]; then
+    echo "Invalid size. Enter a whole number from 1 to 1024 GB."
+    return 1
+  fi
+  size_bytes=$((size_gb * 1024 * 1024 * 1024))
+  available_bytes=$(df --output=avail -B1 / | awk 'NR==2 {print $1}')
+  reserve_bytes=$((512 * 1024 * 1024))
+  if ! [[ "$available_bytes" =~ ^[0-9]+$ ]] || [ "$available_bytes" -lt $((size_bytes + reserve_bytes)) ]; then
+    echo "Not enough free disk space. At least ${size_gb} GB plus 512 MB reserve is required."
+    return 1
+  fi
+
+  echo "Creating ${size_gb} GB swap file..."
+  if ! fallocate -l "${size_gb}G" "$GECKO_SWAP_FILE" 2>/dev/null; then
+    dd if=/dev/zero of="$GECKO_SWAP_FILE" bs=1M count=$((size_gb * 1024)) status=progress || {
+      rm -f "$GECKO_SWAP_FILE"
+      echo "Could not allocate the swap file."
+      return 1
+    }
+  fi
+  chmod 600 "$GECKO_SWAP_FILE"
+  if ! mkswap "$GECKO_SWAP_FILE" >/dev/null || ! swapon "$GECKO_SWAP_FILE"; then
+    swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
+    rm -f "$GECKO_SWAP_FILE"
+    echo "Could not initialize or activate swap. Changes were rolled back."
+    return 1
+  fi
+
+  backup_fstab="/etc/fstab.gecko-swap.$(date +%Y%m%d-%H%M%S).bak"
+  if ! cp -a /etc/fstab "$backup_fstab"; then
+    swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
+    rm -f "$GECKO_SWAP_FILE"
+    echo "Could not back up /etc/fstab. Changes were rolled back."
+    return 1
+  fi
+  if ! grep -Eq '^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap([[:space:]]|$)' /etc/fstab; then
+    if ! printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab; then
+      cp -a "$backup_fstab" /etc/fstab
+      swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
+      rm -f "$GECKO_SWAP_FILE"
+      echo "Could not update /etc/fstab. Changes were rolled back."
+      return 1
+    fi
+  fi
+  if ! cat > "$GECKO_SWAP_SYSCTL" <<'EOF_GECKO_SWAP_SYSCTL'
+# Prefer physical RAM; keep a small safety margin before severe memory pressure.
+vm.swappiness = 10
+EOF_GECKO_SWAP_SYSCTL
+  then
+    cp -a "$backup_fstab" /etc/fstab
+    swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
+    rm -f "$GECKO_SWAP_FILE" "$GECKO_SWAP_SYSCTL"
+    echo "Could not save the swappiness setting. Changes were rolled back."
+    return 1
+  fi
+  if ! sysctl -w vm.swappiness=10 >/dev/null; then
+    cp -a "$backup_fstab" /etc/fstab
+    swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
+    rm -f "$GECKO_SWAP_FILE" "$GECKO_SWAP_SYSCTL"
+    echo "Could not apply swappiness. Changes were rolled back."
+    return 1
+  fi
+
+  echo "Swap created and enabled successfully."
+  echo "Size          : ${size_gb} GB"
+  echo "Swappiness    : 10"
+  echo "fstab backup  : $backup_fstab"
+}
+
+gecko_swap_remove() {
+  clear
+  echo "======================================================="
+  echo " Remove GECKO Swap File"
+  echo "======================================================="
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
+  [ -e "$GECKO_SWAP_FILE" ] || { echo "GECKO swap file is not installed."; return 0; }
+  read -rp "Disable and remove $GECKO_SWAP_FILE? [y/N]: " confirm
+  case "$confirm" in y|Y|yes|YES|Yes) ;; *) echo "Cancelled."; return 0 ;; esac
+
+  if gecko_swap_is_active && ! swapoff "$GECKO_SWAP_FILE"; then
+    echo "Swap could not be disabled, usually because RAM is insufficient. Nothing was removed."
+    return 1
+  fi
+  local remove_backup
+  remove_backup="/etc/fstab.gecko-swap-remove.$(date +%Y%m%d-%H%M%S).bak"
+  if ! cp -a /etc/fstab "$remove_backup" ||
+     ! sed -Ei '\#^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap([[:space:]]|$)#d' /etc/fstab; then
+    [ -f "$remove_backup" ] && cp -a "$remove_backup" /etc/fstab
+    swapon "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
+    echo "Could not update /etc/fstab. The swap file was not removed."
+    return 1
+  fi
+  rm -f "$GECKO_SWAP_FILE" "$GECKO_SWAP_SYSCTL"
+  sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+  echo "GECKO swap file was removed."
+}
+
+gecko_swap_menu() {
+  while true; do
+    clear
+    echo "======================================================="
+    echo " GECKO Swap RAM Menu"
+    echo "======================================================="
+    echo " 1) Create swap with a custom size"
+    echo " 2) Show swap and memory status"
+    echo " 3) Remove GECKO swap"
+    echo " 0) Back"
+    echo "======================================================="
+    read -rp "Choose: " GECKO_SWAP_CHOICE
+    case "$GECKO_SWAP_CHOICE" in
+      1) gecko_swap_create; read -rp "Press Enter to return to menu..." ;;
+      2) gecko_swap_status; read -rp "Press Enter to return to menu..." ;;
+      3) gecko_swap_remove; read -rp "Press Enter to return to menu..." ;;
+      0) return ;;
+      *) echo "Invalid choice."; sleep 1 ;;
+    esac
+  done
+}
+
 if ! gecko_apply_log_protection; then
   echo "WARNING: GECKO could not fully apply log cleanup and error-only Hysteria logging." >&2
 fi
@@ -7063,6 +7490,8 @@ while true; do
   echo -e "8)  \e[93mGOST Multi-Tunnel Menu\e[0m"
   echo -e "9)  \e[91mCSF Firewall Menu\e[0m"
   echo -e "10) \e[96mXboard ISP Dedicated Proxies Local Bridge Menu\e[0m"
+  echo -e "11) \e[92mSwap RAM Management (custom size, RAM-first)\e[0m"
+  echo -e "12) \e[96mMieru Protocol [Core: sing-box-extended]\e[0m"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -7131,6 +7560,14 @@ while true; do
   10)
     clear
     xboard_socks_routing_menu
+    ;;
+  11)
+    clear
+    gecko_swap_menu
+    ;;
+  12)
+    clear
+    mieru_menu
     ;;
   0)
     clear
