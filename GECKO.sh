@@ -7003,174 +7003,6 @@ xboard_socks_routing_menu() {
   done
 }
 
-# ---- Swap management ----
-GECKO_SWAP_FILE="/swapfile"
-GECKO_SWAP_SYSCTL="/etc/sysctl.d/99-zz-gecko-swap.conf"
-
-gecko_swap_is_active() {
-  swapon --noheadings --raw --output NAME 2>/dev/null | grep -Fxq "$GECKO_SWAP_FILE"
-}
-
-gecko_swap_status() {
-  clear
-  echo "======================================================="
-  echo " GECKO Swap Status"
-  echo "======================================================="
-  free -h
-  echo
-  swapon --show 2>/dev/null || true
-  echo
-  echo "vm.swappiness: $(sysctl -n vm.swappiness 2>/dev/null || echo unknown)"
-  if [ -f "$GECKO_SWAP_FILE" ]; then
-    echo "Managed file : $GECKO_SWAP_FILE ($(du -h "$GECKO_SWAP_FILE" 2>/dev/null | awk '{print $1}'))"
-  else
-    echo "Managed file : not installed"
-  fi
-}
-
-gecko_swap_create() {
-  clear
-  echo "======================================================="
-  echo " Create GECKO Swap File"
-  echo "======================================================="
-  echo "Swap will use vm.swappiness=10, so Linux strongly prefers"
-  echo "physical RAM and uses swap only under heavy memory pressure."
-  echo "======================================================="
-
-  [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
-  command -v mkswap >/dev/null 2>&1 || { echo "mkswap is not installed (package: util-linux)."; return 1; }
-
-  if gecko_swap_is_active; then
-    echo "$GECKO_SWAP_FILE is already active. Remove it from this menu before changing its size."
-    return 1
-  fi
-  if [ -e "$GECKO_SWAP_FILE" ]; then
-    echo "$GECKO_SWAP_FILE already exists but is not an active GECKO swap file."
-    echo "It was not overwritten. Move or remove it manually, then try again."
-    return 1
-  fi
-
-  local size_gb size_bytes available_bytes reserve_bytes backup_fstab=""
-  read -rp "Enter swap size in GB (whole number, e.g. 2): " size_gb
-  if ! [[ "$size_gb" =~ ^[1-9][0-9]*$ ]] || [ "$size_gb" -gt 1024 ]; then
-    echo "Invalid size. Enter a whole number from 1 to 1024 GB."
-    return 1
-  fi
-  size_bytes=$((size_gb * 1024 * 1024 * 1024))
-  available_bytes=$(df --output=avail -B1 / | awk 'NR==2 {print $1}')
-  reserve_bytes=$((512 * 1024 * 1024))
-  if ! [[ "$available_bytes" =~ ^[0-9]+$ ]] || [ "$available_bytes" -lt $((size_bytes + reserve_bytes)) ]; then
-    echo "Not enough free disk space. At least ${size_gb} GB plus 512 MB reserve is required."
-    return 1
-  fi
-
-  echo "Creating ${size_gb} GB swap file..."
-  if ! fallocate -l "${size_gb}G" "$GECKO_SWAP_FILE" 2>/dev/null; then
-    dd if=/dev/zero of="$GECKO_SWAP_FILE" bs=1M count=$((size_gb * 1024)) status=progress || {
-      rm -f "$GECKO_SWAP_FILE"
-      echo "Could not allocate the swap file."
-      return 1
-    }
-  fi
-  chmod 600 "$GECKO_SWAP_FILE"
-  if ! mkswap "$GECKO_SWAP_FILE" >/dev/null || ! swapon "$GECKO_SWAP_FILE"; then
-    swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
-    rm -f "$GECKO_SWAP_FILE"
-    echo "Could not initialize or activate swap. Changes were rolled back."
-    return 1
-  fi
-
-  backup_fstab="/etc/fstab.gecko-swap.$(date +%Y%m%d-%H%M%S).bak"
-  if ! cp -a /etc/fstab "$backup_fstab"; then
-    swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
-    rm -f "$GECKO_SWAP_FILE"
-    echo "Could not back up /etc/fstab. Changes were rolled back."
-    return 1
-  fi
-  if ! grep -Eq '^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap([[:space:]]|$)' /etc/fstab; then
-    if ! printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab; then
-      cp -a "$backup_fstab" /etc/fstab
-      swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
-      rm -f "$GECKO_SWAP_FILE"
-      echo "Could not update /etc/fstab. Changes were rolled back."
-      return 1
-    fi
-  fi
-  if ! cat > "$GECKO_SWAP_SYSCTL" <<'EOF_GECKO_SWAP_SYSCTL'
-# Prefer physical RAM; keep a small safety margin before severe memory pressure.
-vm.swappiness = 10
-EOF_GECKO_SWAP_SYSCTL
-  then
-    cp -a "$backup_fstab" /etc/fstab
-    swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
-    rm -f "$GECKO_SWAP_FILE" "$GECKO_SWAP_SYSCTL"
-    echo "Could not save the swappiness setting. Changes were rolled back."
-    return 1
-  fi
-  if ! sysctl -w vm.swappiness=10 >/dev/null; then
-    cp -a "$backup_fstab" /etc/fstab
-    swapoff "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
-    rm -f "$GECKO_SWAP_FILE" "$GECKO_SWAP_SYSCTL"
-    echo "Could not apply swappiness. Changes were rolled back."
-    return 1
-  fi
-
-  echo "Swap created and enabled successfully."
-  echo "Size          : ${size_gb} GB"
-  echo "Swappiness    : 10"
-  echo "fstab backup  : $backup_fstab"
-}
-
-gecko_swap_remove() {
-  clear
-  echo "======================================================="
-  echo " Remove GECKO Swap File"
-  echo "======================================================="
-  [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
-  [ -e "$GECKO_SWAP_FILE" ] || { echo "GECKO swap file is not installed."; return 0; }
-  read -rp "Disable and remove $GECKO_SWAP_FILE? [y/N]: " confirm
-  case "$confirm" in y|Y|yes|YES|Yes) ;; *) echo "Cancelled."; return 0 ;; esac
-
-  if gecko_swap_is_active && ! swapoff "$GECKO_SWAP_FILE"; then
-    echo "Swap could not be disabled, usually because RAM is insufficient. Nothing was removed."
-    return 1
-  fi
-  local remove_backup
-  remove_backup="/etc/fstab.gecko-swap-remove.$(date +%Y%m%d-%H%M%S).bak"
-  if ! cp -a /etc/fstab "$remove_backup" ||
-     ! sed -Ei '\#^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap([[:space:]]|$)#d' /etc/fstab; then
-    [ -f "$remove_backup" ] && cp -a "$remove_backup" /etc/fstab
-    swapon "$GECKO_SWAP_FILE" >/dev/null 2>&1 || true
-    echo "Could not update /etc/fstab. The swap file was not removed."
-    return 1
-  fi
-  rm -f "$GECKO_SWAP_FILE" "$GECKO_SWAP_SYSCTL"
-  sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
-  echo "GECKO swap file was removed."
-}
-
-gecko_swap_menu() {
-  while true; do
-    clear
-    echo "======================================================="
-    echo " GECKO Swap RAM Menu"
-    echo "======================================================="
-    echo " 1) Create swap with a custom size"
-    echo " 2) Show swap and memory status"
-    echo " 3) Remove GECKO swap"
-    echo " 0) Back"
-    echo "======================================================="
-    read -rp "Choose: " GECKO_SWAP_CHOICE
-    case "$GECKO_SWAP_CHOICE" in
-      1) gecko_swap_create; read -rp "Press Enter to return to menu..." ;;
-      2) gecko_swap_status; read -rp "Press Enter to return to menu..." ;;
-      3) gecko_swap_remove; read -rp "Press Enter to return to menu..." ;;
-      0) return ;;
-      *) echo "Invalid choice."; sleep 1 ;;
-    esac
-  done
-}
-
 if ! gecko_apply_log_protection; then
   echo "WARNING: GECKO could not fully apply log cleanup and error-only Hysteria logging." >&2
 fi
@@ -7231,7 +7063,6 @@ while true; do
   echo -e "8)  \e[93mGOST Multi-Tunnel Menu\e[0m"
   echo -e "9)  \e[91mCSF Firewall Menu\e[0m"
   echo -e "10) \e[96mXboard ISP Dedicated Proxies Local Bridge Menu\e[0m"
-  echo -e "11) \e[92mSwap RAM Management (custom size, RAM-first)\e[0m"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -7300,10 +7131,6 @@ while true; do
   10)
     clear
     xboard_socks_routing_menu
-    ;;
-  11)
-    clear
-    gecko_swap_menu
     ;;
   0)
     clear
