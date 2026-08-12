@@ -7,6 +7,7 @@ source <(curl -sSL https://raw.githubusercontent.com/TheyCallMeSecond/config-exa
 #   - Install the latest sing-box-extended release instead of the upstream core.
 #   - Let Reality use either the latest Xray-core or sing-box-extended.
 #   - Manage simultaneous TCP/gRPC Reality configs with optional XTLS Vision.
+#   - Generate matched X25519 or ML-KEM-768 VLESS Encryption pairs for Reality.
 #   - Add a complete VLESS + XHTTP + TLS manager.
 # The Legacy menu and every custom menu below remain unchanged.
 # -----------------------------------------------------------------------------
@@ -618,6 +619,43 @@ select_reality_flow() {
   fi
 }
 
+select_reality_encryption_mode() {
+  local default_mode="${1:-none}" choice
+  case "$default_mode" in
+    none | x25519 | mlkem768) ;;
+    *) default_mode="none" ;;
+  esac
+  choice=$(whiptail --clear --title "VLESS Encryption" --default-item "$default_mode" \
+    --menu "Select the extra VLESS Encryption layer (Reality remains enabled in every mode):" 18 84 3 \
+    "none" "Disabled (standard VLESS + Reality; widest client compatibility)" \
+    "x25519" "X25519 authentication (requires a compatible recent client)" \
+    "mlkem768" "ML-KEM-768 post-quantum auth (requires a compatible recent client)" \
+    2>&1 >/dev/tty) || return 1
+  printf '%s' "$choice"
+}
+
+reality_encryption_mode_from_value() {
+  local value="${1:-none}" key
+  if [[ -z "$value" || "$value" == "none" ]]; then
+    printf 'none'
+    return 0
+  fi
+  key="${value##*.}"
+  if ((${#key} > 100)); then
+    printf 'mlkem768'
+  else
+    printf 'x25519'
+  fi
+}
+
+reality_encryption_label() {
+  case "${1:-none}" in
+    x25519) printf 'X25519 auth' ;;
+    mlkem768) printf 'ML-KEM-768 auth' ;;
+    *) printf 'disabled' ;;
+  esac
+}
+
 reality_detect_core() {
   local saved="" version_line=""
   if [[ -f "$REALITY_CORE_FILE" ]]; then
@@ -683,6 +721,148 @@ reality_ensure_core() {
   }
 }
 
+# Generate the matched server/client strings defined by Xray's VLESS
+# Encryption format. Xray-core provides the canonical generator. When Reality
+# is using sing-box-extended, download a verified temporary Xray binary only
+# for key generation and remove it immediately afterwards.
+reality_run_vlessenc() {
+  local core machine arch latest_release_url latest_tag archive_name download_url digest_url
+  local digest_data expected_sha actual_sha tmp_dir binary_path output
+
+  core="$(reality_detect_core 2>/dev/null)" || core=""
+  if [[ "$core" == "xray" ]] &&
+    "/usr/bin/$REALITY_SERVICE" help vlessenc >/dev/null 2>&1; then
+    if ! output="$("/usr/bin/$REALITY_SERVICE" vlessenc 2>&1)"; then
+      tui_error "Xray could not generate the VLESS Encryption pair."
+      return 1
+    fi
+    REALITY_VLESSENC_OUTPUT="$output"
+    return 0
+  fi
+
+  machine="$(uname -m)"
+  case "$machine" in
+    x86_64 | amd64) arch="64" ;;
+    aarch64 | arm64) arch="arm64-v8a" ;;
+    i386 | i486 | i586 | i686) arch="32" ;;
+    armv7l | armv7) arch="arm32-v7a" ;;
+    armv6l | armv6) arch="arm32-v6" ;;
+    mips64el) arch="mips64le" ;;
+    mipsel) arch="mips32le" ;;
+    s390x) arch="s390x" ;;
+    *)
+      tui_error "Unsupported CPU architecture for VLESS Encryption generation: $machine"
+      return 1
+      ;;
+  esac
+
+  command -v python3 >/dev/null 2>&1 || {
+    tui_error "python3 is required to extract the temporary Xray key generator."
+    return 1
+  }
+
+  echo "Downloading the verified Xray VLESS Encryption generator..."
+  if ! latest_release_url="$(
+    curl -fsSIL --retry 3 --connect-timeout 15 \
+      -o /dev/null -w '%{url_effective}' \
+      "https://github.com/${TUI_XRAY_REPO}/releases/latest"
+  )"; then
+    tui_error "Could not resolve the latest stable Xray release for VLESS Encryption generation."
+    return 1
+  fi
+  latest_tag="${latest_release_url##*/}"
+  if [[ "$latest_release_url" != "https://github.com/${TUI_XRAY_REPO}/releases/tag/${latest_tag}" ]] ||
+    [[ ! "$latest_tag" =~ ^v[0-9]+([.][0-9]+)+$ ]]; then
+    tui_error "GitHub returned an invalid latest Xray release URL."
+    return 1
+  fi
+
+  archive_name="Xray-linux-${arch}.zip"
+  download_url="https://github.com/${TUI_XRAY_REPO}/releases/download/${latest_tag}/${archive_name}"
+  digest_url="${download_url}.dgst"
+  tmp_dir="$(mktemp -d /tmp/reality-vlessenc.XXXXXX)" || {
+    tui_error "Could not create a temporary VLESS Encryption directory."
+    return 1
+  }
+
+  if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
+    -o "$tmp_dir/$archive_name" "$download_url"; then
+    rm -rf "$tmp_dir"
+    tui_error "Xray VLESS Encryption generator download failed."
+    return 1
+  fi
+  if ! digest_data="$(curl -fsSL --retry 3 --connect-timeout 15 "$digest_url")"; then
+    rm -rf "$tmp_dir"
+    tui_error "Could not download the official Xray digest file."
+    return 1
+  fi
+  expected_sha="$(printf '%s\n' "$digest_data" | sed -nE 's/^SHA2-256=[[:space:]]*([0-9A-Fa-f]{64})[[:space:]]*$/\1/p' | head -n 1)"
+  actual_sha="$(sha256sum "$tmp_dir/$archive_name" | awk '{print $1}')"
+  if [[ -z "$expected_sha" || "${actual_sha,,}" != "${expected_sha,,}" ]]; then
+    rm -rf "$tmp_dir"
+    tui_error "SHA-256 verification failed for the Xray VLESS Encryption generator."
+    return 1
+  fi
+  if ! python3 -m zipfile -e "$tmp_dir/$archive_name" "$tmp_dir/extracted"; then
+    rm -rf "$tmp_dir"
+    tui_error "The downloaded Xray archive is invalid."
+    return 1
+  fi
+  binary_path="$(find "$tmp_dir/extracted" -type f -name xray -print -quit)"
+  if [[ -z "$binary_path" || ! -f "$binary_path" ]]; then
+    rm -rf "$tmp_dir"
+    tui_error "The Xray VLESS Encryption generator was not found in the release archive."
+    return 1
+  fi
+  chmod 0755 "$binary_path"
+  if ! "$binary_path" help vlessenc >/dev/null 2>&1 ||
+    ! output="$("$binary_path" vlessenc 2>&1)"; then
+    rm -rf "$tmp_dir"
+    tui_error "The downloaded Xray version does not support VLESS Encryption generation."
+    return 1
+  fi
+  rm -rf "$tmp_dir"
+  REALITY_VLESSENC_OUTPUT="$output"
+}
+
+reality_generate_vless_encryption_pair() {
+  local mode="$1" index output
+  local -a decryptions=() encryptions=()
+
+  case "$mode" in
+    x25519) index=0 ;;
+    mlkem768) index=1 ;;
+    *)
+      tui_error "Unknown VLESS Encryption authentication mode: $mode"
+      return 1
+      ;;
+  esac
+
+  REALITY_VLESSENC_OUTPUT=""
+  reality_run_vlessenc || return 1
+  output="$REALITY_VLESSENC_OUTPUT"
+  REALITY_VLESSENC_OUTPUT=""
+  mapfile -t decryptions < <(
+    printf '%s\n' "$output" |
+      sed -nE 's/^[[:space:]]*"decryption":[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p'
+  )
+  mapfile -t encryptions < <(
+    printf '%s\n' "$output" |
+      sed -nE 's/^[[:space:]]*"encryption":[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p'
+  )
+  output=""
+
+  if ((${#decryptions[@]} < 2 || ${#encryptions[@]} < 2)) ||
+    [[ -z "${decryptions[$index]:-}" || -z "${encryptions[$index]:-}" ]] ||
+    [[ "${decryptions[$index]}" != mlkem768x25519plus.* ]] ||
+    [[ "${encryptions[$index]}" != mlkem768x25519plus.* ]]; then
+    tui_error "The VLESS Encryption generator returned an invalid key pair."
+    return 1
+  fi
+  REALITY_DECRYPTION="${decryptions[$index]}"
+  REALITY_ENCRYPTION="${encryptions[$index]}"
+}
+
 reality_generate_keypair() {
   local output core
   core="$(reality_detect_core 2>/dev/null)" || core=""
@@ -720,6 +900,7 @@ reality_generate_keypair() {
 reality_migrate_legacy_installation() {
   local legacy_config="$REALITY_DIR/config.json" transport port sni flow
   local private_key public_key short_id service_name id users_json link_file
+  local decryption encryption vless_encryption_mode link_encryption
 
   mkdir -p "$REALITY_INSTANCES_DIR"
   reality_have_instances && return 0
@@ -733,18 +914,24 @@ reality_migrate_legacy_installation() {
   private_key="$(jq -r '.inbounds[0].tls.reality.private_key // empty' "$legacy_config")"
   short_id="$(jq -r '.inbounds[0].tls.reality.short_id[0] // empty' "$legacy_config")"
   service_name="$(jq -r '.inbounds[0].transport.service_name // ""' "$legacy_config")"
+  decryption="$(jq -r '.inbounds[0].decryption // "none"' "$legacy_config")"
+  [[ -n "$decryption" ]] || decryption="none"
   users_json="$(jq -c '[.inbounds[0].users[]? | {name:(.name // "default"), uuid:.uuid}]' "$legacy_config")"
 
   [[ "$port" =~ ^[0-9]+$ && -n "$sni" && -n "$private_key" && -n "$short_id" ]] || return 0
   [[ "$users_json" != "[]" ]] || return 0
 
   public_key=""
+  encryption="none"
   for link_file in "$REALITY_DIR/config.txt" "$REALITY_DIR/user-config.txt"; do
     if [[ -f "$link_file" ]]; then
       public_key="$(grep -oE 'pbk=[^&[:space:]]+' "$link_file" 2>/dev/null | head -n 1 | cut -d= -f2-)"
+      link_encryption="$(grep -oE 'encryption=[^&[:space:]]+' "$link_file" 2>/dev/null | head -n 1 | cut -d= -f2-)"
+      [[ -n "$link_encryption" ]] && encryption="$link_encryption"
       [[ -n "$public_key" ]] && break
     fi
   done
+  vless_encryption_mode="$(reality_encryption_mode_from_value "$encryption")"
 
   id="legacy-${transport}-${port}"
   if ! jq -n \
@@ -757,6 +944,9 @@ reality_migrate_legacy_installation() {
     --arg private_key "$private_key" \
     --arg public_key "$public_key" \
     --arg short_id "$short_id" \
+    --arg vless_encryption_mode "$vless_encryption_mode" \
+    --arg decryption "$decryption" \
+    --arg encryption "$encryption" \
     --argjson users "$users_json" \
     '{
       id: $id,
@@ -768,6 +958,9 @@ reality_migrate_legacy_installation() {
       private_key: $private_key,
       public_key: $public_key,
       short_id: $short_id,
+      vless_encryption_mode: $vless_encryption_mode,
+      decryption: $decryption,
+      encryption: $encryption,
       users: $users,
       migrated_from_legacy: true
     }' >"$(reality_instance_path "$id")"; then
@@ -842,6 +1035,7 @@ reality_collect_instance_settings() {
   local current_file="${1:-}" forced_transport="${2:-}"
   local default_id="" default_transport="tcp" default_port="443" default_sni=""
   local default_flow="" default_service_name="" old_id="" default_candidate
+  local default_encryption_mode="none" default_decryption="none" default_encryption="none"
 
   if [[ -n "$current_file" && -f "$current_file" ]]; then
     old_id="$(jq -r '.id' "$current_file")"
@@ -851,6 +1045,13 @@ reality_collect_instance_settings() {
     default_sni="$(jq -r '.sni' "$current_file")"
     default_flow="$(jq -r '.flow // ""' "$current_file")"
     default_service_name="$(jq -r '.service_name // ""' "$current_file")"
+    default_decryption="$(jq -r '.decryption // "none"' "$current_file")"
+    default_encryption="$(jq -r '.encryption // "none"' "$current_file")"
+    default_encryption_mode="$(jq -r '.vless_encryption_mode // empty' "$current_file")"
+    case "$default_encryption_mode" in
+      none | x25519 | mlkem768) ;;
+      *) default_encryption_mode="$(reality_encryption_mode_from_value "$default_encryption")" ;;
+    esac
   fi
 
   if [[ "$forced_transport" == "tcp" || "$forced_transport" == "grpc" ]]; then
@@ -904,6 +1105,19 @@ reality_collect_instance_settings() {
       return 1
     fi
   fi
+
+  REALITY_ENCRYPTION_MODE="$(select_reality_encryption_mode "$default_encryption_mode")" || return 1
+  if [[ "$REALITY_ENCRYPTION_MODE" == "none" ]]; then
+    REALITY_DECRYPTION="none"
+    REALITY_ENCRYPTION="none"
+  elif [[ "$REALITY_ENCRYPTION_MODE" == "$default_encryption_mode" ]] &&
+    [[ "$default_decryption" == mlkem768x25519plus.* ]] &&
+    [[ "$default_encryption" == mlkem768x25519plus.* ]]; then
+    REALITY_DECRYPTION="$default_decryption"
+    REALITY_ENCRYPTION="$default_encryption"
+  else
+    reality_generate_vless_encryption_pair "$REALITY_ENCRYPTION_MODE" || return 1
+  fi
 }
 
 reality_build_singbox_config() {
@@ -930,6 +1144,7 @@ reality_build_singbox_config() {
               tag: ("reality-" + $instance.id),
               listen: "::",
               listen_port: $instance.port,
+              decryption: ($instance.decryption // "none"),
               users: [
                 $instance.users[]
                 | {name: .name, uuid: .uuid}
@@ -1023,7 +1238,7 @@ reality_build_xray_config() {
                         {}
                       end
                 ],
-                decryption: "none"
+                decryption: ($instance.decryption // "none")
               },
               sniffing: {
                 enabled: true,
@@ -1353,7 +1568,7 @@ reality_commit_stage() {
 
 reality_build_link() {
   local instance_file="$1" user_name="$2" address="$3"
-  local uuid transport port sni flow service_name public_key short_id id authority query
+  local uuid transport port sni flow service_name public_key short_id id encryption authority query
 
   uuid="$(jq -r --arg name "$user_name" '.users[] | select(.name == $name) | .uuid' "$instance_file")"
   transport="$(jq -r '.transport' "$instance_file")"
@@ -1364,6 +1579,8 @@ reality_build_link() {
   public_key="$(jq -r '.public_key // ""' "$instance_file")"
   short_id="$(jq -r '.short_id' "$instance_file")"
   id="$(jq -r '.id' "$instance_file")"
+  encryption="$(jq -r '.encryption // "none"' "$instance_file")"
+  [[ -n "$encryption" ]] || encryption="none"
   [[ -n "$uuid" && -n "$public_key" ]] || return 1
 
   address="${address#[}"
@@ -1374,7 +1591,7 @@ reality_build_link() {
     authority="$address"
   fi
 
-  query="encryption=none&security=reality&sni=$(reality_urlencode "$sni")&fp=firefox&pbk=$(reality_urlencode "$public_key")&sid=$(reality_urlencode "$short_id")&type=$transport"
+  query="encryption=$(reality_urlencode "$encryption")&security=reality&sni=$(reality_urlencode "$sni")&fp=firefox&pbk=$(reality_urlencode "$public_key")&sid=$(reality_urlencode "$short_id")&type=$transport"
   if [[ "$transport" == "grpc" ]]; then
     query+="&serviceName=$(reality_urlencode "$service_name")"
   elif [[ -n "$flow" ]]; then
@@ -1397,7 +1614,7 @@ reality_wait_for_enter() {
 
 reality_display_user_link() {
   local id="$1" user_name="$2" instance_file public_ipv4 public_ipv6 manual_address
-  local ipv4_link="" ipv6_link=""
+  local ipv4_link="" ipv6_link="" encryption_mode
   instance_file="$(reality_instance_path "$id")"
   [[ -f "$instance_file" ]] || return 1
 
@@ -1429,6 +1646,11 @@ reality_display_user_link() {
 
   [[ -n "$public_ipv4" ]] && ipv4_link="$(reality_build_link "$instance_file" "$user_name" "$public_ipv4")"
   [[ -n "$public_ipv6" ]] && ipv6_link="$(reality_build_link "$instance_file" "$user_name" "$public_ipv6")"
+  encryption_mode="$(jq -r '.vless_encryption_mode // empty' "$instance_file")"
+  case "$encryption_mode" in
+    none | x25519 | mlkem768) ;;
+    *) encryption_mode="$(reality_encryption_mode_from_value "$(jq -r '.encryption // "none"' "$instance_file")")" ;;
+  esac
 
   clear
   echo "VLESS + Reality"
@@ -1437,6 +1659,7 @@ reality_display_user_link() {
   echo "Port      : $(jq -r '.port' "$instance_file")"
   echo "SNI       : $(jq -r '.sni' "$instance_file")"
   echo "User      : $user_name"
+  echo "VLESS Enc : $(reality_encryption_label "$encryption_mode")"
   if [[ "$(jq -r '.transport' "$instance_file")" == "tcp" ]]; then
     echo "Flow      : $(jq -r 'if (.flow // "") == "" then "disabled" else .flow end' "$instance_file")"
   else
@@ -1494,6 +1717,9 @@ reality_create_instance() {
     --arg private_key "$REALITY_PRIVATE_KEY" \
     --arg public_key "$REALITY_PUBLIC_KEY" \
     --arg short_id "$short_id" \
+    --arg vless_encryption_mode "$REALITY_ENCRYPTION_MODE" \
+    --arg decryption "$REALITY_DECRYPTION" \
+    --arg encryption "$REALITY_ENCRYPTION" \
     --arg uuid "$uuid" \
     '{
       id: $id,
@@ -1505,6 +1731,9 @@ reality_create_instance() {
       private_key: $private_key,
       public_key: $public_key,
       short_id: $short_id,
+      vless_encryption_mode: $vless_encryption_mode,
+      decryption: $decryption,
+      encryption: $encryption,
       users: [{name: "default", uuid: $uuid}]
     }' >"$(reality_instance_path "$REALITY_ID" "$stage_dir")"; then
     rm -rf "$stage_dir"
@@ -1540,12 +1769,18 @@ reality_edit_instance() {
     --arg sni "$REALITY_SNI" \
     --arg flow "$REALITY_FLOW" \
     --arg service_name "$REALITY_SERVICE_NAME" \
+    --arg vless_encryption_mode "$REALITY_ENCRYPTION_MODE" \
+    --arg decryption "$REALITY_DECRYPTION" \
+    --arg encryption "$REALITY_ENCRYPTION" \
     '.id = $id |
      .transport = $transport |
      .port = $port |
      .sni = $sni |
      .flow = $flow |
-     .service_name = $service_name' \
+     .service_name = $service_name |
+     .vless_encryption_mode = $vless_encryption_mode |
+     .decryption = $decryption |
+     .encryption = $encryption' \
     "$staged_file" >"$stage_dir/.edited.json"; then
     rm -rf "$stage_dir"
     tui_error "Could not edit the Reality instance record."
@@ -1673,6 +1908,70 @@ show_reality_config() {
   id="$(reality_select_instance "Select a Reality config to view:")" || return 0
   name="$(reality_select_user "$id" "Select a user to show its links:")" || return 0
   reality_display_user_link "$id" "$name"
+}
+
+change_reality_vless_encryption() {
+  local id instance_file current_mode new_mode current_encryption
+  local stage_dir staged_file first_user current_label new_label
+
+  reality_prepare_manager
+  id="$(reality_select_instance "Select the Reality config whose VLESS Encryption will change:")" || return 0
+  instance_file="$(reality_instance_path "$id")"
+  current_encryption="$(jq -r '.encryption // "none"' "$instance_file")"
+  current_mode="$(jq -r '.vless_encryption_mode // empty' "$instance_file")"
+  case "$current_mode" in
+    none | x25519 | mlkem768) ;;
+    *) current_mode="$(reality_encryption_mode_from_value "$current_encryption")" ;;
+  esac
+
+  new_mode="$(select_reality_encryption_mode "$current_mode")" || return 0
+  if [[ "$new_mode" == "$current_mode" ]]; then
+    whiptail --msgbox \
+      "'$id' already uses $(reality_encryption_label "$current_mode"). No changes were made." \
+      11 72
+    clear
+    return 0
+  fi
+
+  current_label="$(reality_encryption_label "$current_mode")"
+  new_label="$(reality_encryption_label "$new_mode")"
+  if ! whiptail --title "Change VLESS Encryption" --yesno \
+    "Change '$id' from '$current_label' to '$new_label'? All existing user links for this config must be replaced after this change." \
+    14 78; then
+    return 0
+  fi
+
+  if [[ "$new_mode" == "none" ]]; then
+    REALITY_DECRYPTION="none"
+    REALITY_ENCRYPTION="none"
+  else
+    reality_ensure_core || return 1
+    reality_generate_vless_encryption_pair "$new_mode" || return 1
+  fi
+
+  stage_dir="$(reality_stage_instances)" || return 1
+  staged_file="$(reality_instance_path "$id" "$stage_dir")"
+  if ! jq \
+    --arg mode "$new_mode" \
+    --arg decryption "$REALITY_DECRYPTION" \
+    --arg encryption "$REALITY_ENCRYPTION" \
+    '.vless_encryption_mode = $mode |
+     .decryption = $decryption |
+     .encryption = $encryption' \
+    "$staged_file" >"$stage_dir/.encryption.json"; then
+    rm -rf "$stage_dir"
+    tui_error "Could not update the Reality VLESS Encryption record."
+    return 1
+  fi
+  mv "$stage_dir/.encryption.json" "$staged_file"
+  if ! reality_commit_stage "$stage_dir"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  rm -rf "$stage_dir"
+
+  first_user="$(jq -r '.users[0].name' "$(reality_instance_path "$id")")"
+  reality_display_user_link "$id" "$first_user"
 }
 
 regenerate_keys() {
@@ -1813,14 +2112,15 @@ reality_manager_menu() {
     choice=$(whiptail --clear --title "Reality Multi-Config Manager" \
       --menu "Core: $current_core | WARP is managed centrally from main menu option 6:" 28 78 15 \
       "1" "Create a new config" \
-      "2" "Edit an existing config" \
+      "2" "Edit config / VLESS Encryption" \
       "3" "Delete a config" \
       "4" "Add a user" \
       "5" "Remove a user" \
       "6" "Show user links / QR" \
       "7" "Regenerate keys for one config" \
-      "8" "Select / update Reality core" \
-      "9" "Uninstall all Reality configs" \
+      "8" "Change VLESS Encryption" \
+      "9" "Select / update Reality core" \
+      "10" "Uninstall all Reality configs" \
       "0" "Back to Main Menu" 3>&1 1>&2 2>&3) || break
     case "$choice" in
       "1") clear; reality_create_instance ;;
@@ -1830,8 +2130,9 @@ reality_manager_menu() {
       "5") clear; remove_reality_user ;;
       "6") clear; show_reality_config ;;
       "7") clear; regenerate_keys ;;
-      "8") clear; change_reality_core ;;
-      "9") clear; uninstall_reality ;;
+      "8") clear; change_reality_vless_encryption ;;
+      "9") clear; change_reality_core ;;
+      "10") clear; uninstall_reality ;;
       "0") break ;;
       *) whiptail --msgbox "Invalid choice." 10 40 ;;
     esac
@@ -3803,7 +4104,7 @@ csf_apply_install_port_defaults_c() {
 csf_install_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Install"
+  echo " CSF Firewall â€” Install"
   echo "======================================================="
   if csf_is_installed; then
     csf_warn_c "CSF is already installed."
@@ -3863,7 +4164,7 @@ csf_install_c() {
 csf_control_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Start / Stop / Reload"
+  echo " CSF Firewall â€” Start / Stop / Reload"
   echo "======================================================="
   csf_require_install || return 1
   echo " 1) Start firewall     (csf -s)"
@@ -4018,7 +4319,7 @@ csf_port_mgmt_c() {
   while true; do
     clear
     echo "======================================================="
-    echo " CSF Firewall — Port Management"
+    echo " CSF Firewall â€” Port Management"
     echo "======================================================="
     csf_show_all_ports "TCP_IN"  "\e[92m"
     echo
@@ -4045,7 +4346,7 @@ csf_port_mgmt_c() {
         case "$dc" in 1) CSFC_DIR="IN" ;; 2) CSFC_DIR="OUT" ;; *) csf_err_c "Invalid."; continue ;; esac
         local key; key="$(csf_conf_key "$CSFC_PROTO" "$CSFC_DIR")"
         echo
-        read -rp " Port(s) to add — comma separated (e.g. 443,8080,9000:9100): " input
+        read -rp " Port(s) to add â€” comma separated (e.g. 443,8080,9000:9100): " input
         [ -n "$input" ] || { csf_err_c "Input required."; continue; }
         local added=0 skipped=0
         IFS=',' read -ra new_ports <<< "$input"
@@ -4053,7 +4354,7 @@ csf_port_mgmt_c() {
           np="$(echo "$np" | tr -d ' ')"
           [ -z "$np" ] && continue
           if csf_port_exists_in_conf "$key" "$np"; then
-            csf_warn_c "Port $np already in ${key} — skipped."
+            csf_warn_c "Port $np already in ${key} â€” skipped."
             skipped=$((skipped+1))
           else
             csf_add_port_to_conf "$key" "$np"
@@ -4086,7 +4387,7 @@ csf_port_mgmt_c() {
           [ -n "$p" ] && { printf "   %3d) %s\n" "$i" "$p"; i=$((i+1)); }
         done
         echo
-        read -rp " Number(s) to remove — comma separated (e.g. 2,5,8): " picks
+        read -rp " Number(s) to remove â€” comma separated (e.g. 2,5,8): " picks
         [ -n "$picks" ] || { csf_err_c "Input required."; continue; }
         # CSFC_PORT_LIST is normalized, so the displayed number always maps to
         # the same array element. Collect unique valid indices first.
@@ -4095,7 +4396,7 @@ csf_port_mgmt_c() {
         for pick in "${pick_arr[@]}"; do
           pick="$(echo "$pick" | tr -d ' ')"
           if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#CSFC_PORT_LIST[@]}" ]; then
-            csf_warn_c "Invalid number: $pick — skipped."
+            csf_warn_c "Invalid number: $pick â€” skipped."
             continue
           fi
           local tp="${CSFC_PORT_LIST[$((pick-1))]}"
@@ -4149,7 +4450,7 @@ csf_port_mgmt_c() {
 csf_block_ip_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Block IP (add to deny list)"
+  echo " CSF Firewall â€” Block IP (add to deny list)"
   echo "======================================================="
   csf_require_install || return 1
   read -rp "IP to block: " ip
@@ -4162,7 +4463,7 @@ csf_block_ip_c() {
 csf_unblock_ip_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Unblock IP (remove from deny list)"
+  echo " CSF Firewall â€” Unblock IP (remove from deny list)"
   echo "======================================================="
   csf_require_install || return 1
   echo "Current deny list:"
@@ -4178,7 +4479,7 @@ csf_unblock_ip_c() {
 csf_allow_ip_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Allow IP (whitelist)"
+  echo " CSF Firewall â€” Allow IP (whitelist)"
   echo "======================================================="
   csf_require_install || return 1
   read -rp "IP to allow (or comma-separated list): " ips
@@ -4196,7 +4497,7 @@ csf_allow_ip_c() {
 csf_remove_allow_ip_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Remove IP from Whitelist"
+  echo " CSF Firewall â€” Remove IP from Whitelist"
   echo "======================================================="
   csf_require_install || return 1
   echo "Current allow list:"
@@ -4212,7 +4513,7 @@ csf_remove_allow_ip_c() {
 csf_show_rules_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Current Rules"
+  echo " CSF Firewall â€” Current Rules"
   echo "======================================================="
   csf_require_install || return 1
   csf -l 2>/dev/null | head -80
@@ -4223,7 +4524,7 @@ csf_show_rules_c() {
 csf_show_logs_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — LFD Logs (last 40 lines)"
+  echo " CSF Firewall â€” LFD Logs (last 40 lines)"
   echo "======================================================="
   csf_require_install || return 1
   local logfile=""
@@ -4243,7 +4544,7 @@ csf_show_logs_c() {
 csf_ping_block_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — PING Block (ICMP_IN)"
+  echo " CSF Firewall â€” PING Block (ICMP_IN)"
   echo "======================================================="
   csf_require_install || return 1
   local current current_rate
@@ -4282,7 +4583,7 @@ csf_ping_block_c() {
 csf_uninstall_c() {
   clear
   echo "======================================================="
-  echo " CSF Firewall — Uninstall"
+  echo " CSF Firewall â€” Uninstall"
   echo "======================================================="
   csf_require_install || return 1
   read -rp "Uninstall CSF completely? [y/N]: " c
@@ -4310,7 +4611,7 @@ csf_lfd_ssh_mgmt_c() {
   while true; do
     clear
     echo "======================================================="
-    echo " CSF — LFD SSH Brute-Force Settings"
+    echo " CSF â€” LFD SSH Brute-Force Settings"
     echo "======================================================="
 
     # Read current values
@@ -4358,9 +4659,9 @@ csf_lfd_ssh_mgmt_c() {
       2)
         echo
         echo " Block mode:"
-        echo "   1) Permanent  — blocked IP never auto-unblocked"
-        echo "   2) Temporary  — blocked IP unblocked after LF_TEMP_BLOCK seconds"
-        echo "   3) Both       — block permanently AND add temporary rule"
+        echo "   1) Permanent  â€” blocked IP never auto-unblocked"
+        echo "   2) Temporary  â€” blocked IP unblocked after LF_TEMP_BLOCK seconds"
+        echo "   3) Both       â€” block permanently AND add temporary rule"
         read -rp " Choose: " bm
         case "$bm" in
           1)
@@ -4436,7 +4737,7 @@ csf_menu() {
     echo "======================================================="
     echo " 1)  Install CSF"
     echo " 2)  Start / Stop / Reload"
-    echo " 3)  Port Management (TCP/UDP · IN/OUT)"
+    echo " 3)  Port Management (TCP/UDP Â· IN/OUT)"
     echo " 4)  Block IP   (add to deny list)"
     echo " 5)  Unblock IP (remove from deny list)"
     echo " 6)  Allow IP   (whitelist)"
@@ -4444,7 +4745,7 @@ csf_menu() {
     echo " 8)  Show firewall rules"
     echo " 9)  Show LFD logs"
     echo " 10) PING block (ICMP_IN)"
-    echo " 11) LFD — SSH Brute-Force Settings"
+    echo " 11) LFD â€” SSH Brute-Force Settings"
     echo " 12) Uninstall CSF"
     echo " 0)  Back"
     echo "======================================================="
@@ -4510,7 +4811,7 @@ gost_ensure_bin_m() {
 gost_create_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel — Create New"
+  echo " GOST Multi-Tunnel â€” Create New"
   echo "======================================================="
   echo " Forwards this-server:PORT -> destination:PORT (same port)"
   echo "======================================================="
@@ -4607,7 +4908,7 @@ EOF
 gost_list_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel — List"
+  echo " GOST Multi-Tunnel â€” List"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4632,7 +4933,7 @@ gost_list_m() {
 gost_delete_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel — Delete"
+  echo " GOST Multi-Tunnel â€” Delete"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4662,7 +4963,7 @@ gost_delete_m() {
 gost_status_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel — Status / Logs"
+  echo " GOST Multi-Tunnel â€” Status / Logs"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4699,7 +5000,7 @@ gost_status_m() {
 gost_restart_all_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel — Restart ALL"
+  echo " GOST Multi-Tunnel â€” Restart ALL"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4716,7 +5017,7 @@ gost_restart_all_m() {
 gost_uninstall_all_m() {
   clear
   echo "======================================================="
-  echo " GOST Multi-Tunnel — Uninstall ALL"
+  echo " GOST Multi-Tunnel â€” Uninstall ALL"
   echo "======================================================="
   shopt -s nullglob
   local files=("${GOST_SVC_DIR_M}/${GOST_SVC_PREFIX_M}"*.service)
@@ -4738,7 +5039,7 @@ gost_uninstall_all_m() {
 gost_auto_clear_cache_m() {
   clear
   echo "======================================================="
-  echo " GOST — Auto Clear Cache"
+  echo " GOST â€” Auto Clear Cache"
   echo "======================================================="
   echo " 1) Enable Auto Clear Cache"
   echo " 2) Disable Auto Clear Cache"
@@ -4774,7 +5075,7 @@ gost_multi_menu() {
     echo "======================================================="
     echo " Forward this-server:PORT -> destination:PORT (same port)"
     echo " Each tunnel is its own systemd service (gostm_<name>)"
-    echo " Supports TCP / UDP / gRPC · IPv4 and IPv6"
+    echo " Supports TCP / UDP / gRPC Â· IPv4 and IPv6"
     echo "======================================================="
     echo " 1) Create tunnel"
     echo " 2) List tunnels"
@@ -5095,7 +5396,7 @@ gtun_make_link() {
 gtun_setup_kharej() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Kharej (Exit) Setup"
+  echo " GECKO Relay Tunnel â€” Kharej (Exit) Setup"
   echo "======================================================="
   echo "This server will be the EXIT node."
   echo "Run setup on Iran (entry) after this completes."
@@ -5192,7 +5493,7 @@ gtun_setup_kharej() {
 gtun_setup_iran() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Iran (Entry) Setup"
+  echo " GECKO Relay Tunnel â€” Iran (Entry) Setup"
   echo "======================================================="
   echo "This server will be the ENTRY node."
   echo "You need the hy2://... link from the Kharej setup."
@@ -5217,7 +5518,7 @@ gtun_setup_iran() {
   local link
   read -rp "Paste hy2://... link from Kharej: " link
   if [[ ! "$link" =~ ^hy2:// ]]; then
-    echo "Invalid link — must start with hy2://"; rm -rf "$(gtun_idir "$name")"; return 1
+    echo "Invalid link â€” must start with hy2://"; rm -rf "$(gtun_idir "$name")"; return 1
   fi
 
   # Parse link: hy2://AUTH@IP:PORT?sni=...&obfs=gecko&obfs-password=...
@@ -5336,7 +5637,7 @@ gtun_pick() {
 gtun_show_status() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Status"
+  echo " GECKO Relay Tunnel â€” Status"
   echo "======================================================="
   gtun_pick || return 1
   local name="$GTUN_PICKED"
@@ -5360,7 +5661,7 @@ gtun_show_status() {
 gtun_restart_one() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Restart"
+  echo " GECKO Relay Tunnel â€” Restart"
   echo "======================================================="
   gtun_pick || return 1
   gtun_start "$GTUN_PICKED"
@@ -5369,7 +5670,7 @@ gtun_restart_one() {
 gtun_restart_all() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Restart ALL"
+  echo " GECKO Relay Tunnel â€” Restart ALL"
   echo "======================================================="
   local name any=0
   while IFS= read -r name; do
@@ -5383,7 +5684,7 @@ gtun_restart_all() {
 gtun_show_link() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Show Link"
+  echo " GECKO Relay Tunnel â€” Show Link"
   echo "======================================================="
   gtun_pick || return 1
   local name="$GTUN_PICKED"
@@ -5407,7 +5708,7 @@ gtun_show_link() {
 gtun_delete_one() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Delete"
+  echo " GECKO Relay Tunnel â€” Delete"
   echo "======================================================="
   gtun_pick || return 1
   local name="$GTUN_PICKED"
@@ -5422,7 +5723,7 @@ gtun_delete_one() {
 gtun_uninstall_all() {
   clear
   echo "======================================================="
-  echo " GECKO Relay Tunnel — Uninstall ALL"
+  echo " GECKO Relay Tunnel â€” Uninstall ALL"
   echo "======================================================="
   local names=() name
   while IFS= read -r name; do [ -n "$name" ] && names+=("$name"); done < <(gtun_instances)
@@ -7580,14 +7881,14 @@ fi
 
 while true; do
   echo "
-╭━━━╮╱╱╱╱╱╱╱╱╱╭━━╮╱╱╱╱╱╱╱╭━━━╮╱╱╱╱╱╭━╮╱╱╱╱╭━━╮╱╱╱╱╱╭╮╱╱╱╭╮╭╮
-┃╭━╮┃╱╱╱╱╱╱╱╱╱┃╭╮┃╱╱╱╱╱╱╱┃╭━╮┃╱╱╱╱╱┃╭╯╱╱╱╱╰┫┣╯╱╱╱╱╭╯╰╮╱╱┃┃┃┃
-┃╰━━┳┳━╮╭━━╮╱╱┃╰╯╰┳━━┳╮╭╮┃┃╱╰╋━━┳━┳╯╰┳┳━━╮╱┃┃╭━╮╭━┻╮╭╋━━┫┃┃┃╭━━┳━╮
-╰━━╮┣┫╭╮┫╭╮┣━━┫╭━╮┃╭╮┣╋╋╯┃┃╱╭┫╭╮┃╭╋╮╭╋┫╭╮┃╱┃┃┃╭╮┫━━┫┃┃╭╮┃┃┃┃┃┃━┫╭╯
-┃╰━╯┃┃┃┃┃╰╯┣━━┫╰━╯┃╰╯┣╋╋╮┃╰━╯┃╰╯┃┃┃┃┃┃┃╰╯┃╭┫┣┫┃┃┣━━┃╰┫╭╮┃╰┫╰┫┃━┫┃
-╰━━━┻┻╯╰┻━╮┃╱╱╰━━━┻━━┻╯╰╯╰━━━┻━━┻╯╰┻╯╰┻━╮┃╰━━┻╯╰┻━━┻━┻╯╰┻━┻━┻━━┻╯
-╱╱╱╱╱╱╱╱╭━╯┃╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╭━╯┃
-╱╱╱╱╱╱╱╱╰━━╯╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╰━━╯V6.1.0"
+â•­â”â”â”â•®â•±â•±â•±â•±â•±â•±â•±â•±â•±â•­â”â”â•®â•±â•±â•±â•±â•±â•±â•±â•­â”â”â”â•®â•±â•±â•±â•±â•±â•­â”â•®â•±â•±â•±â•±â•­â”â”â•®â•±â•±â•±â•±â•±â•­â•®â•±â•±â•±â•­â•®â•­â•®
+â”ƒâ•­â”â•®â”ƒâ•±â•±â•±â•±â•±â•±â•±â•±â•±â”ƒâ•­â•®â”ƒâ•±â•±â•±â•±â•±â•±â•±â”ƒâ•­â”â•®â”ƒâ•±â•±â•±â•±â•±â”ƒâ•­â•¯â•±â•±â•±â•±â•°â”«â”£â•¯â•±â•±â•±â•±â•­â•¯â•°â•®â•±â•±â”ƒâ”ƒâ”ƒâ”ƒ
+â”ƒâ•°â”â”â”³â”³â”â•®â•­â”â”â•®â•±â•±â”ƒâ•°â•¯â•°â”³â”â”â”³â•®â•­â•®â”ƒâ”ƒâ•±â•°â•‹â”â”â”³â”â”³â•¯â•°â”³â”³â”â”â•®â•±â”ƒâ”ƒâ•­â”â•®â•­â”â”»â•®â•­â•‹â”â”â”«â”ƒâ”ƒâ”ƒâ•­â”â”â”³â”â•®
+â•°â”â”â•®â”£â”«â•­â•®â”«â•­â•®â”£â”â”â”«â•­â”â•®â”ƒâ•­â•®â”£â•‹â•‹â•¯â”ƒâ”ƒâ•±â•­â”«â•­â•®â”ƒâ•­â•‹â•®â•­â•‹â”«â•­â•®â”ƒâ•±â”ƒâ”ƒâ”ƒâ•­â•®â”«â”â”â”«â”ƒâ”ƒâ•­â•®â”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ”â”«â•­â•¯
+â”ƒâ•°â”â•¯â”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ•°â•¯â”£â”â”â”«â•°â”â•¯â”ƒâ•°â•¯â”£â•‹â•‹â•®â”ƒâ•°â”â•¯â”ƒâ•°â•¯â”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ”ƒâ•°â•¯â”ƒâ•­â”«â”£â”«â”ƒâ”ƒâ”£â”â”â”ƒâ•°â”«â•­â•®â”ƒâ•°â”«â•°â”«â”ƒâ”â”«â”ƒ
+â•°â”â”â”â”»â”»â•¯â•°â”»â”â•®â”ƒâ•±â•±â•°â”â”â”â”»â”â”â”»â•¯â•°â•¯â•°â”â”â”â”»â”â”â”»â•¯â•°â”»â•¯â•°â”»â”â•®â”ƒâ•°â”â”â”»â•¯â•°â”»â”â”â”»â”â”»â•¯â•°â”»â”â”»â”â”»â”â”â”»â•¯
+â•±â•±â•±â•±â•±â•±â•±â•±â•­â”â•¯â”ƒâ•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•­â”â•¯â”ƒ
+â•±â•±â•±â•±â•±â•±â•±â•±â•°â”â”â•¯â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•±â•°â”â”â•¯V6.1.0"
 
   echo "By theTCS"
 
@@ -7616,9 +7917,9 @@ while true; do
   echo
 
   echo "
-▒█▀▀▀█ █▀▀ █░░ █▀▀ █▀▀ ▀▀█▀▀ 　 █▀▄▀█ █▀▀ █▀▀▄ █░░█ 　 ▄ 
-░▀▀▀▄▄ █▀▀ █░░ █▀▀ █░░ ░░█░░ 　 █░▀░█ █▀▀ █░░█ █░░█ 　 ░ 
-▒█▄▄▄█ ▀▀▀ ▀▀▀ ▀▀▀ ▀▀▀ ░░▀░░ 　 ▀░░░▀ ▀▀▀ ▀░░▀ ░▀▀▀ 　 ▀"
+â–’â–ˆâ–€â–€â–€â–ˆ â–ˆâ–€â–€ â–ˆâ–‘â–‘ â–ˆâ–€â–€ â–ˆâ–€â–€ â–€â–€â–ˆâ–€â–€ ã€€ â–ˆâ–€â–„â–€â–ˆ â–ˆâ–€â–€ â–ˆâ–€â–€â–„ â–ˆâ–‘â–‘â–ˆ ã€€ â–„ 
+â–‘â–€â–€â–€â–„â–„ â–ˆâ–€â–€ â–ˆâ–‘â–‘ â–ˆâ–€â–€ â–ˆâ–‘â–‘ â–‘â–‘â–ˆâ–‘â–‘ ã€€ â–ˆâ–‘â–€â–‘â–ˆ â–ˆâ–€â–€ â–ˆâ–‘â–‘â–ˆ â–ˆâ–‘â–‘â–ˆ ã€€ â–‘ 
+â–’â–ˆâ–„â–„â–„â–ˆ â–€â–€â–€ â–€â–€â–€ â–€â–€â–€ â–€â–€â–€ â–‘â–‘â–€â–‘â–‘ ã€€ â–€â–‘â–‘â–‘â–€ â–€â–€â–€ â–€â–‘â–‘â–€ â–‘â–€â–€â–€ ã€€ â–€"
 
   echo
 
