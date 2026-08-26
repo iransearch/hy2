@@ -5986,7 +5986,9 @@ gecko_warp_apply_singbox_json() {
       | .outbounds += [{type:"socks", tag:"warp", server:"127.0.0.1", server_port:$port, version:"5"}]
       | .route.rules = ((.route.rules // []) | map(select(.outbound != "warp")))
       | if $full then
-          .route.rules += [{action:"route", outbound:"warp", network:["tcp","udp"]}]
+          # TCP only: the WARP SOCKS5 proxy cannot carry UDP, so DNS and QUIC
+          # stay DIRECT instead of being black-holed.
+          .route.rules += [{action:"route", outbound:"warp", network:["tcp"]}]
         elif (($domains.exact | length) + ($domains.suffix | length)) > 0 then
           .route.rules += [
             ({action:"route", outbound:"warp"}
@@ -6025,7 +6027,7 @@ gecko_warp_apply_xray_json() {
       | .routing.rules = ((.routing.rules // []) | map(select(.outboundTag != "warp")))
       | (($domains.exact | map("full:" + .)) + ($domains.suffix | map("domain:" + .))) as $xdomains
       | if $full then
-          .routing.rules += [{type:"field", network:"tcp,udp", outboundTag:"warp"}]
+          .routing.rules += [{type:"field", network:"tcp", outboundTag:"warp"}]
         elif ($xdomains | length) > 0 then
           .routing.rules += [{type:"field", domain:$xdomains, outboundTag:"warp"}]
         else . end
@@ -6046,6 +6048,9 @@ gecko_warp_apply_xray_json() {
 
 build_gecko_warp_acl_rules() {
   if gecko_warp_is_full; then
+    # The WARP SOCKS5 proxy has no UDP support, so UDP (client DNS and QUIC)
+    # must stay DIRECT or every lookup fails and no site loads.
+    echo "    - direct(all, udp/*)"
     echo "    - warp(all)"
     return 0
   fi
@@ -6191,7 +6196,8 @@ enable_gecko_real_outbound_via_warp() {
   echo "======================================================="
   echo "The same policy will be applied to installed Hysteria2, Reality and XHTTP services."
   if [[ "$mode" == "full" ]]; then
-    echo "ALL domains and destinations will go through WARP; the route list is ignored."
+    echo "ALL domains and destinations will go through WARP (TCP); the route list is ignored."
+    echo "UDP (client DNS and QUIC) stays DIRECT because the WARP SOCKS5 proxy has no UDP support."
   else
     echo "Everything not listed will continue through DIRECT."
   fi
@@ -6199,8 +6205,9 @@ enable_gecko_real_outbound_via_warp() {
   [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
   if [[ "$mode" == "full" ]]; then
     echo
-    echo "Full WARP mode: every connection is forwarded to the local WARP SOCKS5 proxy."
-    echo "If the WARP proxy stops working, all client traffic stops as well."
+    echo "Full WARP mode: every TCP connection is forwarded to the local WARP SOCKS5 proxy."
+    echo "UDP (DNS, QUIC) keeps using DIRECT so name resolution never breaks."
+    echo "If the WARP proxy stops working, TCP client traffic stops as well."
     echo
     read -rp "Enable FULL WARP for all traffic? [y/N]: " CONFIRM_FULL
     case "$CONFIRM_FULL" in y|Y|yes|YES|Yes) ;; *) echo "Cancelled."; return 0 ;; esac
@@ -6429,7 +6436,7 @@ gecko_warp_proxy_menu() {
     echo
     echo " 1) Install Cloudflare WARP Proxy using fscarmen script"
     echo " 2) Enable unified SELECTIVE WARP (only listed domains via WARP)"
-    echo " 3) Enable unified FULL WARP (ALL domains via WARP)"
+    echo " 3) Enable unified FULL WARP (ALL domains via WARP, TCP)"
     echo " 4) Edit selective WARP route list"
     echo " 5) Disable unified WARP for all installed services"
     echo " 6) Show unified WARP/service status"
