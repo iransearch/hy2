@@ -5982,13 +5982,20 @@ gecko_warp_apply_singbox_json() {
     domains="$(gecko_warp_domain_sets_json)" || { rm -f "$tmp"; return 1; }
     if gecko_warp_is_full; then full="true"; else full="false"; fi
     jq --argjson port "$port" --argjson domains "$domains" --argjson full "$full" '
+      def gecko_warp_rule_is_ours:
+        (.outbound == "warp")
+        or ((.action == "reject") and (.network == ["udp"]) and (.port == [443]));
       .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
       | .outbounds += [{type:"socks", tag:"warp", server:"127.0.0.1", server_port:$port, version:"5"}]
-      | .route.rules = ((.route.rules // []) | map(select(.outbound != "warp")))
+      | .route.rules = ((.route.rules // []) | map(select(gecko_warp_rule_is_ours | not)))
       | if $full then
-          # TCP only: the WARP SOCKS5 proxy cannot carry UDP, so DNS and QUIC
-          # stay DIRECT instead of being black-holed.
-          .route.rules += [{action:"route", outbound:"warp", network:["tcp"]}]
+          # TCP only: the WARP SOCKS5 proxy cannot carry UDP, so DNS stays
+          # DIRECT. QUIC is rejected so clients fall back to TCP and never
+          # leak the server IP for HTTP/3 sites such as aistudio.google.com.
+          .route.rules += [
+            {action:"reject", network:["udp"], port:[443]},
+            {action:"route", outbound:"warp", network:["tcp"]}
+          ]
         elif (($domains.exact | length) + ($domains.suffix | length)) > 0 then
           .route.rules += [
             ({action:"route", outbound:"warp"}
@@ -5999,8 +6006,11 @@ gecko_warp_apply_singbox_json() {
     ' "$config_file" >"$tmp"
   else
     jq '
+      def gecko_warp_rule_is_ours:
+        (.outbound == "warp")
+        or ((.action == "reject") and (.network == ["udp"]) and (.port == [443]));
       .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
-      | .route.rules = ((.route.rules // []) | map(select(.outbound != "warp")))
+      | .route.rules = ((.route.rules // []) | map(select(gecko_warp_rule_is_ours | not)))
     ' "$config_file" >"$tmp"
   fi
   local status=$?
@@ -6023,19 +6033,24 @@ gecko_warp_apply_xray_json() {
     if gecko_warp_is_full; then full="true"; else full="false"; fi
     jq --argjson port "$port" --argjson domains "$domains" --argjson full "$full" '
       .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
+      | .outbounds = (.outbounds | map(select(.tag != "warp-block")))
       | .outbounds += [{protocol:"socks", tag:"warp", settings:{address:"127.0.0.1", port:$port}}]
-      | .routing.rules = ((.routing.rules // []) | map(select(.outboundTag != "warp")))
+      | .outbounds += [{protocol:"blackhole", tag:"warp-block", settings:{}}]
+      | .routing.rules = ((.routing.rules // []) | map(select((.outboundTag != "warp") and (.outboundTag != "warp-block"))))
       | (($domains.exact | map("full:" + .)) + ($domains.suffix | map("domain:" + .))) as $xdomains
       | if $full then
-          .routing.rules += [{type:"field", network:"tcp", outboundTag:"warp"}]
+          .routing.rules += [
+            {type:"field", network:"udp", port:"443", outboundTag:"warp-block"},
+            {type:"field", network:"tcp", outboundTag:"warp"}
+          ]
         elif ($xdomains | length) > 0 then
           .routing.rules += [{type:"field", domain:$xdomains, outboundTag:"warp"}]
         else . end
     ' "$config_file" >"$tmp"
   else
     jq '
-      .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
-      | .routing.rules = ((.routing.rules // []) | map(select(.outboundTag != "warp")))
+      .outbounds = ((.outbounds // []) | map(select((.tag != "warp") and (.tag != "warp-block"))))
+      | .routing.rules = ((.routing.rules // []) | map(select((.outboundTag != "warp") and (.outboundTag != "warp-block"))))
     ' "$config_file" >"$tmp"
   fi
   local status=$?
@@ -6048,8 +6063,10 @@ gecko_warp_apply_xray_json() {
 
 build_gecko_warp_acl_rules() {
   if gecko_warp_is_full; then
-    # The WARP SOCKS5 proxy has no UDP support, so UDP (client DNS and QUIC)
-    # must stay DIRECT or every lookup fails and no site loads.
+    # The WARP SOCKS5 proxy has no UDP support. QUIC is rejected so clients
+    # retry over TCP through WARP instead of leaking the server IP, while the
+    # remaining UDP (client DNS) stays DIRECT or no name resolves at all.
+    echo "    - reject(all, udp/443)"
     echo "    - direct(all, udp/*)"
     echo "    - warp(all)"
     return 0
@@ -6058,6 +6075,16 @@ build_gecko_warp_acl_rules() {
   while IFS= read -r RULE; do
     RULE="$(echo "$RULE" | sed 's/#.*$//' | xargs)"
     [ -z "$RULE" ] && continue
+    # Hysteria2 ACL understands domains, wildcards, suffix:, geoip: and
+    # geosite:. Translate what it does not know and drop the rest so one
+    # unsupported line cannot stop the whole service.
+    case "$RULE" in
+      domain:*) RULE="suffix:${RULE#domain:}" ;;
+      keyword:*)
+        echo "    # skipped unsupported rule: $RULE"
+        continue
+        ;;
+    esac
     echo "    - warp($RULE)"
   done < "$GECKO_WARP_ROUTES_FILE"
   echo "    - direct(all)"
@@ -6197,7 +6224,8 @@ enable_gecko_real_outbound_via_warp() {
   echo "The same policy will be applied to installed Hysteria2, Reality and XHTTP services."
   if [[ "$mode" == "full" ]]; then
     echo "ALL domains and destinations will go through WARP (TCP); the route list is ignored."
-    echo "UDP (client DNS and QUIC) stays DIRECT because the WARP SOCKS5 proxy has no UDP support."
+    echo "QUIC (UDP/443) is rejected so clients fall back to TCP and stay on WARP."
+    echo "Other UDP (client DNS) stays DIRECT because the WARP SOCKS5 proxy has no UDP support."
   else
     echo "Everything not listed will continue through DIRECT."
   fi
@@ -6206,7 +6234,8 @@ enable_gecko_real_outbound_via_warp() {
   if [[ "$mode" == "full" ]]; then
     echo
     echo "Full WARP mode: every TCP connection is forwarded to the local WARP SOCKS5 proxy."
-    echo "UDP (DNS, QUIC) keeps using DIRECT so name resolution never breaks."
+    echo "QUIC is blocked so HTTP/3 sites (Google, YouTube) also go through WARP over TCP."
+    echo "Client DNS keeps using DIRECT so name resolution never breaks."
     echo "If the WARP proxy stops working, TCP client traffic stops as well."
     echo
     read -rp "Enable FULL WARP for all traffic? [y/N]: " CONFIRM_FULL
