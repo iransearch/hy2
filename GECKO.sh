@@ -5997,11 +5997,16 @@ gecko_warp_apply_singbox_json() {
             {action:"route", outbound:"warp", network:["tcp"]}
           ]
         elif (($domains.exact | length) + ($domains.suffix | length)) > 0 then
-          .route.rules += [
-            ({action:"route", outbound:"warp"}
-             + if ($domains.exact | length) > 0 then {domain:$domains.exact} else {} end
-             + if ($domains.suffix | length) > 0 then {domain_suffix:$domains.suffix} else {} end)
-          ]
+          ((if ($domains.exact | length) > 0 then {domain:$domains.exact} else {} end)
+           + (if ($domains.suffix | length) > 0 then {domain_suffix:$domains.suffix} else {} end)) as $match
+          # Reject QUIC for the routed domains first: the WARP SOCKS5 proxy
+          # cannot carry UDP, so an unrejected QUIC attempt is black-holed and
+          # HTTP/3 heavy sites (aistudio.google.com) hang instead of retrying
+          # over TCP through WARP.
+          | .route.rules += [
+              ({action:"reject", network:["udp"], port:[443]} + $match),
+              ({action:"route", outbound:"warp"} + $match)
+            ]
         else . end
     ' "$config_file" >"$tmp"
   else
@@ -6044,7 +6049,10 @@ gecko_warp_apply_xray_json() {
             {type:"field", network:"tcp", outboundTag:"warp"}
           ]
         elif ($xdomains | length) > 0 then
-          .routing.rules += [{type:"field", domain:$xdomains, outboundTag:"warp"}]
+          .routing.rules += [
+            {type:"field", domain:$xdomains, network:"udp", port:"443", outboundTag:"warp-block"},
+            {type:"field", domain:$xdomains, outboundTag:"warp"}
+          ]
         else . end
     ' "$config_file" >"$tmp"
   else
@@ -6072,21 +6080,33 @@ build_gecko_warp_acl_rules() {
     return 0
   fi
   [ -f "$GECKO_WARP_ROUTES_FILE" ] || write_default_gecko_warp_routes
-  while IFS= read -r RULE; do
-    RULE="$(echo "$RULE" | sed 's/#.*$//' | xargs)"
-    [ -z "$RULE" ] && continue
+  local -a routed=()
+  local rule
+  while IFS= read -r rule; do
+    rule="$(echo "$rule" | sed 's/#.*$//' | xargs)"
+    [ -z "$rule" ] && continue
     # Hysteria2 ACL understands domains, wildcards, suffix:, geoip: and
     # geosite:. Translate what it does not know and drop the rest so one
     # unsupported line cannot stop the whole service.
-    case "$RULE" in
-      domain:*) RULE="suffix:${RULE#domain:}" ;;
+    case "$rule" in
+      domain:*) rule="suffix:${rule#domain:}" ;;
       keyword:*)
-        echo "    # skipped unsupported rule: $RULE"
+        echo "    # skipped unsupported rule: $rule"
         continue
         ;;
     esac
-    echo "    - warp($RULE)"
+    routed+=("$rule")
   done < "$GECKO_WARP_ROUTES_FILE"
+
+  # QUIC first: the WARP SOCKS5 proxy has no UDP support, so a routed domain
+  # reached over HTTP/3 would be black-holed. Rejecting it makes the client
+  # retry over TCP, which does go through WARP.
+  for rule in "${routed[@]}"; do
+    echo "    - reject($rule, udp/443)"
+  done
+  for rule in "${routed[@]}"; do
+    echo "    - warp($rule)"
+  done
   echo "    - direct(all)"
 }
 
