@@ -5793,6 +5793,14 @@ GECKO_WARP_ENABLED_FILE="$GECKO_WARP_DIR/enabled"
 GECKO_WARP_PORT_FILE="$GECKO_WARP_DIR/proxy-port"
 GECKO_WARP_ROUTES_FILE="$GECKO_WARP_DIR/routes.txt"
 GECKO_WARP_MODE_FILE="$GECKO_WARP_DIR/mode"
+GECKO_WARP_IPV4_FILE="$GECKO_WARP_DIR/ipv4-only"
+
+# When set, the cores resolve destinations to IPv4 themselves so the WARP
+# proxy has to leave over its IPv4 address. Without it WARP picks IPv6 for
+# every destination that publishes an AAAA record.
+gecko_warp_ipv4_only() {
+  [[ -f "$GECKO_WARP_IPV4_FILE" ]]
+}
 
 # Routing mode: "selective" (only the listed domains use WARP) or
 # "full" (every destination uses WARP). Older installs have no mode
@@ -5973,7 +5981,7 @@ gecko_warp_domain_sets_json() {
 
 # Apply or remove the central selective WARP policy from a sing-box JSON file.
 gecko_warp_apply_singbox_json() {
-  local config_file="$1" tmp port domains full
+  local config_file="$1" tmp port domains full ipv4
   [[ -s "$config_file" ]] || return 1
   tmp="$(mktemp /tmp/gecko-warp-singbox.XXXXXX)" || return 1
 
@@ -5981,12 +5989,14 @@ gecko_warp_apply_singbox_json() {
     port="$(gecko_warp_proxy_port)"
     domains="$(gecko_warp_domain_sets_json)" || { rm -f "$tmp"; return 1; }
     if gecko_warp_is_full; then full="true"; else full="false"; fi
-    jq --argjson port "$port" --argjson domains "$domains" --argjson full "$full" '
+    if gecko_warp_ipv4_only; then ipv4="true"; else ipv4="false"; fi
+    jq --argjson port "$port" --argjson domains "$domains" --argjson full "$full" --argjson ipv4 "$ipv4" '
       def gecko_warp_rule_is_ours:
         (.outbound == "warp")
         or ((.action == "reject") and (.network == ["udp"]) and (.port == [443]));
       .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
-      | .outbounds += [{type:"socks", tag:"warp", server:"127.0.0.1", server_port:$port, version:"5"}]
+      | .outbounds += [({type:"socks", tag:"warp", server:"127.0.0.1", server_port:$port, version:"5"}
+                        + (if $ipv4 then {domain_strategy:"ipv4_only"} else {} end))]
       | .route.rules = ((.route.rules // []) | map(select(gecko_warp_rule_is_ours | not)))
       | if $full then
           # TCP only: the WARP SOCKS5 proxy cannot carry UDP, so DNS stays
@@ -6028,7 +6038,7 @@ gecko_warp_apply_singbox_json() {
 
 # Apply or remove the same policy from an Xray Reality JSON file.
 gecko_warp_apply_xray_json() {
-  local config_file="$1" tmp port domains full
+  local config_file="$1" tmp port domains full ipv4
   [[ -s "$config_file" ]] || return 1
   tmp="$(mktemp /tmp/gecko-warp-xray.XXXXXX)" || return 1
 
@@ -6036,12 +6046,14 @@ gecko_warp_apply_xray_json() {
     port="$(gecko_warp_proxy_port)"
     domains="$(gecko_warp_domain_sets_json)" || { rm -f "$tmp"; return 1; }
     if gecko_warp_is_full; then full="true"; else full="false"; fi
-    jq --argjson port "$port" --argjson domains "$domains" --argjson full "$full" '
+    if gecko_warp_ipv4_only; then ipv4="true"; else ipv4="false"; fi
+    jq --argjson port "$port" --argjson domains "$domains" --argjson full "$full" --argjson ipv4 "$ipv4" '
       .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
       | .outbounds = (.outbounds | map(select(.tag != "warp-block")))
       | .outbounds += [{protocol:"socks", tag:"warp", settings:{address:"127.0.0.1", port:$port}}]
       | .outbounds += [{protocol:"blackhole", tag:"warp-block", settings:{}}]
       | .routing.rules = ((.routing.rules // []) | map(select((.outboundTag != "warp") and (.outboundTag != "warp-block"))))
+      | .routing.domainStrategy = (if $ipv4 then "UseIPv4" else "AsIs" end)
       | (($domains.exact | map("full:" + .)) + ($domains.suffix | map("domain:" + .))) as $xdomains
       | if $full then
           .routing.rules += [
@@ -6059,6 +6071,7 @@ gecko_warp_apply_xray_json() {
     jq '
       .outbounds = ((.outbounds // []) | map(select((.tag != "warp") and (.tag != "warp-block"))))
       | .routing.rules = ((.routing.rules // []) | map(select((.outboundTag != "warp") and (.outboundTag != "warp-block"))))
+      | .routing.domainStrategy = "AsIs"
     ' "$config_file" >"$tmp"
   fi
   local status=$?
@@ -6346,6 +6359,11 @@ show_gecko_warp_status() {
   if gecko_warp_is_enabled; then
     echo "Unified state: ENABLED (SOCKS5 127.0.0.1:$(gecko_warp_proxy_port))"
     echo "Routing mode:  $(gecko_warp_mode_label)"
+    if gecko_warp_ipv4_only; then
+      echo "Address family: IPv4 forced for Reality/XHTTP (Hysteria2 follows the WARP client)"
+    else
+      echo "Address family: default (WARP picks IPv6 whenever the site has an AAAA record)"
+    fi
   else
     echo "Unified state: DISABLED"
     echo "Last routing mode: $(gecko_warp_mode_label)"
@@ -6468,6 +6486,63 @@ edit_gecko_warp_routes() {
   fi
 }
 
+toggle_gecko_warp_ipv4_only() {
+  local backup_dir
+  clear
+  echo "======================================================="
+  echo " Force IPv4 egress through WARP"
+  echo "======================================================="
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
+  echo "WARP is usually dual stack, so any site publishing an AAAA record is"
+  echo "reached over the WARP IPv6 address. Some services (Google AI Studio)"
+  echo "treat those IPv6 ranges differently from the IPv4 ones."
+  echo
+  echo "This switch makes Reality and XHTTP resolve destinations to IPv4"
+  echo "themselves, so WARP has to use its IPv4 address."
+  echo
+  echo "Hysteria2 cannot do this: its socks5 outbound takes only addr,"
+  echo "username and password, so the WARP client decides the address family."
+  echo "For Hysteria2 switch the WARP client itself to IPv4 in the fscarmen menu."
+  echo "======================================================="
+  gecko_warp_prepare_storage
+  if gecko_warp_ipv4_only; then
+    echo "Current: IPv4 forced."
+    read -rp "Turn it OFF and go back to the default? [y/N]: " ANSWER
+    case "$ANSWER" in y|Y|yes|YES|Yes) ;; *) echo "Unchanged."; return 0 ;; esac
+  else
+    echo "Current: default (WARP may leave over IPv6)."
+    read -rp "Turn IPv4-only egress ON? [y/N]: " ANSWER
+    case "$ANSWER" in y|Y|yes|YES|Yes) ;; *) echo "Unchanged."; return 0 ;; esac
+  fi
+
+  if gecko_warp_is_enabled; then
+    backup_dir="$(mktemp -d /tmp/gecko-warp-backup.XXXXXX)" || return 1
+    gecko_warp_backup_all "$backup_dir" || { rm -rf "$backup_dir"; return 1; }
+  fi
+  if gecko_warp_ipv4_only; then
+    rm -f "$GECKO_WARP_IPV4_FILE"
+  else
+    touch "$GECKO_WARP_IPV4_FILE"
+  fi
+  if gecko_warp_is_enabled; then
+    if ! gecko_warp_refresh_all; then
+      echo "A service rejected the change; restoring every previous configuration."
+      gecko_warp_restore_all "$backup_dir"
+      rm -rf "$backup_dir"
+      return 1
+    fi
+    rm -rf "$backup_dir"
+  fi
+  if gecko_warp_ipv4_only; then
+    echo "IPv4-only egress is ON for Reality/XHTTP."
+  else
+    echo "IPv4-only egress is OFF."
+  fi
+  echo
+  echo "Check the WARP exit address with:"
+  echo "  curl -s --socks5-hostname 127.0.0.1:$(gecko_warp_proxy_port) https://api.ipify.org"
+}
+
 gecko_warp_proxy_menu() {
   while true; do
     clear
@@ -6490,6 +6565,7 @@ gecko_warp_proxy_menu() {
     echo " 5) Disable unified WARP for all installed services"
     echo " 6) Show unified WARP/service status"
     echo " 7) Test local WARP SOCKS5 proxy"
+    echo " 8) Force IPv4 egress through WARP (Reality/XHTTP)"
     echo " 0) Back"
     echo "======================================================="
     read -rp "Choose: " WARP_CHOICE
@@ -6501,6 +6577,7 @@ gecko_warp_proxy_menu() {
       5) disable_gecko_real_outbound_via_warp; read -rp "Press Enter to return to WARP menu..." ;;
       6) show_gecko_warp_status; read -rp "Press Enter to return to WARP menu..." ;;
       7) test_gecko_warp_proxy; read -rp "Press Enter to return to WARP menu..." ;;
+      8) toggle_gecko_warp_ipv4_only; read -rp "Press Enter to return to WARP menu..." ;;
       0) return ;;
       *) echo "Invalid choice."; sleep 1 ;;
     esac
