@@ -6111,6 +6111,9 @@ write_default_gecko_warp_routes() {
     'suffix:cdn-apple.com'
     'suffix:labs.google'
     'suffix:netflix.com'
+    'suffix:googlevideo.com'
+    'suffix:ggpht.com'
+    'suffix:withgoogle.com'
   )
 
   gecko_warp_prepare_storage
@@ -6135,6 +6138,9 @@ suffix:showip.net
 suffix:cdn-apple.com
 suffix:labs.google
 suffix:netflix.com
+suffix:googlevideo.com
+suffix:ggpht.com
+suffix:withgoogle.com
 EOF
   fi
 
