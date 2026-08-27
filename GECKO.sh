@@ -5995,7 +5995,12 @@ gecko_warp_apply_xray_json() {
     port="$(gecko_warp_proxy_port)"
     domains="$(gecko_warp_domain_sets_json)" || { rm -f "$tmp"; return 1; }
     jq --argjson port "$port" --argjson domains "$domains" '
-      .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
+      # Hand the sniffed domain, not the client supplied IP, to the WARP proxy.
+      # With routeOnly the socks5 outbound dials a raw IP, WARP cannot resolve
+      # the name itself, and services like Google AI Studio answer differently
+      # than they do for Hysteria2, which always forwards the domain.
+      .inbounds = ((.inbounds // []) | map(if .sniffing then .sniffing.routeOnly = false else . end))
+      | .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
       | .outbounds += [{protocol:"socks", tag:"warp", settings:{address:"127.0.0.1", port:$port}}]
       | .routing.rules = ((.routing.rules // []) | map(select(.outboundTag != "warp")))
       | (($domains.exact | map("full:" + .)) + ($domains.suffix | map("domain:" + .))) as $xdomains
@@ -6005,7 +6010,8 @@ gecko_warp_apply_xray_json() {
     ' "$config_file" >"$tmp"
   else
     jq '
-      .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
+      .inbounds = ((.inbounds // []) | map(if .sniffing then .sniffing.routeOnly = true else . end))
+      | .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
       | .routing.rules = ((.routing.rules // []) | map(select(.outboundTag != "warp")))
     ' "$config_file" >"$tmp"
   fi
