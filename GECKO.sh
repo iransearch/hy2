@@ -5,7 +5,7 @@ source <(curl -sSL https://raw.githubusercontent.com/TheyCallMeSecond/config-exa
 # -----------------------------------------------------------------------------
 # TUI-only overrides
 #   - Install the latest sing-box-extended release instead of the upstream core.
-#   - Let Reality use either the latest Xray-core or sing-box-extended.
+#   - Let Reality and XHTTP use either the latest Xray-core or sing-box-extended.
 #   - Manage simultaneous TCP/gRPC Reality configs with optional XTLS Vision.
 #   - Generate matched X25519 or ML-KEM-768 VLESS Encryption pairs for Reality.
 #   - Add a complete VLESS + XHTTP + TLS manager.
@@ -19,6 +19,7 @@ REALITY_INSTANCES_DIR="$REALITY_DIR/instances"
 REALITY_SERVICE="RS"
 REALITY_CORE_FILE="$REALITY_DIR/core"
 XHTTP_DIR="/etc/xhttp"
+XHTTP_CORE_FILE="/etc/xhttp/core"
 XHTTP_SERVICE="XH"
 GECKO_LOG_CLEANUP_JOB="/etc/cron.daily/cleanup-var-log"
 
@@ -2448,8 +2449,206 @@ xhttp_prepare_certificate() {
   fi
 }
 
+# =======================================================
+# XHTTP core selection. XHTTP can run on Xray-core or on
+# sing-box-extended, the same way Reality does.
+# =======================================================
+xhttp_detect_core() {
+  local saved="" version_line=""
+  if [[ -f "$XHTTP_CORE_FILE" ]]; then
+    saved="$(tr -d '[:space:]' <"$XHTTP_CORE_FILE")"
+    if [[ "$saved" == "xray" || "$saved" == "sing-box" ]]; then
+      printf '%s' "$saved"
+      return 0
+    fi
+  fi
+  # Older installs have no marker file: recognise the config shape instead.
+  if [[ -s "$XHTTP_DIR/config.json" ]] &&
+    jq -e '.inbounds[0].settings.clients' "$XHTTP_DIR/config.json" >/dev/null 2>&1; then
+    printf 'xray'
+    return 0
+  fi
+  if [[ -x "/usr/bin/$XHTTP_SERVICE" ]]; then
+    version_line="$("/usr/bin/$XHTTP_SERVICE" version 2>/dev/null | head -n 1)"
+    case "$version_line" in
+      Xray\ *) printf 'xray'; return 0 ;;
+      sing-box\ version\ *) printf 'sing-box'; return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+xhttp_save_core() {
+  local core="$1"
+  [[ "$core" == "xray" || "$core" == "sing-box" ]] || return 1
+  mkdir -p "$XHTTP_DIR" || return 1
+  printf '%s\n' "$core" >"$XHTTP_CORE_FILE" || return 1
+  chmod 0600 "$XHTTP_CORE_FILE" 2>/dev/null || true
+}
+
+select_xhttp_core() {
+  local default_core="${1:-sing-box}" default_item choice
+  if [[ "$default_core" == "xray" ]]; then
+    default_item="xray"
+  else
+    default_item="sing-box"
+  fi
+  choice=$(whiptail --clear --title "XHTTP Core" --default-item "$default_item" \
+    --menu "Select the core for VLESS + XHTTP + TLS:" 16 76 2 \
+    "xray" "Xray-core (XTLS/Xray-core)" \
+    "sing-box" "sing-box-extended" \
+    2>&1 >/dev/tty) || return 1
+  printf '%s' "$choice"
+}
+
+xhttp_install_core() {
+  local core="$1"
+  case "$core" in
+    xray) install_xray_core "$XHTTP_SERVICE" ;;
+    sing-box) install_core "$XHTTP_SERVICE" ;;
+    *) tui_error "Unknown XHTTP core: $core"; return 1 ;;
+  esac
+}
+
+# Validate a candidate config with whichever core is installed.
+xhttp_check_config() {
+  local config_file="$1" core="${2:-}"
+  [[ -n "$core" ]] || core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
+  case "$core" in
+    xray) "/usr/bin/$XHTTP_SERVICE" run -test -format=json -c "$config_file" ;;
+    *) "/usr/bin/$XHTTP_SERVICE" check -c "$config_file" ;;
+  esac
+}
+
+# Users are stored differently by each core. These helpers hide that and
+# always speak the neutral {name, uuid} form used by the link generator.
+xhttp_list_users() {
+  local config_file="$1" core="${2:-}"
+  [[ -n "$core" ]] || core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
+  if [[ "$core" == "xray" ]]; then
+    jq -r '.inbounds[0].settings.clients[]? | [(.email // ""), .id] | @tsv' "$config_file"
+  else
+    jq -r '.inbounds[0].users[]? | [.name, .uuid] | @tsv' "$config_file"
+  fi
+}
+
+xhttp_users_json() {
+  local config_file="$1" core="${2:-}"
+  [[ -n "$core" ]] || core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
+  if [[ "$core" == "xray" ]]; then
+    jq -c '[.inbounds[0].settings.clients[]? | {name: (.email // ""), uuid: .id}]' "$config_file"
+  else
+    jq -c '[.inbounds[0].users[]? | {name: .name, uuid: .uuid}]' "$config_file"
+  fi
+}
+
+xhttp_user_count() {
+  local config_file="$1" core="${2:-}"
+  xhttp_list_users "$config_file" "$core" | grep -c . || true
+}
+
+xhttp_add_user_to_config() {
+  local config_file="$1" name="$2" uuid="$3" core="${4:-}"
+  [[ -n "$core" ]] || core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
+  if [[ "$core" == "xray" ]]; then
+    jq --arg name "$name" --arg uuid "$uuid" \
+      '.inbounds[0].settings.clients += [{"id":$uuid,"email":$name}]' "$config_file"
+  else
+    jq --arg name "$name" --arg uuid "$uuid" \
+      '.inbounds[0].users += [{"name":$name,"uuid":$uuid}]' "$config_file"
+  fi
+}
+
+xhttp_remove_user_from_config() {
+  local config_file="$1" name="$2" core="${3:-}"
+  [[ -n "$core" ]] || core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
+  if [[ "$core" == "xray" ]]; then
+    jq --arg name "$name" \
+      '.inbounds[0].settings.clients |= map(select((.email // "") != $name))' "$config_file"
+  else
+    jq --arg name "$name" \
+      '.inbounds[0].users |= map(select(.name != $name))' "$config_file"
+  fi
+}
+
+# Xray-core flavour of the same VLESS + XHTTP + TLS inbound.
+xhttp_build_xray_config() {
+  local output_file="$1" cert_path="$2" key_path="$3" users_json="$4"
+  jq -n \
+    --argjson port "$XHTTP_PORT" \
+    --arg sni "$XHTTP_SNI" \
+    --arg host "$XHTTP_HOST" \
+    --arg cert_path "$cert_path" \
+    --arg key_path "$key_path" \
+    --arg path "$XHTTP_PATH" \
+    --argjson users "$users_json" \
+    '{
+      "log": {
+        "loglevel": "none"
+      },
+      "inbounds": [
+        {
+          "tag": "vless-xhttp-in",
+          "listen": "::",
+          "port": $port,
+          "protocol": "vless",
+          "settings": {
+            "clients": [$users[] | {"id": .uuid, "email": .name}],
+            "decryption": "none"
+          },
+          "streamSettings": {
+            "network": "xhttp",
+            "security": "tls",
+            "tlsSettings": {
+              "serverName": $sni,
+              "alpn": ["h2"],
+              "certificates": [
+                {
+                  "certificateFile": $cert_path,
+                  "keyFile": $key_path
+                }
+              ]
+            },
+            "xhttpSettings": ({
+              "path": $path,
+              "mode": "auto",
+              "xPaddingBytes": "100-1000",
+              "noSSEHeader": false,
+              "scMaxEachPostBytes": 1000000,
+              "scMaxBufferedPosts": 30,
+              "scStreamUpServerSecs": "20-80"
+            } + (if $host == "" then {} else {"host": $host} end))
+          },
+          "sniffing": {
+            "enabled": true,
+            "destOverride": ["http", "tls", "quic"],
+            "routeOnly": true
+          }
+        }
+      ],
+      "outbounds": [
+        {
+          "protocol": "freedom",
+          "tag": "direct"
+        }
+      ],
+      "routing": {
+        "domainStrategy": "AsIs",
+        "rules": []
+      }
+    }' >"$output_file" || return 1
+
+  gecko_warp_apply_xray_json "$output_file"
+}
+
 xhttp_build_server_config() {
   local output_file="$1" cert_path="$2" key_path="$3" users_json="$4"
+  local core="${5:-}"
+  [[ -n "$core" ]] || core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
+  if [[ "$core" == "xray" ]]; then
+    xhttp_build_xray_config "$output_file" "$cert_path" "$key_path" "$users_json"
+    return $?
+  fi
   jq -n \
     --argjson port "$XHTTP_PORT" \
     --arg sni "$XHTTP_SNI" \
@@ -2580,24 +2779,33 @@ xhttp_write_links() {
     [[ -n "$name" && -n "$uuid" ]] || continue
     link="$(xhttp_build_link "$metadata_file" "$uuid" "$name-XHTTP")" || return 1
     printf '%s\n' "$link" >>"$XHTTP_DIR/user-config.txt"
-  done < <(jq -r '.inbounds[0].users[] | [.name, .uuid] | @tsv' "$config_file")
+  done < <(xhttp_list_users "$config_file")
 
   xhttp_build_link "$metadata_file" "UUID" "NAME-XHTTP" >"$XHTTP_DIR/config.txt"
   printf '\n' >>"$XHTTP_DIR/config.txt"
 }
 
 xhttp_write_service() {
-  cat >"/etc/systemd/system/${XHTTP_SERVICE}.service" <<'EOF_XHTTP_SERVICE'
+  local core="${1:-}" description documentation
+  [[ -n "$core" ]] || core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
+  if [[ "$core" == "xray" ]]; then
+    description="VLESS XHTTP TLS (Xray-core)"
+    documentation="https://github.com/XTLS/Xray-core"
+  else
+    description="VLESS XHTTP TLS (sing-box-extended)"
+    documentation="https://github.com/shtorm-7/sing-box-extended"
+  fi
+  cat >"/etc/systemd/system/${XHTTP_SERVICE}.service" <<EOF_XHTTP_SERVICE
 [Unit]
-Description=VLESS XHTTP TLS (sing-box-extended)
-Documentation=https://github.com/shtorm-7/sing-box-extended
+Description=$description
+Documentation=$documentation
 After=network-online.target nss-lookup.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/XH run -c /etc/xhttp/config.json
+ExecStart=/usr/bin/$XHTTP_SERVICE run -c $XHTTP_DIR/config.json
 StandardOutput=null
 StandardError=null
 Restart=on-failure
@@ -2616,21 +2824,27 @@ xhttp_disable_logging() {
   local config_file="$XHTTP_DIR/config.json"
   local service_file="/etc/systemd/system/${XHTTP_SERVICE}.service"
   local candidate backup_dir config_changed="false" service_changed="false"
-  local was_active="false" had_service="false"
+  local was_active="false" had_service="false" core
 
   [[ -s "$config_file" ]] || return 0
   [[ -x "/usr/bin/$XHTTP_SERVICE" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 1
 
   candidate="$(mktemp /tmp/xhttp-no-log.XXXXXX)" || return 1
-  if ! jq '.log = ((.log // {}) + {disabled: true, level: "error", timestamp: false})' \
+  core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
+  if [[ "$core" == "xray" ]]; then
+    jq '.log = {loglevel: "none"}' "$config_file" >"$candidate" || {
+      rm -f "$candidate"
+      return 1
+    }
+  elif ! jq '.log = ((.log // {}) + {disabled: true, level: "error", timestamp: false})' \
     "$config_file" >"$candidate"; then
     rm -f "$candidate"
     return 1
   fi
   if ! cmp -s "$candidate" "$config_file"; then
     config_changed="true"
-    if ! "/usr/bin/$XHTTP_SERVICE" check -c "$candidate" >/dev/null 2>&1; then
+    if ! xhttp_check_config "$candidate" "$core" >/dev/null 2>&1; then
       rm -f "$candidate"
       return 1
     fi
@@ -2715,7 +2929,7 @@ xhttp_show_config() {
   }
 
   clear
-  echo "VLESS + XHTTP + TLS"
+  echo "VLESS + XHTTP + TLS  [core: $(xhttp_detect_core 2>/dev/null || echo unknown)]"
   echo "Address : $(jq -r '.address' "$metadata_file"):$(jq -r '.port' "$metadata_file")"
   echo "SNI     : $(jq -r '.sni' "$metadata_file")"
   echo "Host    : $(jq -r 'if .host == "" then "(omitted)" else .host end' "$metadata_file")"
@@ -2739,7 +2953,7 @@ xhttp_show_config() {
 configure_xhttp_tui() {
   local operation="$1" stage_dir backup_dir="" service_backup=""
   local users_json uuid check_log final_config old_installed="false"
-  local final_cert_path final_key_path user_port
+  local final_cert_path final_key_path user_port core previous_core="" final_status
 
   if [[ "$operation" == "install" && -f "$XHTTP_DIR/config.json" ]]; then
     whiptail --msgbox "XHTTP is already installed." 10 45
@@ -2753,7 +2967,9 @@ configure_xhttp_tui() {
   fi
 
   xhttp_collect_settings "$XHTTP_DIR/client.json" || return 0
-  install_core "$XHTTP_SERVICE" || return 1
+  previous_core="$(xhttp_detect_core 2>/dev/null)" || previous_core=""
+  core="$(select_xhttp_core "${previous_core:-sing-box}")" || return 0
+  xhttp_install_core "$core" || return 1
 
   stage_dir="$(mktemp -d /tmp/xhttp-stage.XXXXXX)" || {
     tui_error "Could not create the XHTTP staging directory."
@@ -2761,7 +2977,7 @@ configure_xhttp_tui() {
   }
 
   if [[ "$operation" == "modify" ]]; then
-    users_json="$(jq -c '.inbounds[0].users' "$XHTTP_DIR/config.json")"
+    users_json="$(xhttp_users_json "$XHTTP_DIR/config.json" "${previous_core:-sing-box}")"
     old_installed="true"
   else
     uuid="$(cat /proc/sys/kernel/random/uuid)"
@@ -2778,7 +2994,7 @@ configure_xhttp_tui() {
     return 1
   fi
   if ! xhttp_build_server_config "$stage_dir/config.json" \
-    "$stage_dir/server.crt" "$stage_dir/server.key" "$users_json"; then
+    "$stage_dir/server.crt" "$stage_dir/server.key" "$users_json" "$core"; then
     rm -rf "$stage_dir"
     tui_error "Could not build the XHTTP server configuration."
     return 1
@@ -2793,7 +3009,7 @@ configure_xhttp_tui() {
     rm -rf "$stage_dir"
     return 1
   }
-  if ! "/usr/bin/$XHTTP_SERVICE" check -c "$stage_dir/config.json" >"$check_log" 2>&1; then
+  if ! xhttp_check_config "$stage_dir/config.json" "$core" >"$check_log" 2>&1; then
     sed -i $'s/\033\\[[0-9;]*m//g' "$check_log" 2>/dev/null || true
     whiptail --title "XHTTP config error" --textbox "$check_log" 22 78
     rm -f "$check_log"
@@ -2810,10 +3026,19 @@ configure_xhttp_tui() {
     final_cert_path="/etc/xhttp/server.crt"
     final_key_path="/etc/xhttp/server.key"
   fi
-  if ! jq --arg cert_path "$final_cert_path" --arg key_path "$final_key_path" \
-    '.inbounds[0].tls.certificate_path = $cert_path |
-     .inbounds[0].tls.key_path = $key_path' \
-    "$stage_dir/config.json" >"$final_config"; then
+  if [[ "$core" == "xray" ]]; then
+    jq --arg cert_path "$final_cert_path" --arg key_path "$final_key_path" \
+      '.inbounds[0].streamSettings.tlsSettings.certificates =
+         [{"certificateFile": $cert_path, "keyFile": $key_path}]' \
+      "$stage_dir/config.json" >"$final_config"
+  else
+    jq --arg cert_path "$final_cert_path" --arg key_path "$final_key_path" \
+      '.inbounds[0].tls.certificate_path = $cert_path |
+       .inbounds[0].tls.key_path = $key_path' \
+      "$stage_dir/config.json" >"$final_config"
+  fi
+  final_status=$?
+  if ((final_status != 0)); then
     rm -rf "$stage_dir"
     tui_error "Could not finalize the XHTTP certificate paths."
     return 1
@@ -2837,7 +3062,8 @@ configure_xhttp_tui() {
   install -m 0644 "$stage_dir/client.json" "$XHTTP_DIR/client.json"
   install -m 0644 "$stage_dir/server.crt" "$XHTTP_DIR/server.crt"
   install -m 0600 "$stage_dir/server.key" "$XHTTP_DIR/server.key"
-  xhttp_write_service
+  xhttp_save_core "$core"
+  xhttp_write_service "$core"
   systemctl daemon-reload
 
   user_port="$XHTTP_PORT"
@@ -2908,7 +3134,7 @@ xhttp_commit_user_config() {
 }
 
 add_xhttp_user() {
-  local name uuid candidate check_log
+  local name uuid candidate check_log core
   if [[ ! -f "$XHTTP_DIR/config.json" ]]; then
     whiptail --msgbox "XHTTP is not installed yet." 10 45
     clear
@@ -2920,17 +3146,16 @@ add_xhttp_user() {
     tui_error "Invalid name. Use 1-32 ASCII letters, numbers, '.', '_' or '-'."
     return 1
   fi
-  if jq -e --arg name "$name" '.inbounds[0].users[] | select(.name == $name)' \
-    "$XHTTP_DIR/config.json" >/dev/null; then
+  core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
+  if xhttp_list_users "$XHTTP_DIR/config.json" "$core" | cut -f1 | grep -qxF "$name"; then
     tui_error "An XHTTP user with this name already exists."
     return 1
   fi
 
   uuid="$(cat /proc/sys/kernel/random/uuid)"
   candidate="$(mktemp /tmp/xhttp-user.XXXXXX)" || return 1
-  if ! jq --arg name "$name" --arg uuid "$uuid" \
-    '.inbounds[0].users += [{"name":$name,"uuid":$uuid}]' \
-    "$XHTTP_DIR/config.json" >"$candidate"; then
+  if ! xhttp_add_user_to_config "$XHTTP_DIR/config.json" "$name" "$uuid" "$core" \
+    >"$candidate"; then
     rm -f "$candidate"
     tui_error "Could not add the XHTTP user."
     return 1
@@ -2940,7 +3165,7 @@ add_xhttp_user() {
     rm -f "$candidate"
     return 1
   }
-  if ! "/usr/bin/$XHTTP_SERVICE" check -c "$candidate" >"$check_log" 2>&1; then
+  if ! xhttp_check_config "$candidate" >"$check_log" 2>&1; then
     sed -i $'s/\033\\[[0-9;]*m//g' "$check_log" 2>/dev/null || true
     whiptail --title "XHTTP config error" --textbox "$check_log" 22 78
     rm -f "$check_log" "$candidate"
@@ -2959,7 +3184,7 @@ add_xhttp_user() {
 }
 
 remove_xhttp_user() {
-  local count choice candidate check_log
+  local count choice candidate check_log core
   local name uuid
   local -a menu_items=()
 
@@ -2968,7 +3193,8 @@ remove_xhttp_user() {
     clear
     return
   fi
-  count="$(jq '.inbounds[0].users | length' "$XHTTP_DIR/config.json")"
+  core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
+  count="$(xhttp_user_count "$XHTTP_DIR/config.json" "$core")"
   if ((count <= 1)); then
     whiptail --msgbox "The last XHTTP user cannot be removed." 10 50
     return
@@ -2976,15 +3202,14 @@ remove_xhttp_user() {
 
   while IFS=$'\t' read -r name uuid; do
     menu_items+=("$name" "$uuid")
-  done < <(jq -r '.inbounds[0].users[] | [.name, .uuid] | @tsv' "$XHTTP_DIR/config.json")
+  done < <(xhttp_list_users "$XHTTP_DIR/config.json" "$core")
   choice=$(whiptail --clear --title "Remove XHTTP User" \
     --menu "Select the user to remove:" 20 78 10 \
     "${menu_items[@]}" 2>&1 >/dev/tty) || return
 
   candidate="$(mktemp /tmp/xhttp-user.XXXXXX)" || return 1
-  if ! jq --arg name "$choice" \
-    '.inbounds[0].users |= map(select(.name != $name))' \
-    "$XHTTP_DIR/config.json" >"$candidate"; then
+  if ! xhttp_remove_user_from_config "$XHTTP_DIR/config.json" "$choice" "$core" \
+    >"$candidate"; then
     rm -f "$candidate"
     tui_error "Could not remove the XHTTP user."
     return 1
@@ -2994,7 +3219,7 @@ remove_xhttp_user() {
     rm -f "$candidate"
     return 1
   }
-  if ! "/usr/bin/$XHTTP_SERVICE" check -c "$candidate" >"$check_log" 2>&1; then
+  if ! xhttp_check_config "$candidate" >"$check_log" 2>&1; then
     sed -i $'s/\033\\[[0-9;]*m//g' "$check_log" 2>/dev/null || true
     whiptail --title "XHTTP config error" --textbox "$check_log" 22 78
     rm -f "$check_log" "$candidate"
@@ -3013,14 +3238,15 @@ remove_xhttp_user() {
 }
 
 update_xhttp_core() {
-  local check_log
+  local check_log core
   if [[ ! -f "$XHTTP_DIR/config.json" ]]; then
     whiptail --msgbox "XHTTP is not installed yet." 10 45
     return
   fi
-  install_core "$XHTTP_SERVICE" || return 1
+  core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
+  xhttp_install_core "$core" || return 1
   check_log="$(mktemp /tmp/xhttp-check.XXXXXX)" || return 1
-  if ! "/usr/bin/$XHTTP_SERVICE" check -c "$XHTTP_DIR/config.json" >"$check_log" 2>&1; then
+  if ! xhttp_check_config "$XHTTP_DIR/config.json" "$core" >"$check_log" 2>&1; then
     sed -i $'s/\033\\[[0-9;]*m//g' "$check_log" 2>/dev/null || true
     whiptail --title "XHTTP config error" --textbox "$check_log" 22 78
     rm -f "$check_log"
@@ -3028,7 +3254,7 @@ update_xhttp_core() {
   fi
   rm -f "$check_log"
   if systemctl restart "$XHTTP_SERVICE"; then
-    whiptail --msgbox "The XHTTP sing-box-extended core was updated successfully." 10 60
+    whiptail --msgbox "The XHTTP $core core was updated successfully." 10 60
   else
     tui_error "The XHTTP core was updated, but its service could not restart."
     return 1
@@ -6096,14 +6322,19 @@ gecko_warp_refresh_reality() {
 }
 
 gecko_warp_refresh_xhttp() {
-  local candidate check_log
+  local candidate check_log core
   [[ -f "$XHTTP_DIR/config.json" ]] || return 0
   [[ -x "/usr/bin/$XHTTP_SERVICE" ]] || { echo "XHTTP core is missing."; return 1; }
+  core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
   candidate="$(mktemp /tmp/xhttp-warp.XXXXXX)" || return 1
   cp -a "$XHTTP_DIR/config.json" "$candidate" || { rm -f "$candidate"; return 1; }
-  gecko_warp_apply_singbox_json "$candidate" || { rm -f "$candidate"; return 1; }
+  if [[ "$core" == "xray" ]]; then
+    gecko_warp_apply_xray_json "$candidate" || { rm -f "$candidate"; return 1; }
+  else
+    gecko_warp_apply_singbox_json "$candidate" || { rm -f "$candidate"; return 1; }
+  fi
   check_log="$(mktemp /tmp/xhttp-warp-check.XXXXXX)" || { rm -f "$candidate"; return 1; }
-  if ! "/usr/bin/$XHTTP_SERVICE" check -c "$candidate" >"$check_log" 2>&1; then
+  if ! xhttp_check_config "$candidate" >"$check_log" 2>&1; then
     echo "XHTTP rejected the unified WARP configuration:"
     sed $'s/\033\[[0-9;]*m//g' "$check_log"
     rm -f "$candidate" "$check_log"
@@ -6261,6 +6492,7 @@ show_gecko_warp_status() {
   else echo 'not installed'; fi
   printf 'XHTTP:     '
   if [[ -f "$XHTTP_DIR/config.json" ]]; then
+    printf '(%s) ' "$(xhttp_detect_core 2>/dev/null || echo unknown)"
     jq -e 'any(.outbounds[]?; (.tag // "") == "warp")' "$XHTTP_DIR/config.json" >/dev/null && echo 'installed - warp: enabled' || echo 'installed - warp: disabled'
   else echo 'not installed'; fi
   echo
