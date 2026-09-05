@@ -6262,7 +6262,7 @@ gecko_warp_apply_xray_json() {
 }
 
 build_gecko_warp_acl_rules() {
-  [ -f "$GECKO_WARP_ROUTES_FILE" ] || write_default_gecko_warp_routes
+  write_default_gecko_warp_routes || return 1
   while IFS= read -r RULE; do
     RULE="$(echo "$RULE" | sed 's/#.*$//' | xargs)"
     [ -z "$RULE" ] && continue
@@ -6282,7 +6282,7 @@ build_gecko_warp_acl_rules() {
 }
 
 show_default_gecko_warp_routes() {
-  [ -f "$GECKO_WARP_ROUTES_FILE" ] || write_default_gecko_warp_routes
+  write_default_gecko_warp_routes || return 1
   cat "$GECKO_WARP_ROUTES_FILE"
 }
 
@@ -6509,11 +6509,8 @@ show_gecko_warp_status() {
   else echo 'not installed'; fi
   echo
   echo "[Selective WARP routes]"
-  if [ -f "$GECKO_WARP_ROUTES_FILE" ]; then
-    cat "$GECKO_WARP_ROUTES_FILE"
-  else
-    echo "Routes file not created yet: $GECKO_WARP_ROUTES_FILE"
-  fi
+  show_default_gecko_warp_routes || echo "Could not update/read routes: $GECKO_WARP_ROUTES_FILE"
+  echo "To apply this list to running services, use WARP menu option 2."
   echo
   echo "[Listening proxy candidates]"
   ss -lntup 2>/dev/null | grep -E ':(40000|40001|1080|8086|8080)\b' || echo "No common local proxy port found."
