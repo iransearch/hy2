@@ -6110,6 +6110,9 @@ write_default_gecko_warp_routes() {
     'suffix:showip.net'
     'suffix:cdn-apple.com'
     'suffix:labs.google'
+    'suffix:flow.google'
+    'suffix:flow-content.google'
+    'suffix:www.googletagmanager.com'
     'suffix:netflix.com'
     'suffix:googlevideo.com'
     'suffix:ggpht.com'
@@ -6137,6 +6140,9 @@ suffix:icloud.com
 suffix:showip.net
 suffix:cdn-apple.com
 suffix:labs.google
+suffix:flow.google
+suffix:flow-content.google
+suffix:www.googletagmanager.com
 suffix:netflix.com
 suffix:googlevideo.com
 suffix:ggpht.com
