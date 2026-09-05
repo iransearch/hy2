@@ -6113,6 +6113,20 @@ write_default_gecko_warp_routes() {
     'suffix:flow.google'
     'suffix:flow-content.google'
     'suffix:www.googletagmanager.com'
+    'suffix:flow.google.com'
+    'suffix:accounts.google.com'
+    'suffix:aisandbox-pa.googleapis.com'
+    'suffix:www.gstatic.com'
+    'suffix:fonts.googleapis.com'
+    'suffix:fonts.gstatic.com'
+    'suffix:lh3.googleusercontent.com'
+    'suffix:www.google.com'
+    'suffix:auditrecording-pa.googleapis.com'
+    'suffix:csp.withgoogle.com'
+    'suffix:ogads-pa.clients6.google.com'
+    'suffix:ogs.google.com'
+    'suffix:mail.google.com'
+    'suffix:support.google.com'
     'suffix:netflix.com'
     'suffix:googlevideo.com'
     'suffix:ggpht.com'
@@ -6143,6 +6157,20 @@ suffix:labs.google
 suffix:flow.google
 suffix:flow-content.google
 suffix:www.googletagmanager.com
+suffix:flow.google.com
+suffix:accounts.google.com
+suffix:aisandbox-pa.googleapis.com
+suffix:www.gstatic.com
+suffix:fonts.googleapis.com
+suffix:fonts.gstatic.com
+suffix:lh3.googleusercontent.com
+suffix:www.google.com
+suffix:auditrecording-pa.googleapis.com
+suffix:csp.withgoogle.com
+suffix:ogads-pa.clients6.google.com
+suffix:ogs.google.com
+suffix:mail.google.com
+suffix:support.google.com
 suffix:netflix.com
 suffix:googlevideo.com
 suffix:ggpht.com
