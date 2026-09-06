@@ -3767,7 +3767,25 @@ update_hysteria2_gecko_core() {
   echo "Config/accounts preserved: /etc/hysteria2 was not modified."
 }
 
+# SHA-256 of the leaf certificate, encoded as 64 hexadecimal characters.
+hysteria2_certificate_pin() {
+  local fingerprint
+  fingerprint="$(openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null)" || {
+    echo "Could not read Hysteria2 certificate fingerprint." >&2
+    return 1
+  }
+  fingerprint="${fingerprint#*=}"
+  fingerprint="${fingerprint//:/}"
+  fingerprint="${fingerprint,,}"
+  [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "Invalid Hysteria2 SHA-256 certificate fingerprint." >&2
+    return 1
+  }
+  printf '%s\n' "$fingerprint"
+}
+
 install_hysteria2_gecko_v292() {
+  local HY2_PIN_SHA256 HY2_LINK_HOST
   set -e
   HYSTERIA_BIN="/usr/local/bin/hysteria"
   HYSTERIA_DIR="/etc/hysteria2"
@@ -4020,6 +4038,7 @@ EOF_OBFS
     -subj "/CN=$HY2_SNI" \
     -days 3650 >/dev/null 2>&1
   chmod 600 "$HYSTERIA_DIR/server.key"
+  HY2_PIN_SHA256="$(hysteria2_certificate_pin "$HYSTERIA_DIR/server.crt")" || return 1
 
   cat > "$HYSTERIA_CONFIG" <<EOF
 listen: :$HY2_PORT
@@ -4085,7 +4104,11 @@ EOF
   EN_OBFS="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_OBFS")"
   EN_SNI="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_SNI")"
   EN_REMARK="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$HY2_REMARK")"
-  HY2_LINK="hy2://$EN_AUTH@$SERVER_IP:$HY2_PORT?sni=$EN_SNI&insecure=1&obfs=$HY2_OBFS_TYPE&obfs-password=$EN_OBFS#$EN_REMARK"
+  HY2_LINK_HOST="$SERVER_IP"
+  if [[ "$HY2_LINK_HOST" == *:* && "$HY2_LINK_HOST" != \[*\] ]]; then
+    HY2_LINK_HOST="[$HY2_LINK_HOST]"
+  fi
+  HY2_LINK="hy2://$EN_AUTH@$HY2_LINK_HOST:$HY2_PORT/?sni=$EN_SNI&insecure=1&pinSHA256=$HY2_PIN_SHA256&obfs=$HY2_OBFS_TYPE&obfs-password=$EN_OBFS#$EN_REMARK"
 
   cat > "$HYSTERIA_DIR/client-link.txt" <<EOF
 $HY2_LINK
