@@ -6156,12 +6156,10 @@ write_default_gecko_warp_routes() {
     'suffix:fonts.googleapis.com'
     'suffix:fonts.gstatic.com'
     'suffix:lh3.googleusercontent.com'
-    'suffix:www.google.com'
     'suffix:auditrecording-pa.googleapis.com'
     'suffix:csp.withgoogle.com'
     'suffix:ogads-pa.clients6.google.com'
     'suffix:ogs.google.com'
-    'suffix:mail.google.com'
     'suffix:support.google.com'
     'suffix:netflix.com'
     'suffix:googlevideo.com'
@@ -6200,12 +6198,10 @@ suffix:www.gstatic.com
 suffix:fonts.googleapis.com
 suffix:fonts.gstatic.com
 suffix:lh3.googleusercontent.com
-suffix:www.google.com
 suffix:auditrecording-pa.googleapis.com
 suffix:csp.withgoogle.com
 suffix:ogads-pa.clients6.google.com
 suffix:ogs.google.com
-suffix:mail.google.com
 suffix:support.google.com
 suffix:netflix.com
 suffix:googlevideo.com
@@ -6216,7 +6212,7 @@ EOF
 
   # Upgrade older route files, remove obsolete equivalents and append only
   # genuinely missing entries. Keep one copy of every non-empty rule.
-  sed -i '/^keyword:showip$/d;/^geosite:youtube$/d;/^\*\.showip\.net$/d;/^showip\.net$/d' \
+  sed -i '/^keyword:showip$/d;/^geosite:youtube$/d;/^\*\.showip\.net$/d;/^showip\.net$/d;/^suffix:mail\.google\.com$/d;/^suffix:www\.google\.com$/d' \
     "$GECKO_WARP_ROUTES_FILE" 2>/dev/null || true
   for route in "${required_routes[@]}"; do
     grep -qxF "$route" "$GECKO_WARP_ROUTES_FILE" 2>/dev/null ||
