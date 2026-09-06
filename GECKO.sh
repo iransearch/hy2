@@ -4121,7 +4121,7 @@ EOF
   if [[ "$HY2_LINK_HOST" == *:* && "$HY2_LINK_HOST" != \[*\] ]]; then
     HY2_LINK_HOST="[$HY2_LINK_HOST]"
   fi
-  HY2_LINK="hy2://$EN_AUTH@$HY2_LINK_HOST:$HY2_PORT/?sni=$EN_SNI&insecure=1&pinSHA256=$HY2_PIN_SHA256&obfs=$HY2_OBFS_TYPE&obfs-password=$EN_OBFS#$EN_REMARK"
+  HY2_LINK="hy2://$EN_AUTH@$HY2_LINK_HOST:$HY2_PORT?sni=$EN_SNI&insecure=1&allowInsecure=1&pinSHA256=$HY2_PIN_SHA256&obfs=$HY2_OBFS_TYPE&obfs-password=$EN_OBFS#$EN_REMARK"
 
   cat > "$HYSTERIA_DIR/client-link.txt" <<EOF
 $HY2_LINK
