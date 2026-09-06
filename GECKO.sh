@@ -3785,13 +3785,12 @@ hysteria2_certificate_pin() {
 }
 
 install_hysteria2_gecko_v292() {
-  local HY2_PIN_SHA256 HY2_LINK_HOST
+  local HY2_PIN_SHA256 HY2_LINK_HOST HY2_REQUESTED_VERSION
   set -e
   HYSTERIA_BIN="/usr/local/bin/hysteria"
   HYSTERIA_DIR="/etc/hysteria2"
   HYSTERIA_CONFIG="$HYSTERIA_DIR/server.yaml"
   HYSTERIA_SERVICE="/etc/systemd/system/hysteria2-gecko.service"
-  HYSTERIA_VERSION="$(hysteria_latest_version)" || { echo "Could not determine latest stable Hysteria core."; return 1; }
 
   detect_hysteria_arch() {
     case "$(uname -m)" in
@@ -3810,10 +3809,9 @@ install_hysteria2_gecko_v292() {
     return 1
   fi
 
-  HYSTERIA_URL="https://github.com/apernet/hysteria/releases/download/app%2F${HYSTERIA_VERSION}/hysteria-linux-${HY2_ARCH}"
 
   echo "======================================================="
-  echo " Hysteria2 ${HYSTERIA_VERSION} + Gecko / Salamander Obfuscation Installer"
+  echo " Hysteria2 + Gecko / Salamander Obfuscation Installer"
   echo "======================================================="
 
   if [ "$(id -u)" -ne 0 ]; then
@@ -3824,6 +3822,21 @@ install_hysteria2_gecko_v292() {
   command -v curl >/dev/null 2>&1 || { apt update -y && apt install -y curl; }
   command -v openssl >/dev/null 2>&1 || { apt update -y && apt install -y openssl; }
   command -v python3 >/dev/null 2>&1 || { apt update -y && apt install -y python3; }
+
+  read -rp "Hysteria2 version (e.g. 2.9.2; Enter = latest stable): " HY2_REQUESTED_VERSION
+  if [[ -z "$HY2_REQUESTED_VERSION" ]]; then
+    HYSTERIA_VERSION="$(hysteria_latest_version)" || {
+      echo "Could not determine latest stable Hysteria core."
+      return 1
+    }
+  elif [[ "$HY2_REQUESTED_VERSION" =~ ^2\.[0-9]+\.[0-9]+$ ]]; then
+    HYSTERIA_VERSION="v$HY2_REQUESTED_VERSION"
+  else
+    echo "Invalid version. Use a Hysteria2 version such as 2.9.2, or leave blank."
+    return 1
+  fi
+  HYSTERIA_URL="https://github.com/apernet/hysteria/releases/download/app%2F${HYSTERIA_VERSION}/hysteria-linux-${HY2_ARCH}"
+  echo "Selected Hysteria core: $HYSTERIA_VERSION"
 
   read -rp "Port [2020]: " HY2_PORT
   HY2_PORT="${HY2_PORT:-2020}"
@@ -4005,6 +4018,15 @@ EOF_OBFS
       ;;
   esac
 
+  echo "Downloading Hysteria ${HYSTERIA_VERSION} linux-${HY2_ARCH}..."
+  TMP_BIN="$(mktemp /tmp/hysteria-install.XXXXXX)"
+  if ! curl -fL --retry 3 --retry-delay 2 -o "$TMP_BIN" "$HYSTERIA_URL"; then
+    rm -f "$TMP_BIN"
+    echo "Download failed for $HYSTERIA_VERSION ($HY2_ARCH). Check that this release exists."
+    return 1
+  fi
+  chmod +x "$TMP_BIN"
+
   echo "Preparing Hysteria binary install..."
   systemctl stop hysteria2-gecko.service >/dev/null 2>&1 || true
   systemctl stop hysteria-server.service >/dev/null 2>&1 || true
@@ -4015,15 +4037,6 @@ EOF_OBFS
     pkill -x hysteria >/dev/null 2>&1 || true
     sleep 1
   fi
-
-  echo "Downloading Hysteria v2.9.2 linux-${HY2_ARCH}..."
-  TMP_BIN="$(mktemp /tmp/hysteria-v292.XXXXXX)"
-  if ! curl -fL --retry 3 --retry-delay 2 -o "$TMP_BIN" "$HYSTERIA_URL"; then
-    rm -f "$TMP_BIN"
-    echo "Download failed."
-    return 1
-  fi
-  chmod +x "$TMP_BIN"
 
   # Atomic replacement prevents 'Text file busy' when the old binary was recently running.
   install -m 0755 "$TMP_BIN" "$HYSTERIA_BIN.new"
