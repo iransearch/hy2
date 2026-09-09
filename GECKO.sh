@@ -21,6 +21,8 @@ REALITY_CORE_FILE="$REALITY_DIR/core"
 XHTTP_DIR="/etc/xhttp"
 XHTTP_CORE_FILE="/etc/xhttp/core"
 XHTTP_SERVICE="XH"
+XHTTP_LEGACY_DIR="$XHTTP_DIR"
+XHTTP_INSTANCES_DIR="/etc/xhttp-instances"
 GECKO_LOG_CLEANUP_JOB="/etc/cron.daily/cleanup-var-log"
 
 # Hysteria's native core uses HYSTERIA_LOG_LEVEL, while the Hysteria inbound
@@ -167,7 +169,7 @@ gecko_apply_log_protection() {
   install_gecko_log_cleanup_job || return 1
   gecko_patch_hysteria_singbox_log_error || return 1
   gecko_configure_hysteria_service_logging || return 1
-  xhttp_disable_logging || return 1
+  xhttp_for_each_instance xhttp_disable_logging || return 1
 }
 
 # Preserve the upstream TUI functions loaded at the top of this script, then
@@ -2270,6 +2272,173 @@ EOF_REALITY_TUI_CASE
 # server is intentionally configured in auto mode so links can independently
 # use auto, stream-up, stream-one, or packet-up.
 # -----------------------------------------------------------------------------
+# Named XHTTP instances use independent services/binaries. The old installation
+# remains at its original path as "default"; deleting it cannot delete siblings.
+xhttp_valid_instance_id() {
+  [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$ ]]
+}
+
+xhttp_instance_dir() {
+  xhttp_valid_instance_id "$1" || return 1
+  if [[ "$1" == "default" ]]; then
+    printf '%s\n' "$XHTTP_LEGACY_DIR"
+  else
+    printf '%s/%s\n' "$XHTTP_INSTANCES_DIR" "$1"
+  fi
+}
+
+xhttp_instance_ids() {
+  local file id
+  [[ -f "$XHTTP_LEGACY_DIR/config.json" ]] && printf 'default\n'
+  for file in "$XHTTP_INSTANCES_DIR"/*/config.json; do
+    [[ -f "$file" ]] || continue
+    id="${file%/config.json}"; id="${id##*/}"
+    [[ "$id" != "default" ]] && xhttp_valid_instance_id "$id" && printf '%s\n' "$id"
+  done
+  return 0
+}
+
+xhttp_with_instance() (
+  local id="$1"
+  shift
+  XHTTP_DIR="$(xhttp_instance_dir "$id")" || return 1
+  XHTTP_CORE_FILE="$XHTTP_DIR/core"
+  XHTTP_SERVICE="XH"
+  [[ "$id" == "default" ]] || XHTTP_SERVICE="XH-$id"
+  XHTTP_INSTANCE_ID="$id"
+  "$@"
+)
+
+xhttp_for_each_instance() {
+  local id ids failed=0
+  ids="$(xhttp_instance_ids)" || return 1
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    xhttp_with_instance "$id" "$@" || failed=1
+  done <<<"$ids"
+  return "$failed"
+}
+
+xhttp_select_instance() {
+  local id dir ids port
+  local -a items=()
+  ids="$(xhttp_instance_ids)" || return 1
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    dir="$(xhttp_instance_dir "$id")" || return 1
+    port="$(jq -r '.inbounds[0].port // .inbounds[0].listen_port // "?"' "$dir/config.json")"
+    items+=("$id" "Port $port")
+  done <<<"$ids"
+  if ((${#items[@]} == 0)); then
+    tui_error "No XHTTP configs exist. Create a config first."
+    return 1
+  fi
+  whiptail --clear --title "Select XHTTP config" --menu "Choose the config to manage:" \
+    20 76 10 "${items[@]}" 2>&1 >/dev/tty
+}
+
+xhttp_manage_selected() {
+  local id
+  id="$(xhttp_select_instance)" || return 0
+  xhttp_with_instance "$id" "$@"
+}
+
+xhttp_create_named_instance() {
+  local id dir
+  id=$(whiptail --inputbox "Config name (1-32 letters, digits, '_' or '-'; e.g. office-8443):" \
+    11 80 "" 2>&1 >/dev/tty) || return 0
+  if ! xhttp_valid_instance_id "$id"; then
+    tui_error "Invalid config name. Use 1-32 letters, digits, '_' or '-', starting with a letter or digit."
+    return 1
+  fi
+  dir="$(xhttp_instance_dir "$id")" || return 1
+  if [[ -e "$dir" ]]; then
+    tui_error "This config name already exists. Choose another name or manage the existing config."
+    return 1
+  fi
+  xhttp_with_instance "$id" install_xhttp
+}
+
+xhttp_port_conflicts() {
+  local port="$1" ids id dir existing current
+  ids="$(xhttp_instance_ids)" || return 1
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    dir="$(xhttp_instance_dir "$id")" || return 1
+    [[ "$dir" == "$XHTTP_DIR" ]] && continue
+    existing="$(jq -r '.inbounds[0].port // .inbounds[0].listen_port // 0' "$dir/config.json")"
+    if [[ "$existing" == "$port" ]]; then
+      tui_error "Port $port is already assigned to XHTTP config '$id'."
+      return 0
+    fi
+  done <<<"$ids"
+  current=""
+  [[ -f "$XHTTP_DIR/config.json" ]] && current="$(jq -r '.inbounds[0].port // .inbounds[0].listen_port // 0' "$XHTTP_DIR/config.json")"
+  if [[ "$current" != "$port" ]] && ss -H -lnt 2>/dev/null | awk -v port="$port" '
+      {n=split($4,a,":"); if(a[n] == port) found=1} END {exit !found}'; then
+    tui_error "TCP port $port is already listening. Choose a free port."
+    return 0
+  fi
+  return 1
+}
+
+xhttp_instance_status() {
+  echo "Config: ${XHTTP_INSTANCE_ID:-default} | Service: $XHTTP_SERVICE"
+  systemctl --no-pager --full status "$XHTTP_SERVICE" || true
+  read -rp "Press Enter to return..."
+}
+
+xhttp_instance_action() {
+  case "$1" in start | stop | restart) ;; *) return 1 ;; esac
+  if [[ "$1" == "stop" ]]; then
+    xhttp_update_restart_schedule || return 1
+  fi
+  if ! systemctl "$1" "$XHTTP_SERVICE"; then
+    tui_error "Could not $1 XHTTP config '${XHTTP_INSTANCE_ID:-default}'."
+    return 1
+  fi
+}
+
+xhttp_update_restart_schedule() {
+  local tmp
+  tmp="$(mktemp /tmp/xhttp-cron.XXXXXX)" || return 1
+  crontab -l >"$tmp" 2>/dev/null || true
+  awk -v service="$XHTTP_SERVICE" '$0 !~ ("systemctl (try-)?restart " service "([[:space:]]|$)")' "$tmp" >"$tmp.new"
+  printf '0 */5 * * * systemctl try-restart %s\n' "$XHTTP_SERVICE" >>"$tmp.new"
+  if ! crontab "$tmp.new"; then
+    rm -f "$tmp" "$tmp.new"
+    return 1
+  fi
+  rm -f "$tmp" "$tmp.new"
+}
+
+xhttp_manager_menu() {
+  local choice
+  while true; do
+    choice=$(whiptail --clear --title "VLESS + XHTTP + TLS configs" \
+      --menu "Each config has its own port, users, TLS, Encryption and service." 24 86 12 \
+      "1" "Create a config" "2" "Edit a config" "3" "Add user to a config" \
+      "4" "Remove user from a config" "5" "Show a config's user links" \
+      "6" "Update a config's core" "7" "Delete one config" \
+      "8" "Config status" "9" "Start a config" "10" "Stop a config" \
+      "11" "Restart a config" "0" "Back" 2>&1 >/dev/tty) || return 0
+    case "$choice" in
+      1) xhttp_create_named_instance ;;
+      2) xhttp_manage_selected modify_xhttp_config ;;
+      3) xhttp_manage_selected add_xhttp_user ;;
+      4) xhttp_manage_selected remove_xhttp_user ;;
+      5) xhttp_manage_selected xhttp_show_config ;;
+      6) xhttp_manage_selected update_xhttp_core ;;
+      7) xhttp_manage_selected uninstall_xhttp ;;
+      8) xhttp_manage_selected xhttp_instance_status ;;
+      9) xhttp_manage_selected xhttp_instance_action start ;;
+      10) xhttp_manage_selected xhttp_instance_action stop ;;
+      11) xhttp_manage_selected xhttp_instance_action restart ;;
+      0) return 0 ;;
+    esac
+  done
+}
+
 xhttp_urlencode() {
   jq -rn --arg value "$1" '$value | @uri'
 }
@@ -2420,6 +2589,8 @@ xhttp_collect_settings() {
     tui_error "XHTTP port must be between 1 and 65535."
     return 1
   fi
+
+  xhttp_port_conflicts "$XHTTP_PORT" && return 1
 
   XHTTP_TLS_MODE="$(select_xhttp_tls_mode "$default_tls_mode")" || return 1
   XHTTP_SNI=$(whiptail --inputbox \
@@ -3075,6 +3246,7 @@ xhttp_show_config() {
   }
 
   clear
+  echo "Config: ${XHTTP_INSTANCE_ID:-default} | Service: $XHTTP_SERVICE"
   echo "VLESS + XHTTP + TLS  [core: $(xhttp_detect_core 2>/dev/null || echo unknown)]"
   echo "Address : $(jq -r '.address' "$metadata_file"):$(jq -r '.port' "$metadata_file")"
   echo "SNI     : $(jq -r '.sni' "$metadata_file")"
@@ -3171,8 +3343,8 @@ configure_xhttp_tui() {
     final_cert_path="/etc/letsencrypt/live/$XHTTP_SNI/fullchain.pem"
     final_key_path="/etc/letsencrypt/live/$XHTTP_SNI/privkey.pem"
   else
-    final_cert_path="/etc/xhttp/server.crt"
-    final_key_path="/etc/xhttp/server.key"
+    final_cert_path="$XHTTP_DIR/server.crt"
+    final_key_path="$XHTTP_DIR/server.key"
   fi
   if [[ "$core" == "xray" ]]; then
     jq --arg cert_path "$final_cert_path" --arg key_path "$final_key_path" \
@@ -3240,9 +3412,7 @@ configure_xhttp_tui() {
     return 1
   fi
 
-  if ! crontab -l 2>/dev/null | grep -Fq "systemctl restart $XHTTP_SERVICE"; then
-    (crontab -l 2>/dev/null; echo "0 */5 * * * systemctl restart $XHTTP_SERVICE") | crontab -
-  fi
+  xhttp_update_restart_schedule || echo "Could not update this config's restart schedule."
   xhttp_write_links
 
   rm -rf "$stage_dir"
@@ -3265,15 +3435,18 @@ modify_xhttp_config() {
 }
 
 xhttp_commit_user_config() {
-  local candidate="$1" backup restart_status
+  local candidate="$1" backup restart_status=0 was_active="false"
   backup="$(mktemp /tmp/xhttp-config-backup.XXXXXX)" || return 1
   cp -a "$XHTTP_DIR/config.json" "$backup"
+  systemctl is-active --quiet "$XHTTP_SERVICE" && was_active="true"
   install -m 0600 "$candidate" "$XHTTP_DIR/config.json"
-  systemctl restart "$XHTTP_SERVICE"
-  restart_status=$?
+  if [[ "$was_active" == "true" ]]; then
+    systemctl restart "$XHTTP_SERVICE"
+    restart_status=$?
+  fi
   if ((restart_status != 0)) || ! xhttp_write_links; then
     cp -a "$backup" "$XHTTP_DIR/config.json"
-    systemctl restart "$XHTTP_SERVICE" >/dev/null 2>&1 || true
+    [[ "$was_active" == "true" ]] && systemctl restart "$XHTTP_SERVICE" >/dev/null 2>&1 || true
     xhttp_write_links >/dev/null 2>&1 || true
     rm -f "$backup"
     return 1
@@ -3412,7 +3585,7 @@ update_xhttp_core() {
 uninstall_xhttp() {
   local crontab_file
   if ! whiptail --title "Uninstall XHTTP" --yesno \
-    "Remove XHTTP, all users, certificates and generated links?" 12 68; then
+    "Remove only config '${XHTTP_INSTANCE_ID:-default}', its users, certificates and links?" 12 68; then
     return
   fi
   systemctl disable --now "$XHTTP_SERVICE" >/dev/null 2>&1 || true
@@ -3421,7 +3594,7 @@ uninstall_xhttp() {
   rm -f "/etc/systemd/system/${XHTTP_SERVICE}.service"
   crontab_file="$(mktemp /tmp/xhttp-crontab.XXXXXX)" || crontab_file=""
   if [[ -n "$crontab_file" ]] && crontab -l >"$crontab_file" 2>/dev/null; then
-    sed "/systemctl restart $XHTTP_SERVICE/d" "$crontab_file" | crontab -
+    awk -v service="$XHTTP_SERVICE" '$0 !~ ("systemctl (try-)?restart " service "([[:space:]]|$)")' "$crontab_file" | crontab -
   fi
   [[ -n "$crontab_file" ]] && rm -f "$crontab_file"
   systemctl daemon-reload
@@ -3438,28 +3611,7 @@ inject_xhttp_tui_menu() {
 
   IFS= read -r -d '' xhttp_case <<'EOF_XHTTP_TUI_CASE' || true
     "VLESS-XHTTP-tls")
-        while true; do
-            user_choice=$(whiptail --clear --title "VLESS-XHTTP-tls Menu" --menu "Please select an option:" 25 58 15 \
-                "1" "Install" \
-                "2" "Modify Config" \
-                "3" "Add a new user" \
-                "4" "Remove an existing user" \
-                "5" "Show User Configs" \
-                "6" "Update sing-box-extended core" \
-                "7" "Uninstall" \
-                "0" "Back to Main Menu" 3>&1 1>&2 2>&3)
-            case $user_choice in
-            "1") clear; install_xhttp ;;
-            "2") clear; modify_xhttp_config ;;
-            "3") clear; add_xhttp_user ;;
-            "4") clear; remove_xhttp_user ;;
-            "5") clear; xhttp_show_config ;;
-            "6") clear; update_xhttp_core ;;
-            "7") clear; uninstall_xhttp ;;
-            "0") break ;;
-            *) whiptail --msgbox "Invalid choice. Please select a valid option." 10 45 ;;
-            esac
-        done
+        xhttp_manager_menu
         ;;
 EOF_XHTTP_TUI_CASE
 
@@ -6581,11 +6733,37 @@ gecko_warp_refresh_all() {
     echo "Applying to Reality ($(reality_detect_core 2>/dev/null || echo unknown))..."
     gecko_warp_refresh_reality || { echo "Reality update failed."; failed="true"; }
   fi
-  if [[ -f "$XHTTP_DIR/config.json" ]]; then
-    echo "Applying to XHTTP..."
-    gecko_warp_refresh_xhttp || { echo "XHTTP update failed."; failed="true"; }
-  fi
+  echo "Applying to all XHTTP configs..."
+  xhttp_for_each_instance gecko_warp_refresh_xhttp || { echo "XHTTP update failed."; failed="true"; }
   [[ "$failed" == "false" ]]
+}
+
+xhttp_backup_warp_config() {
+  local dest="$1/xhttp-configs/${XHTTP_INSTANCE_ID:-default}"
+  mkdir -p "$dest" || return 1
+  cp -a "$XHTTP_DIR/config.json" "$dest/config.json" || return 1
+  systemctl is-active --quiet "$XHTTP_SERVICE" && touch "$dest/was-active"
+  return 0
+}
+
+xhttp_warp_status_line() {
+  printf 'XHTTP %-16s (%s): ' "${XHTTP_INSTANCE_ID:-default}" "$(xhttp_detect_core 2>/dev/null || echo unknown)"
+  if jq -e 'any(.outbounds[]?; (.tag // "") == "warp")' "$XHTTP_DIR/config.json" >/dev/null; then
+    echo 'warp: enabled'
+  else
+    echo 'warp: disabled'
+  fi
+}
+
+xhttp_restore_warp_config() {
+  local src="$1/xhttp-configs/${XHTTP_INSTANCE_ID:-default}"
+  [[ -f "$src/config.json" ]] || return 0
+  cp -a "$src/config.json" "$XHTTP_DIR/config.json" || return 1
+  if [[ -f "$src/was-active" ]]; then
+    systemctl restart "$XHTTP_SERVICE"
+  else
+    systemctl stop "$XHTTP_SERVICE"
+  fi
 }
 
 gecko_warp_backup_all() {
@@ -6594,7 +6772,7 @@ gecko_warp_backup_all() {
   [[ -d "$GECKO_WARP_DIR" ]] && cp -a "$GECKO_WARP_DIR" "$backup_dir/gecko-warp"
   [[ -f /etc/hysteria2/server.yaml ]] && cp -a /etc/hysteria2/server.yaml "$backup_dir/hysteria.yaml"
   [[ -f "$REALITY_DIR/config.json" ]] && cp -a "$REALITY_DIR/config.json" "$backup_dir/reality.json"
-  [[ -f "$XHTTP_DIR/config.json" ]] && cp -a "$XHTTP_DIR/config.json" "$backup_dir/xhttp.json"
+  xhttp_for_each_instance xhttp_backup_warp_config "$backup_dir" || return 1
   return 0
 }
 
@@ -6604,10 +6782,9 @@ gecko_warp_restore_all() {
   [[ -d "$backup_dir/gecko-warp" ]] && cp -a "$backup_dir/gecko-warp" "$GECKO_WARP_DIR"
   [[ -f "$backup_dir/hysteria.yaml" ]] && cp -a "$backup_dir/hysteria.yaml" /etc/hysteria2/server.yaml
   [[ -f "$backup_dir/reality.json" ]] && cp -a "$backup_dir/reality.json" "$REALITY_DIR/config.json"
-  [[ -f "$backup_dir/xhttp.json" ]] && cp -a "$backup_dir/xhttp.json" "$XHTTP_DIR/config.json"
+  xhttp_for_each_instance xhttp_restore_warp_config "$backup_dir"
   systemctl restart hysteria2-gecko.service >/dev/null 2>&1 || true
   systemctl restart "$REALITY_SERVICE" >/dev/null 2>&1 || true
-  systemctl restart "$XHTTP_SERVICE" >/dev/null 2>&1 || true
 }
 
 enable_gecko_real_outbound_via_warp() {
@@ -6710,11 +6887,11 @@ show_gecko_warp_status() {
   if [[ -f "$REALITY_DIR/config.json" ]]; then
     jq -e 'any(.outbounds[]?; (.tag // "") == "warp")' "$REALITY_DIR/config.json" >/dev/null && echo 'installed - warp: enabled' || echo 'installed - warp: disabled'
   else echo 'not installed'; fi
-  printf 'XHTTP:     '
-  if [[ -f "$XHTTP_DIR/config.json" ]]; then
-    printf '(%s) ' "$(xhttp_detect_core 2>/dev/null || echo unknown)"
-    jq -e 'any(.outbounds[]?; (.tag // "") == "warp")' "$XHTTP_DIR/config.json" >/dev/null && echo 'installed - warp: enabled' || echo 'installed - warp: disabled'
-  else echo 'not installed'; fi
+  if [[ -n "$(xhttp_instance_ids)" ]]; then
+    xhttp_for_each_instance xhttp_warp_status_line
+  else
+    echo 'XHTTP: not installed'
+  fi
   echo
   echo "[Selective WARP routes]"
   show_default_gecko_warp_routes || echo "Could not update/read routes: $GECKO_WARP_ROUTES_FILE"
