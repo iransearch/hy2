@@ -1066,19 +1066,6 @@ reality_generate_mldsa65_pair() {
   fi
 }
 
-reality_check_mldsa65_target() {
-  local output length
-  if ! output="$(timeout 25 "/usr/bin/$REALITY_SERVICE" tls ping "$1:443" 2>/dev/null)"; then
-    tui_error "Could not check the ML-DSA-65 target with Xray TLS ping. Check the SNI/network and core version."
-    return 1
-  fi
-  length="$(printf '%s\n' "$output" | awk '/Pinging with SNI/{sni=1} sni && /Certificate chain.*total length:/{sub(/^.*total length:[[:space:]]*/, ""); print $1; exit}')"
-  if [[ ! "$length" =~ ^[0-9]+$ ]] || ((length <= 3500)); then
-    tui_error "ML-DSA-65 requires a target certificate chain longer than 3500 bytes. Choose another SNI (inspect it with Xray TLS ping)."
-    return 1
-  fi
-}
-
 reality_collect_mldsa65_settings() {
   local current_file="${1:-}" core choice default_mode="disabled"
   REALITY_MLDSA65_SEED=""
@@ -1097,7 +1084,7 @@ reality_collect_mldsa65_settings() {
     return 0
   fi
   choice=$(whiptail --clear --title "Reality ML-DSA-65" --default-item "$default_mode" \
-    --menu "Additional certificate verification (mldsa65Verify). Requires a compatible client and target certificate chain >3500 bytes." 18 86 2 \
+    --menu "Additional certificate verification (mldsa65Verify). Requires a compatible Xray client. Target TLS compatibility is not checked here." 18 86 2 \
     "disabled" "Disabled" \
     "enabled" "Enable ML-DSA-65 (include pqv in client links)" \
     2>&1 >/dev/tty) || return 1
@@ -1106,7 +1093,6 @@ reality_collect_mldsa65_settings() {
     enabled) ;;
     *) return 1 ;;
   esac
-  reality_check_mldsa65_target "$REALITY_SNI" || return 1
   if [[ -n "$REALITY_MLDSA65_SEED" && -n "$REALITY_MLDSA65_VERIFY" ]]; then
     reality_valid_mldsa65_pair "$REALITY_MLDSA65_SEED" "$REALITY_MLDSA65_VERIFY" || {
       tui_error "Stored ML-DSA-65 keys are invalid. Disable and re-enable ML-DSA-65 to replace them."
