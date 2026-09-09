@@ -727,8 +727,18 @@ reality_ensure_core() {
 # is using sing-box-extended, download a verified temporary Xray binary only
 # for key generation and remove it immediately afterwards.
 reality_run_vlessenc() {
+  local preferred_binary="${1:-}"
   local core machine arch latest_release_url latest_tag archive_name download_url digest_url
   local digest_data expected_sha actual_sha tmp_dir binary_path output
+
+  if [[ -n "$preferred_binary" ]]; then
+    if ! output="$("$preferred_binary" vlessenc 2>/dev/null)"; then
+      tui_error "The selected Xray core could not generate VLESS Encryption keys. Update the core and try again."
+      return 1
+    fi
+    REALITY_VLESSENC_OUTPUT="$output"
+    return 0
+  fi
 
   core="$(reality_detect_core 2>/dev/null)" || core=""
   if [[ "$core" == "xray" ]] &&
@@ -840,7 +850,7 @@ reality_generate_vless_encryption_pair() {
   esac
 
   REALITY_VLESSENC_OUTPUT=""
-  reality_run_vlessenc || return 1
+  reality_run_vlessenc "${2:-}" || return 1
   output="$REALITY_VLESSENC_OUTPUT"
   REALITY_VLESSENC_OUTPUT=""
   mapfile -t decryptions < <(
@@ -2349,6 +2359,42 @@ select_xhttp_fingerprint() {
   printf '%s' "$choice"
 }
 
+xhttp_collect_encryption_settings() {
+  local core="$1" metadata_file="$2" default_mode="none" old_encryption="none" old_decryption="none"
+  local REALITY_ENCRYPTION="" REALITY_DECRYPTION="" REALITY_VLESSENC_OUTPUT="" binary=""
+  XHTTP_ENCRYPTION_MODE="none"
+  XHTTP_ENCRYPTION="none"
+  XHTTP_DECRYPTION="none"
+  if [[ -f "$metadata_file" ]]; then
+    old_encryption="$(jq -r '.encryption // "none"' "$metadata_file")" || return 1
+    default_mode="$(reality_encryption_mode_from_value "$old_encryption")"
+  fi
+  if [[ -f "$XHTTP_DIR/config.json" ]]; then
+    old_decryption="$(jq -r '.inbounds[0].settings.decryption // .inbounds[0].decryption // "none"' "$XHTTP_DIR/config.json")" || return 1
+  fi
+  XHTTP_ENCRYPTION_MODE=$(whiptail --clear --title "XHTTP VLESS Encryption" --default-item "$default_mode" \
+    --menu "Select extra VLESS Encryption for XHTTP+TLS. Enabled modes require a compatible recent client." 18 84 3 \
+    "none" "Disabled (standard VLESS + XHTTP + TLS)" \
+    "x25519" "X25519 authentication" \
+    "mlkem768" "ML-KEM-768 post-quantum authentication" \
+    2>&1 >/dev/tty) || return 1
+  case "$XHTTP_ENCRYPTION_MODE" in
+    none) return 0 ;;
+    x25519 | mlkem768) ;;
+    *) return 1 ;;
+  esac
+  if [[ "$XHTTP_ENCRYPTION_MODE" == "$default_mode" &&
+        "$old_encryption" == mlkem768x25519plus.* && "$old_decryption" == mlkem768x25519plus.* ]]; then
+    XHTTP_ENCRYPTION="$old_encryption"
+    XHTTP_DECRYPTION="$old_decryption"
+  else
+    [[ "$core" == "xray" ]] && binary="/usr/bin/$XHTTP_SERVICE"
+    reality_generate_vless_encryption_pair "$XHTTP_ENCRYPTION_MODE" "$binary" || return 1
+    XHTTP_ENCRYPTION="$REALITY_ENCRYPTION"
+    XHTTP_DECRYPTION="$REALITY_DECRYPTION"
+  fi
+}
+
 xhttp_collect_settings() {
   local metadata_file="${1:-}"
   local default_port="443" default_address="" default_sni=""
@@ -2667,6 +2713,7 @@ xhttp_remove_user_from_config() {
 xhttp_build_xray_config() {
   local output_file="$1" cert_path="$2" key_path="$3" users_json="$4"
   jq -n \
+    --arg decryption "${XHTTP_DECRYPTION:-none}" \
     --argjson port "$XHTTP_PORT" \
     --arg sni "$XHTTP_SNI" \
     --arg host "$XHTTP_HOST" \
@@ -2686,7 +2733,7 @@ xhttp_build_xray_config() {
           "protocol": "vless",
           "settings": {
             "clients": [$users[] | {"id": .uuid, "email": .name}],
-            "decryption": "none"
+            "decryption": $decryption
           },
           "streamSettings": {
             "network": "xhttp",
@@ -2742,6 +2789,7 @@ xhttp_build_server_config() {
     return $?
   fi
   jq -n \
+    --arg decryption "${XHTTP_DECRYPTION:-none}" \
     --argjson port "$XHTTP_PORT" \
     --arg sni "$XHTTP_SNI" \
     --arg cert_path "$cert_path" \
@@ -2761,6 +2809,7 @@ xhttp_build_server_config() {
           "listen": "::",
           "listen_port": $port,
           "users": $users,
+          "decryption": $decryption,
           "tls": {
             "enabled": true,
             "server_name": $sni,
@@ -2805,6 +2854,8 @@ xhttp_build_server_config() {
 xhttp_write_metadata() {
   local output_file="$1"
   jq -n \
+    --arg encryption "${XHTTP_ENCRYPTION:-none}" \
+    --arg encryption_mode "${XHTTP_ENCRYPTION_MODE:-none}" \
     --arg address "$XHTTP_ADDRESS" \
     --argjson port "$XHTTP_PORT" \
     --arg sni "$XHTTP_SNI" \
@@ -2815,6 +2866,8 @@ xhttp_write_metadata() {
     --argjson insecure "$XHTTP_INSECURE" \
     --arg certificate_mode "$XHTTP_TLS_MODE" \
     '{
+      "encryption": $encryption,
+      "vless_encryption_mode": $encryption_mode,
       "address": $address,
       "port": $port,
       "sni": $sni,
@@ -2829,7 +2882,7 @@ xhttp_write_metadata() {
 
 xhttp_build_link() {
   local metadata_file="$1" uuid="$2" name="$3"
-  local address port sni host path mode fingerprint insecure authority query
+  local address port sni host path mode fingerprint insecure authority query encryption
 
   address="$(jq -r '.address' "$metadata_file")"
   port="$(jq -r '.port' "$metadata_file")"
@@ -2846,7 +2899,8 @@ xhttp_build_link() {
     authority="$address"
   fi
 
-  query="encryption=none&security=tls&sni=$(xhttp_urlencode "$sni")&fp=$(xhttp_urlencode "$fingerprint")"
+  encryption="$(jq -r '.encryption // "none"' "$metadata_file")"
+  query="encryption=$(xhttp_urlencode "$encryption")&security=tls&sni=$(xhttp_urlencode "$sni")&fp=$(xhttp_urlencode "$fingerprint")"
   if [[ "$insecure" == "true" ]]; then
     query+="&insecure=1&allowInsecure=1"
   fi
@@ -3027,6 +3081,7 @@ xhttp_show_config() {
   echo "Host    : $(jq -r 'if .host == "" then "(omitted)" else .host end' "$metadata_file")"
   echo "Path    : $(jq -r '.path' "$metadata_file")"
   echo "Mode    : $(jq -r '.mode' "$metadata_file") (server: auto)"
+  echo "VLESS Enc: $(reality_encryption_label "$(jq -r '.vless_encryption_mode // "none"' "$metadata_file")")"
   echo
   while IFS= read -r link; do
     [[ -n "$link" ]] || continue
@@ -3062,6 +3117,7 @@ configure_xhttp_tui() {
   previous_core="$(xhttp_detect_core 2>/dev/null)" || previous_core=""
   core="$(select_xhttp_core "${previous_core:-sing-box}")" || return 0
   xhttp_install_core "$core" || return 1
+  xhttp_collect_encryption_settings "$core" "$XHTTP_DIR/client.json" || return 0
 
   stage_dir="$(mktemp -d /tmp/xhttp-stage.XXXXXX)" || {
     tui_error "Could not create the XHTTP staging directory."
@@ -3150,8 +3206,8 @@ configure_xhttp_tui() {
 
   systemctl stop "$XHTTP_SERVICE" >/dev/null 2>&1 || true
   mkdir -p "$XHTTP_DIR"
-  install -m 0644 "$final_config" "$XHTTP_DIR/config.json"
-  install -m 0644 "$stage_dir/client.json" "$XHTTP_DIR/client.json"
+  install -m 0600 "$final_config" "$XHTTP_DIR/config.json"
+  install -m 0600 "$stage_dir/client.json" "$XHTTP_DIR/client.json"
   install -m 0644 "$stage_dir/server.crt" "$XHTTP_DIR/server.crt"
   install -m 0600 "$stage_dir/server.key" "$XHTTP_DIR/server.key"
   xhttp_save_core "$core"
@@ -3212,7 +3268,7 @@ xhttp_commit_user_config() {
   local candidate="$1" backup restart_status
   backup="$(mktemp /tmp/xhttp-config-backup.XXXXXX)" || return 1
   cp -a "$XHTTP_DIR/config.json" "$backup"
-  install -m 0644 "$candidate" "$XHTTP_DIR/config.json"
+  install -m 0600 "$candidate" "$XHTTP_DIR/config.json"
   systemctl restart "$XHTTP_SERVICE"
   restart_status=$?
   if ((restart_status != 0)) || ! xhttp_write_links; then
