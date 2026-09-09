@@ -1032,6 +1032,91 @@ reality_port_in_use() {
   return 1
 }
 
+# Xray REALITY: private seed stays on the server; only Verify is shared as pqv.
+reality_valid_mldsa65_pair() {
+  python3 - "$1" "$2" <<'PY_MLDSA'
+import base64, re, sys
+for value, size in zip(sys.argv[1:], (32, 1952)):
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', value):
+        sys.exit(1)
+    try:
+        raw = base64.urlsafe_b64decode(value + '=' * (-len(value) % 4))
+    except Exception:
+        sys.exit(1)
+    if len(raw) != size or base64.urlsafe_b64encode(raw).decode().rstrip('=') != value:
+        sys.exit(1)
+PY_MLDSA
+}
+
+reality_generate_mldsa65_pair() {
+  local output
+  REALITY_MLDSA65_SEED=""
+  REALITY_MLDSA65_VERIFY=""
+  if ! output="$("/usr/bin/$REALITY_SERVICE" mldsa65 2>/dev/null)"; then
+    tui_error "This Xray core cannot generate ML-DSA-65 keys. Update Xray and try again."
+    return 1
+  fi
+  REALITY_MLDSA65_SEED="$(printf '%s\n' "$output" | sed -n 's/^Seed:[[:space:]]*//p' | head -n 1)"
+  REALITY_MLDSA65_VERIFY="$(printf '%s\n' "$output" | sed -n 's/^Verify:[[:space:]]*//p' | head -n 1)"
+  if ! reality_valid_mldsa65_pair "$REALITY_MLDSA65_SEED" "$REALITY_MLDSA65_VERIFY"; then
+    REALITY_MLDSA65_SEED=""
+    REALITY_MLDSA65_VERIFY=""
+    tui_error "Xray returned invalid ML-DSA-65 keys. Update Xray and try again."
+    return 1
+  fi
+}
+
+reality_check_mldsa65_target() {
+  local output length
+  if ! output="$(timeout 25 "/usr/bin/$REALITY_SERVICE" tls ping "$1:443" 2>/dev/null)"; then
+    tui_error "Could not check the ML-DSA-65 target with Xray TLS ping. Check the SNI/network and core version."
+    return 1
+  fi
+  length="$(printf '%s\n' "$output" | awk '/Pinging with SNI/{sni=1} sni && /Certificate chain.*total length:/{sub(/^.*total length:[[:space:]]*/, ""); print $1; exit}')"
+  if [[ ! "$length" =~ ^[0-9]+$ ]] || ((length <= 3500)); then
+    tui_error "ML-DSA-65 requires a target certificate chain longer than 3500 bytes. Choose another SNI (inspect it with Xray TLS ping)."
+    return 1
+  fi
+}
+
+reality_collect_mldsa65_settings() {
+  local current_file="${1:-}" core choice default_mode="disabled"
+  REALITY_MLDSA65_SEED=""
+  REALITY_MLDSA65_VERIFY=""
+  if [[ -n "$current_file" && -f "$current_file" ]]; then
+    REALITY_MLDSA65_SEED="$(jq -r '.mldsa65_seed // ""' "$current_file")"
+    REALITY_MLDSA65_VERIFY="$(jq -r '.mldsa65_verify // ""' "$current_file")"
+    [[ -n "$REALITY_MLDSA65_SEED" ]] && default_mode="enabled"
+  fi
+  core="$(reality_detect_core)" || return 1
+  if [[ "$core" != "xray" ]]; then
+    if [[ -n "$REALITY_MLDSA65_SEED" || -n "$REALITY_MLDSA65_VERIFY" ]]; then
+      tui_error "ML-DSA-65 requires the Xray core in this manager."
+      return 1
+    fi
+    return 0
+  fi
+  choice=$(whiptail --clear --title "Reality ML-DSA-65" --default-item "$default_mode" \
+    --menu "Additional certificate verification (mldsa65Verify). Requires a compatible client and target certificate chain >3500 bytes." 18 86 2 \
+    "disabled" "Disabled" \
+    "enabled" "Enable ML-DSA-65 (include pqv in client links)" \
+    2>&1 >/dev/tty) || return 1
+  case "$choice" in
+    disabled) REALITY_MLDSA65_SEED=""; REALITY_MLDSA65_VERIFY=""; return 0 ;;
+    enabled) ;;
+    *) return 1 ;;
+  esac
+  reality_check_mldsa65_target "$REALITY_SNI" || return 1
+  if [[ -n "$REALITY_MLDSA65_SEED" && -n "$REALITY_MLDSA65_VERIFY" ]]; then
+    reality_valid_mldsa65_pair "$REALITY_MLDSA65_SEED" "$REALITY_MLDSA65_VERIFY" || {
+      tui_error "Stored ML-DSA-65 keys are invalid. Disable and re-enable ML-DSA-65 to replace them."
+      return 1
+    }
+  else
+    reality_generate_mldsa65_pair || return 1
+  fi
+}
+
 reality_collect_instance_settings() {
   local current_file="${1:-}" forced_transport="${2:-}"
   local default_id="" default_transport="tcp" default_port="443" default_sni=""
@@ -1119,6 +1204,7 @@ reality_collect_instance_settings() {
   else
     reality_generate_vless_encryption_pair "$REALITY_ENCRYPTION_MODE" || return 1
   fi
+  reality_collect_mldsa65_settings "$current_file" || return 1
 }
 
 reality_build_singbox_config() {
@@ -1129,6 +1215,11 @@ reality_build_singbox_config() {
     find "$instances_dir" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null | sort -z
   )
   ((${#instance_files[@]} > 0)) || return 1
+
+  if jq -se 'any(.[]; (.mldsa65_seed // "") != "" or (.mldsa65_verify // "") != "")' "${instance_files[@]}" >/dev/null; then
+    tui_error "ML-DSA-65 configs require Xray. Disable ML-DSA-65 in those configs before switching to sing-box."
+    return 1
+  fi
 
   if ! jq -s '
     map(select(type == "object")) as $instances
@@ -1250,14 +1341,16 @@ reality_build_xray_config() {
                 {
                   network: $instance.transport,
                   security: "reality",
-                  realitySettings: {
+                  realitySettings: ({
                     show: false,
                     target: ($instance.sni + ":443"),
                     xver: 0,
                     serverNames: [$instance.sni],
                     privateKey: $instance.private_key,
                     shortIds: [$instance.short_id]
-                  }
+                  } + (if ($instance.mldsa65_seed // "") != "" then
+                    {mldsa65Seed: $instance.mldsa65_seed}
+                  else {} end))
                 }
                 + if $instance.transport == "grpc" then
                     {
@@ -1569,7 +1662,7 @@ reality_commit_stage() {
 
 reality_build_link() {
   local instance_file="$1" user_name="$2" address="$3"
-  local uuid transport port sni flow service_name public_key short_id id encryption authority query
+  local uuid transport port sni flow service_name public_key short_id id encryption authority query mldsa65_verify
 
   uuid="$(jq -r --arg name "$user_name" '.users[] | select(.name == $name) | .uuid' "$instance_file")"
   transport="$(jq -r '.transport' "$instance_file")"
@@ -1593,6 +1686,10 @@ reality_build_link() {
   fi
 
   query="encryption=$(reality_urlencode "$encryption")&security=reality&sni=$(reality_urlencode "$sni")&fp=firefox&pbk=$(reality_urlencode "$public_key")&sid=$(reality_urlencode "$short_id")&type=$transport"
+  mldsa65_verify="$(jq -r '.mldsa65_verify // ""' "$instance_file")"
+  if [[ -n "$mldsa65_verify" ]]; then
+    query+="&pqv=$(reality_urlencode "$mldsa65_verify")"
+  fi
   if [[ "$transport" == "grpc" ]]; then
     query+="&serviceName=$(reality_urlencode "$service_name")"
   elif [[ -n "$flow" ]]; then
@@ -1661,6 +1758,7 @@ reality_display_user_link() {
   echo "SNI       : $(jq -r '.sni' "$instance_file")"
   echo "User      : $user_name"
   echo "VLESS Enc : $(reality_encryption_label "$encryption_mode")"
+  echo "ML-DSA-65 : $(jq -r 'if (.mldsa65_verify // "") == "" then "disabled" else "enabled (pqv / mldsa65Verify)" end' "$instance_file")"
   if [[ "$(jq -r '.transport' "$instance_file")" == "tcp" ]]; then
     echo "Flow      : $(jq -r 'if (.flow // "") == "" then "disabled" else .flow end' "$instance_file")"
   else
@@ -1721,6 +1819,8 @@ reality_create_instance() {
     --arg vless_encryption_mode "$REALITY_ENCRYPTION_MODE" \
     --arg decryption "$REALITY_DECRYPTION" \
     --arg encryption "$REALITY_ENCRYPTION" \
+    --arg mldsa65_seed "$REALITY_MLDSA65_SEED" \
+    --arg mldsa65_verify "$REALITY_MLDSA65_VERIFY" \
     --arg uuid "$uuid" \
     '{
       id: $id,
@@ -1735,6 +1835,8 @@ reality_create_instance() {
       vless_encryption_mode: $vless_encryption_mode,
       decryption: $decryption,
       encryption: $encryption,
+      mldsa65_seed: $mldsa65_seed,
+      mldsa65_verify: $mldsa65_verify,
       users: [{name: "default", uuid: $uuid}]
     }' >"$(reality_instance_path "$REALITY_ID" "$stage_dir")"; then
     rm -rf "$stage_dir"
@@ -1773,6 +1875,8 @@ reality_edit_instance() {
     --arg vless_encryption_mode "$REALITY_ENCRYPTION_MODE" \
     --arg decryption "$REALITY_DECRYPTION" \
     --arg encryption "$REALITY_ENCRYPTION" \
+    --arg mldsa65_seed "$REALITY_MLDSA65_SEED" \
+    --arg mldsa65_verify "$REALITY_MLDSA65_VERIFY" \
     '.id = $id |
      .transport = $transport |
      .port = $port |
@@ -1781,7 +1885,9 @@ reality_edit_instance() {
      .service_name = $service_name |
      .vless_encryption_mode = $vless_encryption_mode |
      .decryption = $decryption |
-     .encryption = $encryption' \
+     .encryption = $encryption |
+     .mldsa65_seed = $mldsa65_seed |
+     .mldsa65_verify = $mldsa65_verify' \
     "$staged_file" >"$stage_dir/.edited.json"; then
     rm -rf "$stage_dir"
     tui_error "Could not edit the Reality instance record."
