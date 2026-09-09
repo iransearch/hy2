@@ -1767,12 +1767,10 @@ reality_display_user_link() {
   if [[ -n "$ipv4_link" ]]; then
     echo -e "IPv4: \e[91m$ipv4_link\e[0m"
     echo
-    command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 <<<"$ipv4_link"
   fi
   if [[ -n "$ipv6_link" ]]; then
     echo -e "IPv6: \e[91m$ipv6_link\e[0m"
     echo
-    command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 <<<"$ipv6_link"
   fi
   reality_wait_for_enter
 }
@@ -3259,9 +3257,6 @@ xhttp_show_config() {
     [[ -n "$link" ]] || continue
     ((index += 1))
     echo "[$index] $link"
-    if command -v qrencode >/dev/null 2>&1; then
-      qrencode -t ANSIUTF8 <<<"$link"
-    fi
     echo
   done <"$XHTTP_DIR/user-config.txt"
   echo -e "\e[31mPress Enter to return\e[0m"
