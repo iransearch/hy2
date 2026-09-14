@@ -3049,9 +3049,35 @@ xhttp_write_metadata() {
     }' >"$output_file"
 }
 
+# Pin the leaf certificate actually configured for this XHTTP instance.
+# Read the active path each time, including Let's Encrypt renewal symlinks.
+xhttp_certificate_pin() {
+  local config_file="$1" cert_path fingerprint
+  cert_path="$(jq -er '.inbounds[0].streamSettings.tlsSettings.certificates[0].certificateFile // .inbounds[0].tls.certificate_path // empty' "$config_file" 2>/dev/null)" || {
+    echo "Could not find this XHTTP config's TLS certificate path." >&2
+    return 1
+  }
+  [[ "$cert_path" == /* ]] || cert_path="$(dirname "$config_file")/$cert_path"
+  fingerprint="$(openssl x509 -in "$cert_path" -noout -fingerprint -sha256 2>/dev/null)" || {
+    echo "Could not read this XHTTP config's TLS certificate for pcs." >&2
+    return 1
+  }
+  fingerprint="${fingerprint#*=}"
+  fingerprint="${fingerprint//:/}"
+  fingerprint="${fingerprint,,}"
+  [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "Invalid XHTTP certificate SHA-256 fingerprint." >&2
+    return 1
+  }
+  printf '%s\n' "$fingerprint"
+}
+
 xhttp_build_link() {
-  local metadata_file="$1" uuid="$2" name="$3"
+  local metadata_file="$1" uuid="$2" name="$3" pcs="${4:-}"
   local address port sni host path mode fingerprint insecure authority query encryption
+
+  [[ -n "$pcs" ]] || pcs="$(xhttp_certificate_pin "$(dirname "$metadata_file")/config.json")" || return 1
+  [[ "$pcs" =~ ^[0-9a-f]{64}$ ]] || return 1
 
   address="$(jq -r '.address' "$metadata_file")"
   port="$(jq -r '.port' "$metadata_file")"
@@ -3069,7 +3095,7 @@ xhttp_build_link() {
   fi
 
   encryption="$(jq -r '.encryption // "none"' "$metadata_file")"
-  query="encryption=$(xhttp_urlencode "$encryption")&security=tls&sni=$(xhttp_urlencode "$sni")&fp=$(xhttp_urlencode "$fingerprint")"
+  query="encryption=$(xhttp_urlencode "$encryption")&security=tls&sni=$(xhttp_urlencode "$sni")&fp=$(xhttp_urlencode "$fingerprint")&pcs=$(xhttp_urlencode "$pcs")"
   if [[ "$insecure" == "true" ]]; then
     query+="&insecure=1&allowInsecure=1"
   fi
@@ -3086,17 +3112,18 @@ xhttp_build_link() {
 xhttp_write_links() {
   local config_file="${1:-$XHTTP_DIR/config.json}"
   local metadata_file="${2:-$XHTTP_DIR/client.json}"
-  local name uuid link
+  local name uuid link pcs
 
   [[ -f "$config_file" && -f "$metadata_file" ]] || return 1
+  pcs="$(xhttp_certificate_pin "$config_file")" || return 1
   : >"$XHTTP_DIR/user-config.txt"
   while IFS=$'\t' read -r name uuid; do
     [[ -n "$name" && -n "$uuid" ]] || continue
-    link="$(xhttp_build_link "$metadata_file" "$uuid" "$name-XHTTP")" || return 1
+    link="$(xhttp_build_link "$metadata_file" "$uuid" "$name-XHTTP" "$pcs")" || return 1
     printf '%s\n' "$link" >>"$XHTTP_DIR/user-config.txt"
   done < <(xhttp_list_users "$config_file")
 
-  xhttp_build_link "$metadata_file" "UUID" "NAME-XHTTP" >"$XHTTP_DIR/config.txt"
+  xhttp_build_link "$metadata_file" "UUID" "NAME-XHTTP" "$pcs" >"$XHTTP_DIR/config.txt"
   printf '\n' >>"$XHTTP_DIR/config.txt"
 }
 
