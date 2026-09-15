@@ -5732,7 +5732,43 @@ gtun_urlencode() {
   python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
 }
 
+gtun_parse_link() {
+  python3 - "$1" <<'PY_GTUN'
+import json, re, sys, urllib.parse
+try:
+    u = urllib.parse.urlsplit(sys.argv[1].strip())
+    if u.scheme not in ('hy2', 'hysteria2') or not u.hostname or not u.username:
+        raise ValueError('Use a complete hy2:// or hysteria2:// link.')
+    q = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+    def param(k, default=''):
+        values = q.get(k, [default])
+        if len(values) != 1: raise ValueError('Duplicate link parameter: '+k)
+        return values[0]
+    if param('obfs') != 'gecko':
+        raise ValueError('This menu requires a Gecko link; Salamander links are not Gecko tunnels.')
+    authority = u.netloc.rsplit('@', 1)[-1]
+    port = authority.split(']',1)[1].lstrip(':') if authority.startswith('[') else (authority.rsplit(':',1)[1] if ':' in authority else '')
+    port = param('mport') or port or '443'
+    if not re.fullmatch(r'[0-9]{1,5}(-[0-9]{1,5})?', port): raise ValueError('Invalid port/range.')
+    bounds = list(map(int, port.split('-')))
+    if not all(1 <= n <= 65535 for n in bounds) or bounds[0] > bounds[-1]: raise ValueError('Invalid port/range.')
+    pin = param('pinSHA256').replace(':','').lower()
+    if pin and not re.fullmatch(r'[0-9a-f]{64}',pin): raise ValueError('Invalid pinSHA256.')
+    obfs = param('obfs-password')
+    if not obfs: raise ValueError('Missing Gecko password.')
+    print(json.dumps(dict(server_ip=u.hostname,port='-'.join(map(str,bounds)),auth=urllib.parse.unquote(u.netloc.rsplit('@',1)[0]),obfs=obfs,sni=param('sni',u.hostname),pin=pin)))
+except (ValueError, TypeError) as e:
+    print(str(e), file=sys.stderr); sys.exit(1)
+PY_GTUN
+}
+
 gtun_ensure_binary() {
+  local dependency
+  for dependency in python3 jq openssl curl; do
+    command -v "$dependency" >/dev/null 2>&1 || {
+      apt-get update -y && apt-get install -y "$dependency" || return 1
+    }
+  done
   if [ -x "$GTUN_BIN" ]; then return 0; fi
   echo "Hysteria binary not found at $GTUN_BIN. Installing..."
   local arch
@@ -5809,7 +5845,7 @@ gtun_start() {
   systemctl restart "$(gtun_svc "$name")"
   sleep 2
   if systemctl is-active --quiet "$(gtun_svc "$name")"; then
-    echo "Tunnel '$name' is ACTIVE."
+    echo "Service '$name' is running. End-to-end forwarding has not been verified."
     return 0
   else
     echo "Tunnel '$name' failed to start. Recent log:"
@@ -5871,7 +5907,7 @@ EOF
 
 gtun_write_entry_config() {
   local name="$1" dir; dir="$(gtun_idir "$name")"
-  local server_ip port ports auth obfs up down hop_interval
+  local server_ip port ports auth obfs up down hop_interval sni pin authority
   server_ip="$(gtun_meta_get "$name" REMOTE_IP)"
   port="$(gtun_meta_get "$name"      PORT)"
   ports="$(gtun_meta_get "$name"     PORTS)"
@@ -5881,17 +5917,24 @@ gtun_write_entry_config() {
   down="$(gtun_meta_get "$name"      DOWN)"; down="${down:-100}"
   hop_interval="$(gtun_meta_get "$name" HOP_INTERVAL)"; hop_interval="${hop_interval:-30s}"
 
+  sni="$(gtun_meta_get "$name" SNI)"; sni="${sni:-www.google.com}"
+  pin="$(gtun_meta_get "$name" PIN_SHA256)"
+  authority="$server_ip"
+  [[ "$authority" == *:* ]] && authority="[$authority]"
+
   local AUTH_Y OBFS_Y
   AUTH_Y="$(gtun_yaml_quote "$auth")"
   OBFS_Y="$(gtun_yaml_quote "$obfs")"
 
   {
-    echo "server: ${server_ip}:${port}"
+    echo "server: $(gtun_yaml_quote "${authority}:${port}")"
     echo ""
     echo "auth: ${AUTH_Y}"
     echo ""
     echo "tls:"
+    echo "  sni: $(gtun_yaml_quote "$sni")"
     echo "  insecure: true"
+    [[ -n "$pin" ]] && echo "  pinSHA256: $(gtun_yaml_quote "$pin")"
     echo ""
     echo "obfs:"
     echo "  type: gecko"
@@ -5904,7 +5947,7 @@ gtun_write_entry_config() {
     echo "  up:   ${up} mbps"
     echo "  down: ${down} mbps"
     echo ""
-    echo "fastOpen: true"
+    echo "fastOpen: false"
     echo ""
     echo "quic:"
     echo "  initStreamReceiveWindow: 8388608"
@@ -5954,7 +5997,9 @@ gtun_make_link() {
   sni="$(gtun_meta_get "$name"       SNI)";    sni="${sni:-www.google.com}"
   remark="$(gtun_meta_get "$name"    REMARK)"; remark="${remark:-GECKO-RELAY-$name}"
 
-  local EA EO ES ER
+  local EA EO ES ER pin
+  pin="$(hysteria2_certificate_pin "$GTUN_TLS_DIR/cert.crt")" || return 1
+  [[ "$server_ip" == *:* && "$server_ip" != \[*\] ]] && server_ip="[$server_ip]"
   EA="$(gtun_urlencode "$auth")"
   EO="$(gtun_urlencode "$obfs")"
   ES="$(gtun_urlencode "$sni")"
@@ -5969,7 +6014,7 @@ gtun_make_link() {
     port_param=""
   fi
 
-  local link="hy2://${EA}@${server_ip}:${port}?sni=${ES}&insecure=1&obfs=gecko&obfs-password=${EO}"
+  local link="hy2://${EA}@${server_ip}:${port}?sni=${ES}&insecure=1&allowInsecure=1&pinSHA256=${pin}&obfs=gecko&obfs-password=${EO}"
   [ -n "$port_param" ] && link="${link}&${port_param}"
   link="${link}#${ER}"
   echo "$link"
@@ -6040,7 +6085,7 @@ gtun_setup_kharej() {
     command -v ufw >/dev/null 2>&1 && ufw allow "${main_port}:${p2}/udp" >/dev/null 2>&1 || true
   fi
 
-  gtun_start "$name" || { rm -rf "$(gtun_idir "$name")"; return 1; }
+  gtun_start "$name" || return 1
 
   # Save public IP for link generation
   local SERVER_IP
@@ -6049,12 +6094,12 @@ gtun_setup_kharej() {
              || hostname -I | awk '{print $1}')"
   gtun_meta_set "$name" SERVER_IP "$SERVER_IP"
 
-  local link; link="$(gtun_make_link "$name")"
+  local link; link="$(gtun_make_link "$name")" || return 1
   echo "$link" > "$(gtun_idir "$name")/link.txt"
 
   echo
   echo "======================================================="
-  echo " GECKO Relay Tunnel '$name' is LIVE on Kharej."
+  echo " GECKO Relay Tunnel '$name' service started on Kharej."
   echo "======================================================="
   echo " Link port : $PORT"
   echo " Auth      : $AUTH"
@@ -6101,30 +6146,14 @@ gtun_setup_iran() {
 
   local link
   read -rp "Paste hy2://... link from Kharej: " link
-  if [[ ! "$link" =~ ^hy2:// ]]; then
-    echo "Invalid link â€” must start with hy2://"; rm -rf "$(gtun_idir "$name")"; return 1
-  fi
-
-  # Parse link: hy2://AUTH@IP:PORT?sni=...&obfs=gecko&obfs-password=...
-  local userinfo hostpart query
-  userinfo="${link#hy2://}";    userinfo="${userinfo%%@*}"
-  hostpart="${link#*@}";        hostpart="${hostpart%%\?*}"
-  query="${link#*\?}";          query="${query%%#*}"
-
-  local server_ip link_port auth obfs sni mport
-  auth="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "$userinfo")"
-  server_ip="${hostpart%%:*}"
-  link_port="${hostpart##*:}"
-
-  # Extract from query string
-  sni="$(echo "$query"   | tr '&' '\n' | grep '^sni='          | head -1 | cut -d= -f2-)"
-  obfs="$(echo "$query"  | tr '&' '\n' | grep '^obfs-password=' | head -1 | cut -d= -f2-)"
-  mport="$(echo "$query" | tr '&' '\n' | grep '^mport='         | head -1 | cut -d= -f2-)"
-  sni="$(python3   -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "${sni:-www.google.com}")"
-  obfs="$(python3  -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "${obfs:-}")"
-
-  local effective_port
-  effective_port="${mport:-$link_port}"
+  local parsed server_ip auth obfs sni effective_port pin
+  parsed="$(gtun_parse_link "$link")" || { echo "Invalid relay link."; rm -rf "$(gtun_idir "$name")"; return 1; }
+  server_ip="$(jq -r '.server_ip' <<<"$parsed")"
+  auth="$(jq -r '.auth' <<<"$parsed")"
+  obfs="$(jq -r '.obfs' <<<"$parsed")"
+  sni="$(jq -r '.sni' <<<"$parsed")"
+  pin="$(jq -r '.pin' <<<"$parsed")"
+  effective_port="$(jq -r '.port' <<<"$parsed")"
 
   local ports UP DOWN
   echo "Ports to forward from this server (comma-separated, e.g. 443,8080,2087):"
@@ -6142,6 +6171,7 @@ gtun_setup_iran() {
   gtun_meta_set "$name" AUTH      "$auth"
   gtun_meta_set "$name" OBFS      "$obfs"
   gtun_meta_set "$name" SNI       "$sni"
+  gtun_meta_set "$name" PIN_SHA256 "$pin"
   gtun_meta_set "$name" PORTS     "$ports"
   gtun_meta_set "$name" UP        "$UP"
   gtun_meta_set "$name" DOWN      "$DOWN"
@@ -6159,11 +6189,11 @@ gtun_setup_iran() {
     command -v ufw >/dev/null 2>&1 && ufw allow "${p}/tcp" >/dev/null 2>&1 || true
   done
 
-  gtun_start "$name" || { rm -rf "$(gtun_idir "$name")"; return 1; }
+  gtun_start "$name" || return 1
 
   echo
   echo "======================================================="
-  echo " GECKO Relay Tunnel '$name' is LIVE on Iran."
+  echo " GECKO Relay Tunnel '$name' service started on Iran."
   echo "======================================================="
   echo " Exit (Kharej)  : ${server_ip}:${effective_port}"
   echo " Forwarded ports: ${ports}"
@@ -6248,6 +6278,14 @@ gtun_restart_one() {
   echo " GECKO Relay Tunnel â€” Restart"
   echo "======================================================="
   gtun_pick || return 1
+  local role
+  role="$(gtun_meta_get "$GTUN_PICKED" ROLE)"
+  case "$role" in
+    exit) gtun_write_exit_config "$GTUN_PICKED" || return 1 ;;
+    entry) gtun_write_entry_config "$GTUN_PICKED" || return 1 ;;
+    *) echo "Unknown tunnel role."; return 1 ;;
+  esac
+  gtun_write_run_script "$GTUN_PICKED" "$role" || return 1
   gtun_start "$GTUN_PICKED"
 }
 
@@ -6281,7 +6319,7 @@ gtun_show_link() {
              || curl -4fsSL --max-time 6 https://ifconfig.me 2>/dev/null \
              || hostname -I | awk '{print $1}')"
   gtun_meta_set "$name" SERVER_IP "$SERVER_IP"
-  local link; link="$(gtun_make_link "$name")"
+  local link; link="$(gtun_make_link "$name")" || return 1
   echo "$link" > "$(gtun_idir "$name")/link.txt"
   echo
   echo "$link"
