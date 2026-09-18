@@ -6506,6 +6506,7 @@ write_default_gecko_warp_routes() {
     'suffix:showip.net'
     'suffix:cdn-apple.com'
     'suffix:labs.google'
+    'suffix:antigravity.google'
     'suffix:flow.google'
     'suffix:flow-content.google'
     'suffix:www.googletagmanager.com'
@@ -6548,6 +6549,7 @@ suffix:icloud.com
 suffix:showip.net
 suffix:cdn-apple.com
 suffix:labs.google
+suffix:antigravity.google
 suffix:flow.google
 suffix:flow-content.google
 suffix:www.googletagmanager.com
