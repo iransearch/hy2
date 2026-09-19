@@ -8893,11 +8893,31 @@ anytls_client_json() {
       if $x.security=="reality" then {utls:{enabled:true,fingerprint:($x.fingerprint//"chrome")},reality:{enabled:true,public_key:$x.reality_public_key,short_id:$x.reality_short_id}} else {} end)}],
     route:{final:"proxy"}}'
 }
+anytls_certificate_pin() {
+  local config_file="$1" cert_path fingerprint
+  cert_path="$(jq -er '.inbounds[0].tls.certificate_path // empty' "$config_file" 2>/dev/null)" || {
+    echo "Could not find this AnyTLS config's TLS certificate path." >&2; return 1
+  }
+  [[ "$cert_path" == /* ]] || cert_path="$(dirname "$config_file")/$cert_path"
+  fingerprint="$(openssl x509 -in "$cert_path" -noout -fingerprint -sha256 2>/dev/null)" || {
+    echo "Could not read this AnyTLS config's TLS certificate for pcs." >&2; return 1
+  }
+  fingerprint="${fingerprint#*=}"
+  fingerprint="${fingerprint//:/}"
+  fingerprint="${fingerprint,,}"
+  [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "Invalid AnyTLS certificate SHA-256 fingerprint." >&2; return 1
+  }
+  printf '%s\n' "$fingerprint"
+}
 anytls_show() (
   umask 077
   local id="$1" dir="$(anytls_dir "$1")" meta host name password auth tag query link
   meta="$dir/meta.json"
-  local work
+  local work pcs=""
+  if [[ "$(jq -r .security "$meta")" == tls ]]; then
+    pcs="$(anytls_certificate_pin "$dir/config.json")" || return 1
+  fi
   work="$(mktemp -d "$dir/.clients.XXXXXX")" || return 1
   trap 'rm -rf "$work"' EXIT
   mkdir "$work/clients" || return 1
@@ -8909,6 +8929,7 @@ anytls_show() (
     auth="$(jq -rn --arg v "$password" '$v|@uri')"; tag="$(jq -rn --arg v "$name" '$v|@uri')"
     query="sni=$(jq -rn --arg v "$(jq -r .sni "$meta")" '$v|@uri')&insecure=$([[ "$(jq -r .insecure "$meta")" == true ]] && echo 1 || echo 0)"
     [[ "$(jq -r .security "$meta")" != reality ]] || query="security=reality&fp=$(jq -r ' .fingerprint // "chrome"' "$meta")&$query&pbk=$(jq -rn --arg v "$(jq -r .reality_public_key "$meta")" '$v|@uri')&sid=$(jq -r .reality_short_id "$meta")"
+    [[ -z "$pcs" ]] || query="$query&pcs=$pcs"
     link="anytls://$auth@$host:$(jq -r .port "$meta")/?$query#$tag"; printf '%s\n' "$link" | tee -a "$work/links.txt"
     anytls_client_json "$meta" "$password" >"$work/clients/$name.json" || return 1
   done < <(jq -c '.users[]' "$meta")
