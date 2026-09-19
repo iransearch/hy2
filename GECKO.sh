@@ -8930,7 +8930,7 @@ anytls_show() (
   umask 077
   local id="$1" dir="$(anytls_dir "$1")" meta host name password auth tag query link
   meta="$dir/meta.json"
-  local work pcs=""
+  local work pcs="" uri_path="/"
   if [[ "$(jq -r .security "$meta")" == tls ]]; then
     pcs="$(anytls_certificate_pin "$dir/config.json")" || return 1
   fi
@@ -8944,9 +8944,19 @@ anytls_show() (
     name="$(jq -r .name <<<"$row")"; password="$(jq -r .password <<<"$row")"
     auth="$(jq -rn --arg v "$password" '$v|@uri')"; tag="$(jq -rn --arg v "$name" '$v|@uri')"
     query="sni=$(jq -rn --arg v "$(jq -r .sni "$meta")" '$v|@uri')&insecure=$([[ "$(jq -r '(.security=="tls") and (.insecure==true)' "$meta")" == true ]] && echo 1 || echo 0)"
-    [[ "$(jq -r .security "$meta")" != reality ]] || query="security=reality&fp=$(jq -r ' .fingerprint // "chrome"' "$meta")&$query&pbk=$(jq -rn --arg v "$(jq -r .reality_public_key "$meta")" '$v|@uri')&sid=$(jq -r .reality_short_id "$meta")"
+    if [[ "$(jq -r .security "$meta")" == reality ]]; then
+      uri_path=""
+      query="$(jq -r '[
+        ["idle_session_check_interval", (.idle_session_check_interval // "30s")],
+        ["idle_session_timeout", (.idle_session_timeout // "30s")],
+        ["min_idle_session", (.min_idle_session // 0)],
+        ["security", "reality"], ["sni", .sni],
+        ["fp", (.fingerprint // "chrome")],
+        ["pbk", .reality_public_key], ["sid", .reality_short_id]
+      ] | map(.[0] + "=" + (.[1] | tostring | @uri)) | join("&")' "$meta")" || return 1
+    fi
     [[ -z "$pcs" ]] || query="$query&pcs=$pcs"
-    link="anytls://$auth@$host:$(jq -r .port "$meta")/?$query#$tag"; printf '%s\n' "$link" | tee -a "$work/links.txt"
+    link="anytls://$auth@$host:$(jq -r .port "$meta")$uri_path?$query#$tag"; printf '%s\n' "$link" | tee -a "$work/links.txt"
     anytls_client_json "$meta" "$password" >"$work/clients/$name.json" || return 1
   done < <(jq -c '.users[]' "$meta")
   [[ ! -d "$dir/clients" ]] || mv "$dir/clients" "$work/old-clients" || return 1
