@@ -8474,13 +8474,18 @@ anytls_select() {
   printf '%s' "$picked"
 }
 anytls_port_busy() {
-  local port="$1" excluded="$2" id used excluded_port=""
+  local port="$1" excluded="$2" id used excluded_port="" file
   [[ -z "$excluded" ]] || excluded_port="$(jq -r .port "$(anytls_dir "$excluded")/meta.json" 2>/dev/null)"
   while read -r id; do
     [[ "$id" == "$excluded" ]] && continue
     used="$(jq -r .port "$(anytls_dir "$id")/meta.json" 2>/dev/null)"
     [[ "$used" == "$port" ]] && { tui_error "Port $port belongs to AnyTLS '$id'."; return 0; }
   done < <(anytls_ids)
+  for file in "$REALITY_INSTANCES_DIR"/*.json "$XHTTP_INSTANCES_DIR"/*/config.json "$XHTTP_LEGACY_DIR/config.json"; do
+    [[ -f "$file" ]] || continue
+    used="$(jq -r '.port // .inbounds[0].listen_port // .inbounds[0].port // empty' "$file" 2>/dev/null)"
+    [[ "$used" != "$port" ]] || { tui_error "TCP port $port is reserved in $file."; return 0; }
+  done
   if ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"; then
     [[ -n "$excluded" && "$port" == "$excluded_port" ]] &&
       systemctl is-active --quiet "$(anytls_unit "$excluded")" && return 1
@@ -8496,7 +8501,138 @@ anytls_padding_json() {
   while read -r line; do
     [[ "$line" =~ ^(stop|[0-9]+)=[0-9]+(-[0-9]+)?(,c|,[0-9]+-[0-9]+)*$ ]] || return 1
   done < <(jq -r '.[]' <<<"$json")
+  python3 - "$json" <<'PY_PADDING'
+import json, re, sys
+try:
+    rules = json.loads(sys.argv[1]); seen = set(); stop = None
+    for rule in rules:
+        key, value = rule.split('=', 1)
+        if key in seen: raise ValueError('duplicate padding key')
+        seen.add(key)
+        if key == 'stop':
+            if not value.isdigit() or not 1 <= int(value) <= 65535: raise ValueError('invalid stop')
+            stop = int(value); continue
+        if not key.isdigit() or not 0 <= int(key) <= 65535: raise ValueError('invalid packet index')
+        for size in value.split(','):
+            if size == 'c' and key != '0': continue
+            if not re.fullmatch(r'[0-9]+-[0-9]+', size): raise ValueError('invalid size range')
+            lo, hi = map(int, size.split('-'))
+            if not 0 <= lo <= hi <= 65535: raise ValueError('invalid size range')
+        if key == '0' and ',' in value: raise ValueError('padding0 cannot split')
+    if stop is None or '0' not in seen: raise ValueError('stop and padding0 are required')
+except (ValueError, TypeError) as e:
+    print(str(e), file=sys.stderr); sys.exit(1)
+PY_PADDING
+  [[ $? == 0 ]] || return 1
   printf '%s' "$json"
+}
+anytls_renewal_hook() {
+  local id="$1" dir hook sni
+  dir="$(anytls_dir "$id")"
+  hook="/etc/letsencrypt/renewal-hooks/deploy/gecko-anytls-$id"
+  if [[ "$(jq -r '.security+":"+.certificate_mode' "$dir/meta.json")" != tls:letsencrypt ]]; then
+    rm -f "$hook"; return 0
+  fi
+  sni="$(jq -r .sni "$dir/meta.json")"
+  install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy || return 1
+  cat >"$hook" <<EOF_ANYTLS_RENEW
+#!/bin/sh
+[ "\$RENEWED_LINEAGE" = "/etc/letsencrypt/live/$sni" ] || exit 0
+$ANYTLS_BINARY check -c $dir/config.json || exit 1
+systemctl try-restart $(anytls_unit "$id")
+EOF_ANYTLS_RENEW
+  chmod 0755 "$hook"
+}
+anytls_rotate_keys() {
+  local id="$1" dir work sid
+  dir="$(anytls_dir "$id")"
+  [[ "$(jq -r .security "$dir/meta.json")" == reality ]] || { tui_error "This config uses TLS."; return 1; }
+  whiptail --yesno "Rotate Reality keys? All clients of this config must import new output." 11 76 || return 1
+  anytls_generate_keys || return 1
+  sid=$(whiptail --inputbox "New Short ID (2-16 hexadecimal characters, even length):" 10 82 "$ANYTLS_SID" 2>&1 >/dev/tty) || return 1
+  [[ "$sid" =~ ^([0-9a-fA-F]{2}){1,8}$ ]] || { tui_error "Invalid Short ID."; return 1; }
+  work="$(mktemp /tmp/anytls-rotate.XXXXXX)" || return 1
+  jq --arg private "$ANYTLS_PRIVATE" --arg public "$ANYTLS_PUBLIC" --arg sid "$sid" '.reality_private_key=$private|.reality_public_key=$public|.reality_short_id=$sid' "$dir/meta.json" >"$work" && anytls_replace_meta "$id" "$work"
+  local rc=$?; rm -f "$work"
+  ((rc==0)) || return "$rc"
+  anytls_show "$id"
+}
+
+anytls_validate_clients() (
+  local meta="$1" work="$2" row name password
+  while IFS= read -r row; do
+    name="$(jq -r .name <<<"$row")"
+    password="$(jq -r .password <<<"$row")"
+    anytls_valid_name "$name" || return 1
+    anytls_client_json "$meta" "$password" >"$work/client-check.json" || return 1
+    "$ANYTLS_BINARY" check -c "$work/client-check.json" || return 1
+  done < <(jq -c '.users[]' "$meta")
+)
+anytls_validate_instance() (
+  local dir work
+  dir="$(anytls_dir "$1")"
+  work="$(mktemp -d /tmp/anytls-validate.XXXXXX)" || return 1
+  trap 'rm -rf "$work"' EXIT
+  "$ANYTLS_BINARY" check -c "$dir/config.json" && anytls_validate_clients "$dir/meta.json" "$work"
+)
+anytls_prepare_certificate() {
+  local dir="$1" mode="$2" sni="$3" cert key public_cert public_key
+  if [[ "$mode" == existing ]]; then
+    cert="$ANYTLS_IMPORTED_CERT"; key="$ANYTLS_IMPORTED_KEY"
+  elif [[ "$mode" == letsencrypt ]]; then
+    xhttp_obtain_letsencrypt_certificate "$dir" "$sni" || return 1
+    cert="/etc/letsencrypt/live/$sni/fullchain.pem"; key="/etc/letsencrypt/live/$sni/privkey.pem"
+  else
+    # Keep a valid existing key/certificate when only settings or users change.
+    if [[ ! -L "$dir/server.crt" && ! -L "$dir/server.key" && -s "$dir/server.crt" && -s "$dir/server.key" ]] &&
+      openssl x509 -in "$dir/server.crt" -noout -checkend 604800 >/dev/null 2>&1 &&
+      openssl x509 -in "$dir/server.crt" -noout -checkhost "$sni" >/dev/null 2>&1; then return 0; fi
+    [[ ! -L "$dir/server.crt" ]] || rm -f "$dir/server.crt"
+    [[ ! -L "$dir/server.key" ]] || rm -f "$dir/server.key"
+    xhttp_create_selfsigned_certificate "$dir" "$sni" || return 1
+    return 0
+  fi
+  public_cert="$(openssl x509 -in "$cert" -pubkey -noout)" || return 1
+  public_key="$(openssl pkey -in "$key" -pubout)" || return 1
+  [[ "$public_cert" == "$public_key" ]] || { tui_error "Certificate and private key do not match."; return 1; }
+  openssl x509 -in "$cert" -noout -checkend 0 >/dev/null || return 1
+  if [[ "$ANYTLS_INSECURE" != true ]]; then
+    openssl x509 -in "$cert" -noout -checkhost "$sni" >/dev/null || { tui_error "Certificate does not match SNI."; return 1; }
+  fi
+  # Symlinks follow certbot's live files after renewal, including across restarts.
+  ln -sfn "$cert" "$dir/server.crt" && ln -sfn "$key" "$dir/server.key"
+}
+anytls_prerequisites() {
+  local tool
+  [[ "$(id -u)" == 0 ]] || { tui_error "Run as root."; return 1; }
+  for tool in jq openssl curl tar ss whiptail python3; do
+    command -v "$tool" >/dev/null || { tui_error "Required program is missing: $tool"; return 1; }
+  done
+}
+
+anytls_extra_settings() {
+  local current="$1" d='{}'
+  [[ ! -f "$current" ]] || d="$(cat "$current")"
+  ANYTLS_FP="$(jq -r '.fingerprint // "chrome"' <<<"$d")"
+  ANYTLS_TARGET="$(jq -r --arg s "$ANYTLS_SNI" '.handshake_server // $s' <<<"$d")"
+  ANYTLS_TARGET_PORT="$(jq -r '.handshake_port // 443' <<<"$d")"
+  ANYTLS_TIME_DIFF="$(jq -r '.max_time_difference // "0s"' <<<"$d")"
+  ANYTLS_IMPORTED_CERT="$(jq -r '.imported_cert // ""' <<<"$d")"
+  ANYTLS_IMPORTED_KEY="$(jq -r '.imported_key // ""' <<<"$d")"
+  if [[ "$ANYTLS_SECURITY" == reality ]]; then
+    ANYTLS_FP=$(whiptail --title "Reality fingerprint" --default-item "$ANYTLS_FP" --menu "Client uTLS fingerprint:" 18 72 5 chrome Chrome firefox Firefox safari Safari edge Edge randomized Randomized 2>&1 >/dev/tty) || return 1
+    ANYTLS_TARGET=$(whiptail --inputbox "Reality handshake target (domain or IP):" 10 78 "$ANYTLS_TARGET" 2>&1 >/dev/tty) || return 1
+    ANYTLS_TARGET="$(reality_normalize_address "$ANYTLS_TARGET")" || return 1
+    ANYTLS_TARGET_PORT=$(whiptail --inputbox "Reality handshake target port:" 10 68 "$ANYTLS_TARGET_PORT" 2>&1 >/dev/tty) || return 1
+    [[ "$ANYTLS_TARGET_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && ((ANYTLS_TARGET_PORT<65536)) || { tui_error "Invalid target port."; return 1; }
+    ANYTLS_TIME_DIFF=$(whiptail --inputbox "Maximum clock difference (0s = disabled):" 10 78 "$ANYTLS_TIME_DIFF" 2>&1 >/dev/tty) || return 1
+    [[ "$ANYTLS_TIME_DIFF" == 0s ]] || anytls_valid_duration "$ANYTLS_TIME_DIFF" || return 1
+    ANYTLS_MIN_TLS=1.3; ANYTLS_MAX_TLS=1.3
+  elif [[ "$ANYTLS_CERT_MODE" == existing ]]; then
+    ANYTLS_IMPORTED_CERT=$(whiptail --inputbox "Existing PEM certificate/fullchain path:" 10 78 "$ANYTLS_IMPORTED_CERT" 2>&1 >/dev/tty) || return 1
+    ANYTLS_IMPORTED_KEY=$(whiptail --inputbox "Existing PEM private key path:" 10 78 "$ANYTLS_IMPORTED_KEY" 2>&1 >/dev/tty) || return 1
+    [[ "$ANYTLS_IMPORTED_CERT" == /* && -s "$ANYTLS_IMPORTED_CERT" && "$ANYTLS_IMPORTED_KEY" == /* && -s "$ANYTLS_IMPORTED_KEY" ]] || { tui_error "Certificate or key does not exist."; return 1; }
+  fi
 }
 anytls_collect() {
   local current="$1" old="" choice default_id="" default_port=443 default_address="" default_sni=""
@@ -8517,7 +8653,8 @@ anytls_collect() {
     default_handshake="$(jq -r '.handshake_timeout//"15s"' "$current")"
   fi
   ANYTLS_PORT=$(whiptail --inputbox "Listening TCP port:" 10 60 "$default_port" 2>&1 >/dev/tty) || return 1
-  [[ "$ANYTLS_PORT" =~ ^[0-9]+$ ]] && ((ANYTLS_PORT>0 && ANYTLS_PORT<65536)) || { tui_error "Invalid port."; return 1; }
+  [[ "$ANYTLS_PORT" =~ ^[0-9]{1,5}$ ]] && ((10#$ANYTLS_PORT>0 && 10#$ANYTLS_PORT<65536)) || { tui_error "Invalid port."; return 1; }
+  ANYTLS_PORT=$((10#$ANYTLS_PORT))
   anytls_port_busy "$ANYTLS_PORT" "$old" && return 1
   [[ -n "$default_id" ]] || default_id="anytls-$ANYTLS_PORT"
   ANYTLS_ID=$(whiptail --inputbox "Unique config name:" 10 65 "$default_id" 2>&1 >/dev/tty) || return 1
@@ -8527,13 +8664,19 @@ anytls_collect() {
     tls "TLS certificate" reality "Reality handshake camouflage" 2>&1 >/dev/tty) || return 1
   ANYTLS_SNI=$(whiptail --inputbox "SNI / handshake domain:" 10 70 "$default_sni" 2>&1 >/dev/tty) || return 1
   xhttp_is_hostname "$ANYTLS_SNI" || { tui_error "Invalid SNI domain."; return 1; }
+  if [[ "$ANYTLS_SECURITY" == reality && -z "$default_address" ]]; then
+    default_address="${WAN4:-${WAN6:-}}"
+  fi
   ANYTLS_ADDRESS=$(whiptail --inputbox "Client address (blank = SNI):" 10 72 "$default_address" 2>&1 >/dev/tty) || return 1
+  if [[ -z "$ANYTLS_ADDRESS" && "$ANYTLS_SECURITY" == reality ]]; then
+    tui_error "Enter this server's public IP or domain, not the Reality target."; return 1
+  fi
   [[ -n "$ANYTLS_ADDRESS" ]] || ANYTLS_ADDRESS="$ANYTLS_SNI"
   ANYTLS_ADDRESS="$(xhttp_normalize_address "$ANYTLS_ADDRESS")" || { tui_error "Invalid client address."; return 1; }
   ANYTLS_CERT_MODE=""; ANYTLS_INSECURE=false
   if [[ "$ANYTLS_SECURITY" == tls ]]; then
-    ANYTLS_CERT_MODE=$(whiptail --title "Certificate" --default-item "$default_cert" --menu "Certificate type:" 16 84 2 \
-      letsencrypt "Trusted Let's Encrypt certificate" selfsigned "Self-signed certificate" 2>&1 >/dev/tty) || return 1
+    ANYTLS_CERT_MODE=$(whiptail --title "Certificate" --default-item "$default_cert" --menu "Certificate type:" 18 84 3 \
+      letsencrypt "Trusted Let's Encrypt certificate" selfsigned "Self-signed certificate" existing "Existing PEM certificate and key" 2>&1 >/dev/tty) || return 1
     if [[ "$ANYTLS_CERT_MODE" == selfsigned ]]; then ANYTLS_INSECURE=true
     else
       choice=$(whiptail --title "TLS verification" --default-item "$([[ "$default_insecure" == true ]] && echo insecure || echo verify)" \
@@ -8553,7 +8696,8 @@ anytls_collect() {
   ANYTLS_IDLE_TIMEOUT=$(whiptail --inputbox "Client idle-session timeout:" 10 70 "$default_timeout" 2>&1 >/dev/tty) || return 1
   anytls_valid_duration "$ANYTLS_IDLE_TIMEOUT" || { tui_error "Use a duration such as 30s or 2m."; return 1; }
   ANYTLS_MIN_IDLE=$(whiptail --inputbox "Minimum idle sessions (0-64):" 10 70 "$default_min" 2>&1 >/dev/tty) || return 1
-  [[ "$ANYTLS_MIN_IDLE" =~ ^[0-9]+$ ]] && ((ANYTLS_MIN_IDLE<=64)) || { tui_error "Value must be 0-64."; return 1; }
+  [[ "$ANYTLS_MIN_IDLE" =~ ^[0-9]{1,2}$ ]] && ((10#$ANYTLS_MIN_IDLE<=64)) || { tui_error "Value must be 0-64."; return 1; }
+  ANYTLS_MIN_IDLE=$((10#$ANYTLS_MIN_IDLE))
   ANYTLS_CLIENT_METADATA=$(whiptail --inputbox "Client metadata (optional, max 128 characters):" 10 82 "$default_cm" 2>&1 >/dev/tty) || return 1
   [[ ${#ANYTLS_CLIENT_METADATA} -le 128 && "$ANYTLS_CLIENT_METADATA" != *$'\n'* ]] || { tui_error "Invalid client metadata."; return 1; }
   ANYTLS_ALPN_TEXT=$(whiptail --inputbox "ALPN list, comma separated (blank = automatic):" 10 82 "$default_alpn" 2>&1 >/dev/tty) || return 1
@@ -8565,6 +8709,7 @@ anytls_collect() {
   [[ "$ANYTLS_MIN_TLS" != 1.3 || "$ANYTLS_MAX_TLS" == 1.3 ]] || { tui_error "TLS maximum cannot be below the minimum."; return 1; }
   ANYTLS_HANDSHAKE_TIMEOUT=$(whiptail --inputbox "TLS handshake timeout:" 10 68 "$default_handshake" 2>&1 >/dev/tty) || return 1
   anytls_valid_duration "$ANYTLS_HANDSHAKE_TIMEOUT" || { tui_error "Invalid TLS handshake timeout."; return 1; }
+  anytls_extra_settings "$current"
 }
 anytls_generate_keys() {
   local output
@@ -8576,18 +8721,22 @@ anytls_generate_keys() {
 }
 anytls_write_meta() {
   local file="$1" users="$2" padding="$3" private="$4" public="$5" sid="$6"
+  (umask 077
   jq -n --arg id "$ANYTLS_ID" --argjson port "$ANYTLS_PORT" --arg address "$ANYTLS_ADDRESS" --arg sni "$ANYTLS_SNI" \
     --arg security "$ANYTLS_SECURITY" --arg cert "$ANYTLS_CERT_MODE" --argjson insecure "$ANYTLS_INSECURE" \
     --arg pm "$ANYTLS_PADDING_MODE" --arg pt "$ANYTLS_PADDING_TEXT" --argjson padding "$padding" \
     --arg check "$ANYTLS_IDLE_CHECK" --arg timeout "$ANYTLS_IDLE_TIMEOUT" --argjson min "$ANYTLS_MIN_IDLE" \
     --arg cm "$ANYTLS_CLIENT_METADATA" --argjson alpn "$ANYTLS_ALPN" --arg min_tls "$ANYTLS_MIN_TLS" \
     --arg max_tls "$ANYTLS_MAX_TLS" --arg handshake "$ANYTLS_HANDSHAKE_TIMEOUT" \
+    --arg fp "$ANYTLS_FP" --arg target "$ANYTLS_TARGET" --argjson target_port "$ANYTLS_TARGET_PORT" \
+    --arg time_diff "$ANYTLS_TIME_DIFF" --arg cert_source "$ANYTLS_IMPORTED_CERT" --arg key_source "$ANYTLS_IMPORTED_KEY" \
     --arg private "$private" --arg public "$public" --arg sid "$sid" --argjson users "$users" \
     '{id:$id,port:$port,address:$address,sni:$sni,security:$security,certificate_mode:$cert,insecure:$insecure,
       padding_mode:$pm,padding_text:$pt,padding_scheme:$padding,idle_session_check_interval:$check,
       idle_session_timeout:$timeout,min_idle_session:$min,client_metadata:$cm,alpn:$alpn,
       min_tls_version:$min_tls,max_tls_version:$max_tls,handshake_timeout:$handshake,reality_private_key:$private,
-      reality_public_key:$public,reality_short_id:$sid,users:$users}' >"$file"
+      reality_public_key:$public,reality_short_id:$sid,users:$users,fingerprint:$fp,handshake_server:$target,handshake_port:$target_port,max_time_difference:$time_diff,imported_cert:$cert_source,imported_key:$key_source}' >"$file"
+  )
 }
 anytls_build_config() {
   local dir="$1" output="$2" meta="$1/meta.json"
@@ -8595,14 +8744,14 @@ anytls_build_config() {
     jq '{log:{level:"error",timestamp:true},inbounds:[{type:"anytls",tag:"anytls-in",listen:"::",listen_port:.port,
       users:[.users[]|{name,password}],padding_scheme:.padding_scheme,tls:{enabled:true,server_name:.sni,
       alpn:.alpn,min_version:.min_tls_version,max_version:.max_tls_version,handshake_timeout:.handshake_timeout,
-      reality:{enabled:true,handshake:{server:.sni,server_port:443},private_key:.reality_private_key,short_id:[.reality_short_id]}}}],
-      outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}' "$meta" >"$output"
+      reality:{enabled:true,handshake:{server:(.handshake_server//.sni),server_port:(.handshake_port//443)},max_time_difference:(.max_time_difference//"0s"),private_key:.reality_private_key,short_id:[.reality_short_id]}}}],
+      outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}' "$meta" >"$output" || return 1
   else
     jq --arg dir "$dir" '{log:{level:"error",timestamp:true},inbounds:[{type:"anytls",tag:"anytls-in",listen:"::",
       listen_port:.port,users:[.users[]|{name,password}],padding_scheme:.padding_scheme,
       tls:{enabled:true,alpn:.alpn,min_version:.min_tls_version,max_version:.max_tls_version,
       handshake_timeout:.handshake_timeout,certificate_path:($dir+"/server.crt"),key_path:($dir+"/server.key")}}],
-      outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}' "$meta" >"$output"
+      outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}' "$meta" >"$output" || return 1
   fi
   gecko_warp_apply_singbox_json "$output"
 }
@@ -8630,31 +8779,37 @@ LogRateLimitBurst=100
 WantedBy=multi-user.target
 EOF_ANYTLS_SERVICE
 }
-anytls_commit() {
-  local id="$1" dir="$(anytls_dir "$1")" candidate log backup="" active=false
-  candidate="$(mktemp /tmp/anytls-config.XXXXXX)" || return 1
-  log="$(mktemp /tmp/anytls-check.XXXXXX)" || { rm -f "$candidate"; return 1; }
-  anytls_build_config "$dir" "$candidate" || { rm -f "$candidate" "$log"; return 1; }
-  if ! "$ANYTLS_BINARY" check -c "$candidate" >"$log" 2>&1; then
-    whiptail --title "AnyTLS config error" --textbox "$log" 22 86; rm -f "$candidate" "$log"; return 1
-  fi
-  [[ -f "$dir/config.json" ]] && { backup="$(mktemp /tmp/anytls-old.XXXXXX)"; cp -a "$dir/config.json" "$backup"; }
+anytls_commit() (
+  local id="$1" dir candidate backup active=false failed=false
+  dir="$(anytls_dir "$id")"
+  backup="$(mktemp -d /tmp/anytls-commit.XXXXXX)" || return 1
+  trap 'rm -rf "$backup"' EXIT
+  candidate="$backup/config.json"
+  anytls_build_config "$dir" "$candidate" || return 1
+  "$ANYTLS_BINARY" check -c "$candidate" || return 1
+  anytls_validate_clients "$dir/meta.json" "$backup" || return 1
+  [[ ! -f "$dir/config.json" ]] || cp -a "$dir/config.json" "$backup/old.json" || return 1
+  local unit="/etc/systemd/system/$(anytls_unit "$id")"
+  [[ ! -f "$unit" ]] || cp -a "$unit" "$backup/unit" || return 1
   systemctl is-active --quiet "$(anytls_unit "$id")" && active=true
-  install -m 0600 "$candidate" "$dir/config.json" && anytls_write_service "$id" && systemctl daemon-reload || {
-    rm -f "$candidate" "$log" "$backup"; return 1;
-  }
-  if [[ "$active" == true ]] && ! systemctl restart "$(anytls_unit "$id")"; then
-    [[ -n "$backup" ]] && cp -a "$backup" "$dir/config.json"
-    systemctl restart "$(anytls_unit "$id")" >/dev/null 2>&1 || true
-    rm -f "$candidate" "$log" "$backup"; tui_error "Restart failed; previous config restored."; return 1
+  install -m 0600 "$candidate" "$dir/config.json" && anytls_write_service "$id" && systemctl daemon-reload || failed=true
+  if [[ "$failed" == false && "$active" == true ]]; then
+    systemctl restart "$(anytls_unit "$id")" && systemctl is-active --quiet "$(anytls_unit "$id")" || failed=true
   fi
-  rm -f "$candidate" "$log" "$backup"
-}
+  if [[ "$failed" == true ]]; then
+    [[ ! -f "$backup/old.json" ]] || cp -a "$backup/old.json" "$dir/config.json"
+    if [[ -f "$backup/unit" ]]; then cp -a "$backup/unit" "$unit"; else rm -f "$unit"; fi
+    systemctl daemon-reload
+    [[ "$active" != true ]] || systemctl restart "$(anytls_unit "$id")" || true
+    return 1
+  fi
+  anytls_show "$id" >/dev/null
+)
 anytls_create() {
   local name password users padding dir
   [[ "$(id -u)" == 0 ]] || { tui_error "Run as root."; return 1; }
   mkdir -p "$ANYTLS_INSTANCES_DIR"; chmod 0700 "$ANYTLS_DIR" "$ANYTLS_INSTANCES_DIR"
-  install_core AT || return 1
+  [[ -x "$ANYTLS_BINARY" ]] || install_core AT || return 1
   anytls_collect "" || return 1
   name=$(whiptail --inputbox "First user name:" 10 60 "user1" 2>&1 >/dev/tty) || return 1
   anytls_valid_name "$name" || { tui_error "Invalid user name."; return 1; }
@@ -8666,11 +8821,15 @@ anytls_create() {
   ANYTLS_PRIVATE=""; ANYTLS_PUBLIC=""; ANYTLS_SID=""
   [[ "$ANYTLS_SECURITY" != reality ]] || anytls_generate_keys || return 1
   dir="$(anytls_dir "$ANYTLS_ID")"; mkdir -p "$dir"; chmod 0700 "$dir"
-  [[ "$ANYTLS_SECURITY" != tls ]] || xhttp_prepare_certificate "$dir" "$ANYTLS_CERT_MODE" "$ANYTLS_SNI" || { rm -rf "$dir"; return 1; }
+  [[ "$ANYTLS_SECURITY" != tls ]] || anytls_prepare_certificate "$dir" "$ANYTLS_CERT_MODE" "$ANYTLS_SNI" || { rm -rf "$dir"; return 1; }
   anytls_write_meta "$dir/meta.json" "$users" "$padding" "$ANYTLS_PRIVATE" "$ANYTLS_PUBLIC" "$ANYTLS_SID" || { rm -rf "$dir"; return 1; }
   chmod 0600 "$dir/meta.json"
   anytls_commit "$ANYTLS_ID" || { rm -rf "$dir"; rm -f "/etc/systemd/system/$(anytls_unit "$ANYTLS_ID")"; return 1; }
-  systemctl enable --now "$(anytls_unit "$ANYTLS_ID")" || return 1
+  if ! systemctl enable --now "$(anytls_unit "$ANYTLS_ID")" || ! systemctl is-active --quiet "$(anytls_unit "$ANYTLS_ID")"; then
+    tui_error "AnyTLS did not start. Configuration was retained; use Status and diagnostics."
+    return 1
+  fi
+  anytls_renewal_hook "$ANYTLS_ID" || return 1
   anytls_show "$ANYTLS_ID"
 }
 anytls_modify() {
@@ -8681,12 +8840,15 @@ anytls_modify() {
   [[ "$ANYTLS_ID" == "$id" ]] || { tui_error "Renaming is not supported."; return 1; }
   padding="$(anytls_padding_json "$ANYTLS_PADDING_MODE" "$ANYTLS_PADDING_TEXT")" || return 1
   if [[ "$ANYTLS_SECURITY" == reality && -z "$private" ]]; then anytls_generate_keys || return 1; private="$ANYTLS_PRIVATE"; public="$ANYTLS_PUBLIC"; sid="$ANYTLS_SID"; fi
-  backup="$(mktemp -d /tmp/anytls-edit.XXXXXX)" || return 1; cp -a "$dir/." "$backup/"
-  [[ "$ANYTLS_SECURITY" != tls ]] || xhttp_prepare_certificate "$dir" "$ANYTLS_CERT_MODE" "$ANYTLS_SNI" || { cp -a "$backup/." "$dir/"; rm -rf "$backup"; return 1; }
+  backup="$(mktemp -d /tmp/anytls-edit.XXXXXX)" || return 1
+  cp -a "$dir/." "$backup/" || { rm -rf "$backup"; return 1; }
+  [[ "$ANYTLS_SECURITY" != tls ]] || anytls_prepare_certificate "$dir" "$ANYTLS_CERT_MODE" "$ANYTLS_SNI" || { cp -a "$backup/." "$dir/"; rm -rf "$backup"; return 1; }
   anytls_write_meta "$meta" "$users" "$padding" "$private" "$public" "$sid" && anytls_commit "$id" || {
-    rm -rf "$dir"; mkdir -p "$dir"; cp -a "$backup/." "$dir/"; rm -rf "$backup"; return 1;
+    cp -a "$backup/." "$dir/"; systemctl try-restart "$(anytls_unit "$id")" || true; rm -rf "$backup"; return 1;
   }
-  rm -rf "$backup"; anytls_show "$id"
+  rm -rf "$backup"
+  anytls_renewal_hook "$id" || return 1
+  anytls_show "$id"
 }
 anytls_replace_meta() {
   local id="$1" candidate="$2" meta="$(anytls_dir "$1")/meta.json" backup
@@ -8707,6 +8869,7 @@ anytls_add_user() {
   password=$(whiptail --inputbox "Password (blank = secure random):" 10 72 "" 2>&1 >/dev/tty) || return 1
   [[ -n "$password" ]] || password="$(openssl rand -base64 24 | tr -d '\n')"
   anytls_valid_password "$password" || { tui_error "Password is empty, too long or contains control characters."; return 1; }
+  jq -e --arg p "$password" 'any(.users[];.password==$p)' "$meta" >/dev/null && { tui_error "Password is already assigned to another user."; return 1; }
   tmp="$(mktemp /tmp/anytls-meta.XXXXXX)" || return 1
   jq --arg n "$name" --arg p "$password" '.users += [{name:$n,password:$p}]' "$meta" >"$tmp" &&
     anytls_replace_meta "$id" "$tmp"; rc=$?; rm -f "$tmp"; return "$rc"
@@ -8721,30 +8884,41 @@ anytls_remove_user() {
     anytls_replace_meta "$id" "$tmp"; rc=$?; rm -f "$tmp"; return "$rc"
 }
 anytls_client_json() {
-  jq -n --slurpfile m "$1" --arg p "$2" '$m[0] as $x|{log:{level:"warn"},outbounds:[{
+  jq -n --slurpfile m "$1" --arg p "$2" '$m[0] as $x|{log:{level:"warn"},inbounds:[{type:"mixed",tag:"local",listen:"127.0.0.1",listen_port:1080}],outbounds:[{
     type:"anytls",tag:"proxy",server:$x.address,server_port:$x.port,password:$p,
     idle_session_check_interval:$x.idle_session_check_interval,idle_session_timeout:$x.idle_session_timeout,
     min_idle_session:$x.min_idle_session,client_metadata:$x.client_metadata,
     tls:({enabled:true,server_name:$x.sni,insecure:$x.insecure,alpn:$x.alpn,
       min_version:$x.min_tls_version,max_version:$x.max_tls_version,handshake_timeout:$x.handshake_timeout}+
-      if $x.security=="reality" then {reality:{enabled:true,public_key:$x.reality_public_key,short_id:$x.reality_short_id}} else {} end)}],
+      if $x.security=="reality" then {utls:{enabled:true,fingerprint:($x.fingerprint//"chrome")},reality:{enabled:true,public_key:$x.reality_public_key,short_id:$x.reality_short_id}} else {} end)}],
     route:{final:"proxy"}}'
 }
-anytls_show() {
+anytls_show() (
+  umask 077
   local id="$1" dir="$(anytls_dir "$1")" meta host name password auth tag query link
-  meta="$dir/meta.json"; mkdir -p "$dir/clients"; chmod 0700 "$dir/clients"; : >"$dir/links.txt"
+  meta="$dir/meta.json"
+  local work
+  work="$(mktemp -d "$dir/.clients.XXXXXX")" || return 1
+  trap 'rm -rf "$work"' EXIT
+  mkdir "$work/clients" || return 1
+  : >"$work/links.txt"
   host="$(jq -r .address "$meta")"; [[ "$host" == *:* ]] && host="[$host]"
-  while IFS=$'\t' read -r name password; do
+  local row
+  while IFS= read -r row; do
+    name="$(jq -r .name <<<"$row")"; password="$(jq -r .password <<<"$row")"
     auth="$(jq -rn --arg v "$password" '$v|@uri')"; tag="$(jq -rn --arg v "$name" '$v|@uri')"
     query="sni=$(jq -rn --arg v "$(jq -r .sni "$meta")" '$v|@uri')&insecure=$([[ "$(jq -r .insecure "$meta")" == true ]] && echo 1 || echo 0)"
-    [[ "$(jq -r .security "$meta")" != reality ]] || query="security=reality&$query&pbk=$(jq -rn --arg v "$(jq -r .reality_public_key "$meta")" '$v|@uri')&sid=$(jq -r .reality_short_id "$meta")"
-    link="anytls://$auth@$host:$(jq -r .port "$meta")/?$query#$tag"; printf '%s\n' "$link" | tee -a "$dir/links.txt"
-    anytls_client_json "$meta" "$password" >"$dir/clients/$name.json"
-  done < <(jq -r '.users[]|[.name,.password]|@tsv' "$meta")
-  chmod 0600 "$dir/links.txt" "$dir"/clients/*.json
+    [[ "$(jq -r .security "$meta")" != reality ]] || query="security=reality&fp=$(jq -r ' .fingerprint // "chrome"' "$meta")&$query&pbk=$(jq -rn --arg v "$(jq -r .reality_public_key "$meta")" '$v|@uri')&sid=$(jq -r .reality_short_id "$meta")"
+    link="anytls://$auth@$host:$(jq -r .port "$meta")/?$query#$tag"; printf '%s\n' "$link" | tee -a "$work/links.txt"
+    anytls_client_json "$meta" "$password" >"$work/clients/$name.json" || return 1
+  done < <(jq -c '.users[]' "$meta")
+  [[ ! -d "$dir/clients" ]] || mv "$dir/clients" "$work/old-clients" || return 1
+  mv "$work/clients" "$dir/clients" || { [[ ! -d "$work/old-clients" ]] || mv "$work/old-clients" "$dir/clients"; return 1; }
+  mv "$work/links.txt" "$dir/links.txt" || return 1
   echo; echo "Client JSON files: $dir/clients"
   [[ "$(jq -r .security "$meta")" != reality ]] || echo "Reality URI parameters are extended; use JSON if a client ignores pbk/sid."
-}
+  return 0
+)
 anytls_status() {
   systemctl --no-pager --full status "$(anytls_unit "$1")" || true
   "$ANYTLS_BINARY" check -c "$(anytls_dir "$1")/config.json" || true
@@ -8755,29 +8929,52 @@ anytls_delete() {
   answer=$(whiptail --inputbox "Type $1 to delete:" 10 64 "" 2>&1 >/dev/tty) || return 1
   [[ "$answer" == "$1" ]] || return 1
   systemctl disable --now "$(anytls_unit "$1")" >/dev/null 2>&1 || true
+  rm -f "/etc/letsencrypt/renewal-hooks/deploy/gecko-anytls-$1"
   rm -f "/etc/systemd/system/$(anytls_unit "$1")"; rm -rf "$(anytls_dir "$1")"; systemctl daemon-reload
 }
 anytls_action() { systemctl "$2" "$(anytls_unit "$1")"; }
 anytls_chosen() { local fn="$1" id; shift; id="$(anytls_select)" || return 1; "$fn" "$id" "$@"; }
-anytls_update() {
-  install_core AT || return 1
-  local id failed=false; while read -r id; do anytls_commit "$id" || failed=true; done < <(anytls_ids)
-  [[ "$failed" == false ]]
-}
+anytls_update() (
+  local backup id failed=false
+  backup="$(mktemp -d /tmp/anytls-core-backup.XXXXXX)" || return 1
+  trap 'rm -rf "$backup"' EXIT
+  [[ ! -x "$ANYTLS_BINARY" ]] || cp -a "$ANYTLS_BINARY" "$backup/core" || return 1
+  install_core AT || { [[ ! -f "$backup/core" ]] || install -m 0755 "$backup/core" "$ANYTLS_BINARY"; return 1; }
+  while read -r id; do
+    anytls_validate_instance "$id" || failed=true
+  done < <(anytls_ids)
+  if [[ "$failed" == true ]]; then
+    [[ ! -f "$backup/core" ]] || install -m 0755 "$backup/core" "$ANYTLS_BINARY"
+    tui_error "New core rejected a config; previous core restored."
+    return 1
+  fi
+  while read -r id; do
+    systemctl is-active --quiet "$(anytls_unit "$id")" && touch "$backup/active-$id"
+  done < <(anytls_ids)
+  while read -r id; do
+    systemctl try-restart "$(anytls_unit "$id")" || failed=true
+  done < <(anytls_ids)
+  if [[ "$failed" == true ]]; then
+    [[ ! -f "$backup/core" ]] || install -m 0755 "$backup/core" "$ANYTLS_BINARY"
+    while read -r id; do [[ ! -f "$backup/active-$id" ]] || systemctl restart "$(anytls_unit "$id")" || true; done < <(anytls_ids)
+    return 1
+  fi
+)
 anytls_warp_refresh_all() {
   local id failed=false; while read -r id; do anytls_commit "$id" || failed=true; done < <(anytls_ids)
   [[ "$failed" == false ]]
 }
 anytls_menu() {
+  anytls_prerequisites || return 1
   local c
   while true; do
-    c=$(whiptail --title "AnyTLS [sing-box-extended]" --menu "Independent TLS / Reality configs." 24 88 12 \
+    c=$(whiptail --title "AnyTLS [sing-box-extended]" --menu "Independent TLS / Reality configs." 25 88 13 \
       1 "Create config" 2 "Edit config" 3 "Add user" 4 "Remove user" 5 "Show links and client JSON" \
-      6 "Update core" 7 "Delete config" 8 "Status and diagnostics" 9 "Start" 10 "Stop" 11 "Restart" 0 "Back" 2>&1 >/dev/tty) || return
+      6 "Update core" 7 "Delete config" 8 "Status and diagnostics" 9 "Start" 10 "Stop" 11 "Restart" 12 "Rotate Reality keys / Short ID" 0 "Back" 2>&1 >/dev/tty) || return
     case "$c" in 1) anytls_create;; 2) anytls_chosen anytls_modify;; 3) anytls_chosen anytls_add_user;;
       4) anytls_chosen anytls_remove_user;; 5) anytls_chosen anytls_show;; 6) anytls_update;;
       7) anytls_chosen anytls_delete;; 8) anytls_chosen anytls_status;; 9) anytls_chosen anytls_action start;;
-      10) anytls_chosen anytls_action stop;; 11) anytls_chosen anytls_action restart;; 0) return;; esac
+      10) anytls_chosen anytls_action stop;; 11) anytls_chosen anytls_action restart;; 12) anytls_chosen anytls_rotate_keys;; 0) return;; esac
     read -rp "Press Enter to return to AnyTLS menu..."
   done
 }
