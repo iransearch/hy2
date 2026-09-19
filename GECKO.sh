@@ -8611,22 +8611,29 @@ anytls_prerequisites() {
 }
 
 anytls_extra_settings() {
-  local current="$1" d='{}'
+  local current="$1" d='{}' target_mode=auto
   [[ ! -f "$current" ]] || d="$(cat "$current")"
   ANYTLS_FP="$(jq -r '.fingerprint // "chrome"' <<<"$d")"
-  ANYTLS_TARGET="$(jq -r --arg s "$ANYTLS_SNI" '.handshake_server // $s' <<<"$d")"
+  # Follow SNI changes unless a separate target was explicitly configured.
+  ANYTLS_TARGET="$(jq -r --arg s "$ANYTLS_SNI" 'if (.handshake_server // "") == "" or .handshake_server == .sni then $s else .handshake_server end' <<<"$d")"
   ANYTLS_TARGET_PORT="$(jq -r '.handshake_port // 443' <<<"$d")"
   ANYTLS_TIME_DIFF="$(jq -r '.max_time_difference // "0s"' <<<"$d")"
   ANYTLS_IMPORTED_CERT="$(jq -r '.imported_cert // ""' <<<"$d")"
   ANYTLS_IMPORTED_KEY="$(jq -r '.imported_key // ""' <<<"$d")"
   if [[ "$ANYTLS_SECURITY" == reality ]]; then
     ANYTLS_FP=$(whiptail --title "Reality fingerprint" --default-item "$ANYTLS_FP" --menu "Client uTLS fingerprint:" 18 72 5 chrome Chrome firefox Firefox safari Safari edge Edge randomized Randomized 2>&1 >/dev/tty) || return 1
+    [[ "$ANYTLS_TARGET" == "$ANYTLS_SNI" && "$ANYTLS_TARGET_PORT" == 443 && "$ANYTLS_TIME_DIFF" == 0s ]] || target_mode=custom
+    target_mode=$(whiptail --title "Reality handshake" --default-item "$target_mode" --menu "Target settings:" 16 82 2 auto "Use SNI:443, no clock limit" custom "Separate target, port or clock limit" 2>&1 >/dev/tty) || return 1
+    if [[ "$target_mode" == auto ]]; then
+      ANYTLS_TARGET="$ANYTLS_SNI"; ANYTLS_TARGET_PORT=443; ANYTLS_TIME_DIFF=0s
+    else
     ANYTLS_TARGET=$(whiptail --inputbox "Reality handshake target (domain or IP):" 10 78 "$ANYTLS_TARGET" 2>&1 >/dev/tty) || return 1
     ANYTLS_TARGET="$(reality_normalize_address "$ANYTLS_TARGET")" || return 1
     ANYTLS_TARGET_PORT=$(whiptail --inputbox "Reality handshake target port:" 10 68 "$ANYTLS_TARGET_PORT" 2>&1 >/dev/tty) || return 1
     [[ "$ANYTLS_TARGET_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && ((ANYTLS_TARGET_PORT<65536)) || { tui_error "Invalid target port."; return 1; }
     ANYTLS_TIME_DIFF=$(whiptail --inputbox "Maximum clock difference (0s = disabled):" 10 78 "$ANYTLS_TIME_DIFF" 2>&1 >/dev/tty) || return 1
     [[ "$ANYTLS_TIME_DIFF" == 0s ]] || anytls_valid_duration "$ANYTLS_TIME_DIFF" || return 1
+    fi
     ANYTLS_MIN_TLS=1.3; ANYTLS_MAX_TLS=1.3
   elif [[ "$ANYTLS_CERT_MODE" == existing ]]; then
     ANYTLS_IMPORTED_CERT=$(whiptail --inputbox "Existing PEM certificate/fullchain path:" 10 78 "$ANYTLS_IMPORTED_CERT" 2>&1 >/dev/tty) || return 1
@@ -8657,7 +8664,10 @@ anytls_collect() {
   ANYTLS_PORT=$((10#$ANYTLS_PORT))
   anytls_port_busy "$ANYTLS_PORT" "$old" && return 1
   [[ -n "$default_id" ]] || default_id="anytls-$ANYTLS_PORT"
-  ANYTLS_ID=$(whiptail --inputbox "Unique config name:" 10 65 "$default_id" 2>&1 >/dev/tty) || return 1
+  ANYTLS_ID="$old"
+  if [[ -z "$old" ]]; then
+    ANYTLS_ID=$(whiptail --inputbox "Unique config name:" 10 65 "$default_id" 2>&1 >/dev/tty) || return 1
+  fi
   anytls_valid_id "$ANYTLS_ID" || { tui_error "Invalid config name."; return 1; }
   [[ "$ANYTLS_ID" == "$old" || ! -e "$(anytls_dir "$ANYTLS_ID")" ]] || { tui_error "Config already exists."; return 1; }
   ANYTLS_SECURITY=$(whiptail --title "AnyTLS security" --default-item "$default_security" --menu "Security layer:" 16 82 2 \
@@ -8667,7 +8677,9 @@ anytls_collect() {
   if [[ "$ANYTLS_SECURITY" == reality && -z "$default_address" ]]; then
     default_address="${WAN4:-${WAN6:-}}"
   fi
-  ANYTLS_ADDRESS=$(whiptail --inputbox "Client address (blank = SNI):" 10 72 "$default_address" 2>&1 >/dev/tty) || return 1
+  local address_prompt="Client address (blank = SNI):"
+  [[ "$ANYTLS_SECURITY" != reality ]] || address_prompt="This proxy server's public IP/domain (required; NOT the camouflage SNI):"
+  ANYTLS_ADDRESS=$(whiptail --inputbox "$address_prompt" 11 88 "$default_address" 2>&1 >/dev/tty) || return 1
   if [[ -z "$ANYTLS_ADDRESS" && "$ANYTLS_SECURITY" == reality ]]; then
     tui_error "Enter this server's public IP or domain, not the Reality target."; return 1
   fi
@@ -8702,11 +8714,15 @@ anytls_collect() {
   [[ ${#ANYTLS_CLIENT_METADATA} -le 128 && "$ANYTLS_CLIENT_METADATA" != *$'\n'* ]] || { tui_error "Invalid client metadata."; return 1; }
   ANYTLS_ALPN_TEXT=$(whiptail --inputbox "ALPN list, comma separated (blank = automatic):" 10 82 "$default_alpn" 2>&1 >/dev/tty) || return 1
   ANYTLS_ALPN="$(anytls_alpn_json "$ANYTLS_ALPN_TEXT")" || return 1
+  if [[ "$ANYTLS_SECURITY" == reality ]]; then
+    ANYTLS_MIN_TLS=1.3; ANYTLS_MAX_TLS=1.3
+  else
   ANYTLS_MIN_TLS=$(whiptail --title "Minimum TLS version" --default-item "$default_min_tls" --menu "Minimum accepted TLS version:" 15 72 2 \
     1.2 "TLS 1.2" 1.3 "TLS 1.3" 2>&1 >/dev/tty) || return 1
   ANYTLS_MAX_TLS=$(whiptail --title "Maximum TLS version" --default-item "$default_max_tls" --menu "Maximum accepted TLS version:" 15 72 2 \
     1.2 "TLS 1.2" 1.3 "TLS 1.3" 2>&1 >/dev/tty) || return 1
   [[ "$ANYTLS_MIN_TLS" != 1.3 || "$ANYTLS_MAX_TLS" == 1.3 ]] || { tui_error "TLS maximum cannot be below the minimum."; return 1; }
+  fi
   ANYTLS_HANDSHAKE_TIMEOUT=$(whiptail --inputbox "TLS handshake timeout:" 10 68 "$default_handshake" 2>&1 >/dev/tty) || return 1
   anytls_valid_duration "$ANYTLS_HANDSHAKE_TIMEOUT" || { tui_error "Invalid TLS handshake timeout."; return 1; }
   anytls_extra_settings "$current"
@@ -8743,7 +8759,7 @@ anytls_build_config() {
   if [[ "$(jq -r .security "$meta")" == reality ]]; then
     jq '{log:{level:"error",timestamp:true},inbounds:[{type:"anytls",tag:"anytls-in",listen:"::",listen_port:.port,
       users:[.users[]|{name,password}],padding_scheme:.padding_scheme,tls:{enabled:true,server_name:.sni,
-      alpn:.alpn,min_version:.min_tls_version,max_version:.max_tls_version,handshake_timeout:.handshake_timeout,
+      alpn:.alpn,min_version:"1.3",max_version:"1.3",handshake_timeout:.handshake_timeout,
       reality:{enabled:true,handshake:{server:(.handshake_server//.sni),server_port:(.handshake_port//443)},max_time_difference:(.max_time_difference//"0s"),private_key:.reality_private_key,short_id:[.reality_short_id]}}}],
       outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}' "$meta" >"$output" || return 1
   else
@@ -8890,7 +8906,7 @@ anytls_client_json() {
     min_idle_session:$x.min_idle_session,client_metadata:$x.client_metadata,
     tls:({enabled:true,server_name:$x.sni,insecure:$x.insecure,alpn:$x.alpn,
       min_version:$x.min_tls_version,max_version:$x.max_tls_version,handshake_timeout:$x.handshake_timeout}+
-      if $x.security=="reality" then {utls:{enabled:true,fingerprint:($x.fingerprint//"chrome")},reality:{enabled:true,public_key:$x.reality_public_key,short_id:$x.reality_short_id}} else {} end)}],
+      if $x.security=="reality" then {insecure:false,min_version:"1.3",max_version:"1.3",utls:{enabled:true,fingerprint:($x.fingerprint//"chrome")},reality:{enabled:true,public_key:$x.reality_public_key,short_id:$x.reality_short_id}} else {} end)}],
     route:{final:"proxy"}}'
 }
 anytls_certificate_pin() {
@@ -8927,7 +8943,7 @@ anytls_show() (
   while IFS= read -r row; do
     name="$(jq -r .name <<<"$row")"; password="$(jq -r .password <<<"$row")"
     auth="$(jq -rn --arg v "$password" '$v|@uri')"; tag="$(jq -rn --arg v "$name" '$v|@uri')"
-    query="sni=$(jq -rn --arg v "$(jq -r .sni "$meta")" '$v|@uri')&insecure=$([[ "$(jq -r .insecure "$meta")" == true ]] && echo 1 || echo 0)"
+    query="sni=$(jq -rn --arg v "$(jq -r .sni "$meta")" '$v|@uri')&insecure=$([[ "$(jq -r '(.security=="tls") and (.insecure==true)' "$meta")" == true ]] && echo 1 || echo 0)"
     [[ "$(jq -r .security "$meta")" != reality ]] || query="security=reality&fp=$(jq -r ' .fingerprint // "chrome"' "$meta")&$query&pbk=$(jq -rn --arg v "$(jq -r .reality_public_key "$meta")" '$v|@uri')&sid=$(jq -r .reality_short_id "$meta")"
     [[ -z "$pcs" ]] || query="$query&pcs=$pcs"
     link="anytls://$auth@$host:$(jq -r .port "$meta")/?$query#$tag"; printf '%s\n' "$link" | tee -a "$work/links.txt"
@@ -8937,13 +8953,50 @@ anytls_show() (
   mv "$work/clients" "$dir/clients" || { [[ ! -d "$work/old-clients" ]] || mv "$work/old-clients" "$dir/clients"; return 1; }
   mv "$work/links.txt" "$dir/links.txt" || return 1
   echo; echo "Client JSON files: $dir/clients"
-  [[ "$(jq -r .security "$meta")" != reality ]] || echo "Reality URI parameters are extended; use JSON if a client ignores pbk/sid."
+  if [[ "$(jq -r .security "$meta")" == reality ]]; then
+    echo "AnyTLS+Reality requires client support. URI import may silently drop Reality settings."
+    echo "Use the client JSON with a compatible sing-box core; local SOCKS/HTTP proxy: 127.0.0.1:1080."
+    while IFS= read -r name; do
+      echo "----- Client JSON: $name -----"
+      cat "$dir/clients/$name.json"
+    done < <(jq -r '.users[].name' "$meta")
+  fi
   return 0
 )
 anytls_status() {
   systemctl --no-pager --full status "$(anytls_unit "$1")" || true
   "$ANYTLS_BINARY" check -c "$(anytls_dir "$1")/config.json" || true
   journalctl -u "$(anytls_unit "$1")" -n 30 --no-pager || true
+  anytls_reality_diagnostics "$(anytls_dir "$1")/config.json"
+}
+anytls_reality_diagnostics() {
+  python3 - "$1" <<'PY_ANYTLS_TARGET'
+import json, socket, ssl, sys
+with open(sys.argv[1]) as f:
+    inbound = json.load(f)['inbounds'][0]
+tls = inbound['tls']
+reality = tls.get('reality', {})
+if not reality.get('enabled'):
+    sys.exit(0)
+target = reality['handshake']
+host, port = target['server'], target['server_port']
+sni = tls['server_name']
+print(f'Reality target test: {host}:{port}, SNI={sni}', flush=True)
+try:
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+    ctx.set_alpn_protocols(tls.get('alpn') or ['h2', 'http/1.1'])
+    with socket.create_connection((host, port), timeout=10) as raw:
+        with ctx.wrap_socket(raw, server_hostname=sni) as conn:
+            print(f'Target reachable; certificate verified; {conn.version()}; ALPN={conn.selected_alpn_protocol()}')
+    print('This checks the camouflage target only, not client authentication or the complete tunnel.')
+except (OSError, ssl.SSLError, ValueError) as e:
+    print(f'Target test failed: {e}')
+    print('Check target/SNI, target port, DNS, outbound connectivity and system time.')
+print('Client must support AnyTLS + Reality, with uTLS, matching public key and Short ID.')
+print('If URI import loses these fields, import the generated client JSON instead.')
+PY_ANYTLS_TARGET
 }
 anytls_delete() {
   local answer
