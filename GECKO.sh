@@ -1037,7 +1037,6 @@ reality_select_user() {
 
 reality_port_in_use() {
   local port="$1" exclude_id="${2:-}" instances_dir="${3:-$REALITY_INSTANCES_DIR}"
-  if rx_reserved_port "$1"; then tui_error "Port $1 belongs to a Reality + XHTTP pair."; return 0; fi
   local file file_id file_port
   while IFS= read -r -d '' file; do
     file_id="$(jq -r '.id' "$file")"
@@ -2363,7 +2362,6 @@ xhttp_create_named_instance() {
 
 xhttp_port_conflicts() {
   local port="$1" ids id dir existing current
-  if rx_reserved_port "$1"; then tui_error "Port $1 belongs to a Reality + XHTTP pair."; return 0; fi
   ids="$(xhttp_instance_ids)" || return 1
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
@@ -6821,8 +6819,6 @@ gecko_warp_refresh_all() {
   xhttp_for_each_instance gecko_warp_refresh_xhttp || { echo "XHTTP update failed."; failed="true"; }
   echo "Applying to all AnyTLS configs..."
   anytls_warp_refresh_all || { echo "AnyTLS update failed."; failed="true"; }
-  echo "Applying to Reality + XHTTP pairs..."
-  rx_warp_refresh_all || { echo "Reality + XHTTP update failed."; failed="true"; }
   [[ "$failed" == "false" ]]
 }
 
@@ -6862,7 +6858,6 @@ gecko_warp_backup_all() {
   [[ -f "$REALITY_DIR/config.json" ]] && cp -a "$REALITY_DIR/config.json" "$backup_dir/reality.json"
   xhttp_for_each_instance xhttp_backup_warp_config "$backup_dir" || return 1
   [[ ! -d "$ANYTLS_INSTANCES_DIR" ]] || cp -a "$ANYTLS_INSTANCES_DIR" "$backup_dir/anytls-instances" || return 1
-  [[ ! -d "$RX_ROOT" ]] || cp -a "$RX_ROOT" "$backup_dir/rx-pairs" || return 1
   return 0
 }
 
@@ -6880,13 +6875,6 @@ gecko_warp_restore_all() {
     while read -r anytls_restore_id; do
       systemctl try-restart "$(anytls_unit "$anytls_restore_id")" >/dev/null 2>&1 || true
     done < <(anytls_ids)
-  fi
-  if [[ -d "$backup_dir/rx-pairs" ]]; then
-    cp -a "$backup_dir/rx-pairs/." "$RX_ROOT/"
-    local rx_restore_id
-    while read -r rx_restore_id; do
-      systemctl try-restart "$(rx_name "$rx_restore_id")" >/dev/null 2>&1 || true
-    done < <(rx_ids)
   fi
   systemctl restart hysteria2-gecko.service >/dev/null 2>&1 || true
   systemctl restart "$REALITY_SERVICE" >/dev/null 2>&1 || true
@@ -6986,13 +6974,6 @@ show_gecko_warp_status() {
     echo "Unified state: DISABLED"
   fi
   echo
-  local rx_status_id
-  while read -r rx_status_id; do
-    printf 'Reality+XHTTP %-16s: ' "$rx_status_id"
-    if jq -e 'any(.outbounds[]?;.tag=="warp")' "$(rx_dir "$rx_status_id")/config.json" >/dev/null; then
-      echo 'warp: enabled'
-    else echo 'warp: disabled'; fi
-  done < <(rx_ids)
   printf 'Hysteria2: '
   if [[ -f /etc/hysteria2/server.yaml ]]; then
     grep -q 'BEGIN GECKO WARP PROXY OUTBOUND' /etc/hysteria2/server.yaml && echo 'installed - warp: enabled' || echo 'installed - warp: disabled'
@@ -8516,7 +8497,6 @@ anytls_select() {
 }
 anytls_port_busy() {
   local port="$1" excluded="$2" id used excluded_port="" file
-  if rx_reserved_port "$1"; then tui_error "Port $1 belongs to a Reality + XHTTP pair."; return 0; fi
   [[ -z "$excluded" ]] || excluded_port="$(jq -r .port "$(anytls_dir "$excluded")/meta.json" 2>/dev/null)"
   while read -r id; do
     [[ "$id" == "$excluded" ]] && continue
@@ -9105,359 +9085,6 @@ anytls_menu() {
   done
 }
 
-# BEGIN GECKO REALITY XHTTP PAIRS
-# Ordinary TLS is forwarded by REALITY target, BEFORE TLS decryption.
-# VLESS settings.fallbacks cannot feed a TLS listener (and VLESS Encryption
-# handshakes run before that fallback). Keep the two layers separate.
-RX_ROOT="/etc/gecko-reality-xhttp"
-rx_dir() { printf '%s/%s' "$RX_ROOT" "$1"; }
-rx_name() { printf 'gecko-rx-%s' "$1"; }
-rx_bin() { printf '/usr/bin/gecko-rx-%s' "$1"; }
-rx_ids() {
-  local file id
-  for file in "$RX_ROOT"/*/meta.json; do
-    [[ -f "$file" ]] || continue
-    id="${file%/meta.json}"; id="${id##*/}"
-    anytls_valid_id "$id" && printf '%s\n' "$id"
-  done
-  return 0
-}
-rx_port_valid() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 )); }
-rx_select() {
-  local id
-  echo 'Available Reality + XHTTP pairs:' >&2
-  rx_ids >&2
-  read -rp 'Pair name: ' id
-  anytls_valid_id "$id" && [[ -f "$(rx_dir "$id")/meta.json" ]] || return 1
-  printf '%s' "$id"
-}
-rx_reserved_port() {
-  local id
-  while read -r id; do
-    jq -e --argjson p "$1" '.port==$p or .backend_port==$p' "$(rx_dir "$id")/meta.json" >/dev/null && return 0
-  done < <(rx_ids)
-  return 1
-}
-rx_port_busy() {
-  local port="$1" excluded="${2:-}" id file
-  while read -r id; do
-    [[ "$id" == "$excluded" ]] && continue
-    jq -e --argjson p "$port" '.port==$p or .backend_port==$p' "$(rx_dir "$id")/meta.json" >/dev/null && return 0
-  done < <(rx_ids)
-  # Include stopped services; a reserved port must not be reused.
-  for file in "$REALITY_INSTANCES_DIR"/*.json "$XHTTP_INSTANCES_DIR"/*/config.json "$XHTTP_LEGACY_DIR/config.json" "$ANYTLS_INSTANCES_DIR"/*/meta.json; do
-    [[ -f "$file" ]] || continue
-    jq -e --argjson p "$port" '([.port, .inbounds[]?.port, .inbounds[]?.listen_port]|any(.==$p))' "$file" >/dev/null && return 0
-  done
-  if ss -H -ltn | awk '{print $4}' | grep -Eq "(^|:)$port$"; then
-    if [[ -n "$excluded" ]] && systemctl is-active --quiet "$(rx_name "$excluded")" &&
-      jq -e --argjson p "$port" '.port==$p or .backend_port==$p' "$(rx_dir "$excluded")/meta.json" >/dev/null; then return 1; fi
-    return 0
-  fi
-  return 1
-}
-rx_certificate_check() {
-  local meta="$1" cert key domain a b
-  cert="$(jq -r .cert "$meta")"; key="$(jq -r .key "$meta")"; domain="$(jq -r .domain "$meta")"
-  [[ -r "$cert" && -r "$key" ]] || { echo 'Certificate/key cannot be read.' >&2; return 1; }
-  a="$(openssl x509 -in "$cert" -pubkey -noout)" && b="$(openssl pkey -in "$key" -pubout)" || return 1
-  [[ "$a" == "$b" ]] || { echo 'Certificate/key mismatch.' >&2; return 1; }
-  openssl x509 -in "$cert" -noout -checkend 0 >/dev/null &&
-    openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null &&
-    openssl verify -purpose sslserver -verify_hostname "$domain" -untrusted "$cert" "$cert" || {
-      echo 'A matching, unexpired, publicly trusted TLS chain is required (no Origin CA/self-signed).' >&2; return 1;
-    }
-}
-rx_generate_encryption() {
-  local meta="$1" binary="$2" mode="$3" rd=none re=none xd=none xe=none
-  if [[ "$mode" == mlkem768 ]]; then
-    reality_generate_vless_encryption_pair mlkem768 "$binary" || return 1
-    rd="$REALITY_DECRYPTION"; re="$REALITY_ENCRYPTION"
-    reality_generate_vless_encryption_pair mlkem768 "$binary" || return 1
-    xd="$REALITY_DECRYPTION"; xe="$REALITY_ENCRYPTION"
-  fi
-  jq --arg mode "$mode" --arg rd "$rd" --arg re "$re" --arg xd "$xd" --arg xe "$xe" \
-    '.encryption_mode=$mode | .reality_decryption=$rd | .reality_encryption=$re | .xhttp_decryption=$xd | .xhttp_encryption=$xe' "$meta" >"$meta.new" && mv "$meta.new" "$meta"
-}
-rx_build() {
-  local meta="$1" out="$2"
-  mkdir -p "$out" || return 1
-  jq '{log:{loglevel:"warning"},inbounds:[
-    {tag:"reality",listen:"::",port:.port,protocol:"vless",
-      settings:{clients:[.users[]|{id, email:(.name+"-reality"),flow:""}],decryption:.reality_decryption},
-      sniffing:{enabled:true,destOverride:["http","tls","quic"],routeOnly:true},
-      streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,
-        target:("127.0.0.1:"+(.backend_port|tostring)),xver:0,serverNames:[.domain],
-        privateKey:.private_key,shortIds:[.short_id]}}},
-    {tag:"xhttp",listen:"127.0.0.1",port:.backend_port,protocol:"vless",
-      settings:{clients:[.users[]|{id,email:(.name+"-xhttp")}],decryption:.xhttp_decryption},
-      sniffing:{enabled:true,destOverride:["http","tls","quic"],routeOnly:true},
-      streamSettings:{network:"xhttp",security:"tls",
-        tlsSettings:{minVersion:"1.3",alpn:["h2","http/1.1"],certificates:[{certificateFile:.cert,keyFile:.key}]},
-        xhttpSettings:{path:.path,mode:"auto",xPaddingBytes:"100-1000",scMaxBufferedPosts:30,scStreamUpServerSecs:"20-80"}}}
-    ],outbounds:[{tag:"direct",protocol:"freedom"}]}' "$meta" >"$out/config.json" || return 1
-  # A pair follows the existing unified WARP selection, including strict all mode.
-  gecko_warp_apply_xray_json "$out/config.json" || return 1
-  python3 - "$meta" "$out" <<'PY_RX_EXPORT'
-import json,sys,pathlib,urllib.parse
-m=json.load(open(sys.argv[1])); out=pathlib.Path(sys.argv[2]); lines=[]
-for u in m['users']:
-    for kind in ('reality','xhttp'):
-        security=kind if kind=='reality' else 'tls'
-        stream={'network':'tcp' if kind=='reality' else 'xhttp','security':security}
-        q={'encryption':m[kind+'_encryption'],'security':security,'sni':m['domain'],'fp':'chrome','type':stream['network']}
-        if kind=='reality':
-            stream['realitySettings']={'serverName':m['domain'],'fingerprint':'chrome','publicKey':m['public_key'],'shortId':m['short_id']}
-            q.update(pbk=m['public_key'],sid=m['short_id'])
-        else:
-            stream['tlsSettings']={'serverName':m['domain'],'fingerprint':'chrome','allowInsecure':False,'alpn':['h2','http/1.1']}
-            stream['xhttpSettings']={'path':m['path'],'host':m['domain'],'mode':'auto'}
-            q.update(path=m['path'],host=m['domain'],mode='auto',alpn='h2,http/1.1')
-        client={'log':{'loglevel':'warning'},'inbounds':[{'listen':'127.0.0.1','port':10808,'protocol':'socks','settings':{'udp':True}}],
-                'outbounds':[{'protocol':'vless','settings':{'vnext':[{'address':m['address'],'port':m['port'],
-                'users':[{'id':u['id'],'encryption':m[kind+'_encryption']}]}]},'streamSettings':stream}]}
-        (out/(u['name']+'-'+kind+'.json')).write_text(json.dumps(client,indent=2)+'\n')
-        host=m['address']; host='['+host+']' if ':' in host else host
-        lines.append('vless://'+u['id']+'@'+host+':'+str(m['port'])+'?'+urllib.parse.urlencode(q,quote_via=urllib.parse.quote)+'#'+urllib.parse.quote(m['id']+'-'+u['name']+'-'+kind,safe=''))
-(out/'links.txt').write_text('\n'.join(lines)+'\n')
-PY_RX_EXPORT
-}
-rx_validate() {
-  local meta="$1" out="$2" binary="$3" file
-  rx_certificate_check "$meta" || return 1
-  rx_build "$meta" "$out" || return 1
-  "$binary" run -test -c "$out/config.json" || return 1
-  for file in "$out"/*-reality.json "$out"/*-xhttp.json; do
-    "$binary" run -test -c "$file" || return 1
-  done
-}
-rx_write_service() {
-  local id="$1"
-  cat >"/etc/systemd/system/$(rx_name "$id").service" <<EOF_RX_UNIT
-[Unit]
-Description=GECKO Reality to XHTTP TLS ($id)
-After=network-online.target
-Wants=network-online.target
-[Service]
-ExecStart=$(rx_bin "$id") run -c $(rx_dir "$id")/config.json
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=1048576
-UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=full
-[Install]
-WantedBy=multi-user.target
-EOF_RX_UNIT
-}
-# Stage the complete set: metadata, server, BOTH client exports and links.
-# Existing inactive services stay inactive. A failed start restores the set.
-rx_commit() (
-  umask 077
-  local id="$1" meta="$2" dir unit stage backup active=false new=false failed=false
-  anytls_valid_id "$id" || return 1
-  dir="$(rx_dir "$id")"; unit="$(rx_name "$id")"
-  mkdir -p "$RX_ROOT" || return 1
-  stage="$(mktemp -d "$RX_ROOT/.stage.XXXXXX")" || return 1
-  backup="$(mktemp -d "$RX_ROOT/.backup.XXXXXX")" || { rm -rf "$stage"; return 1; }
-  trap 'rm -rf "$stage" "$backup"' EXIT
-  cp "$meta" "$stage/meta.json" || return 1
-  rx_validate "$stage/meta.json" "$stage" "$(rx_bin "$id")" || return 1
-  if [[ -d "$dir" ]]; then cp -a "$dir/." "$backup/" || return 1; else new=true; fi
-  systemctl is-active --quiet "$unit" && active=true
-  if [[ "$new" == true ]]; then rx_write_service "$id" && systemctl daemon-reload || return 1; fi
-  # No stale per-user export survives a removal.
-  rm -rf "$dir"
-  mv "$stage" "$dir" || failed=true
-  if [[ "$failed" == false && ( "$active" == true || "$new" == true ) ]]; then
-    systemctl restart "$unit" && sleep 1 && systemctl is-active --quiet "$unit" || failed=true
-  fi
-  if [[ "$failed" == false && "$new" == true ]]; then
-    systemctl enable "$unit" || failed=true
-  fi
-  if [[ "$failed" == true ]]; then
-    echo 'Pair activation failed; restoring previous configuration.' >&2
-    if [[ "$new" == true ]]; then
-      systemctl disable --now "$unit" || true
-      rm -rf "$dir"
-      rm -f "/etc/systemd/system/$unit.service"
-      systemctl daemon-reload
-    else
-      rm -rf "$dir"; mv "$backup" "$dir"
-      [[ "$active" != true ]] || systemctl restart "$unit" || true
-    fi
-    return 1
-  fi
-  return 0
-)
-rx_collect() {
-  local meta="$1" id="$2" old='{}' address domain port backend path mode cert key kind answer
-  [[ ! -s "$meta" ]] || old="$(cat "$meta")"
-  read -rp "Server IP or DNS address [$(jq -r '.address//empty' <<<"$old")]: " address
-  address="${address:-$(jq -r '.address//empty' <<<"$old")}"; address="$(xhttp_normalize_address "$address")" || return 1
-  read -rp "TLS domain / Reality SNI [$(jq -r '.domain//empty' <<<"$old")]: " domain
-  domain="${domain:-$(jq -r '.domain//empty' <<<"$old")}"; xhttp_is_hostname "$domain" || return 1
-  read -rp "Shared public TCP port [$(jq -r '.port//443' <<<"$old")]: " port
-  port="${port:-$(jq -r '.port//443' <<<"$old")}"; rx_port_valid "$port" || return 1
-  rx_port_busy "$port" "$id" && { echo 'Public port is busy/reserved.'; return 1; }
-  read -rp "Internal XHTTP TLS port [$(jq -r '.backend_port//2096' <<<"$old")]: " backend
-  backend="${backend:-$(jq -r '.backend_port//2096' <<<"$old")}"; rx_port_valid "$backend" && [[ "$backend" != "$port" ]] || return 1
-  rx_port_busy "$backend" "$id" && { echo 'Backend port is busy/reserved.'; return 1; }
-  read -rp "XHTTP path [$(jq -r '.path//"/news"' <<<"$old")]: " path
-  path="${path:-$(jq -r '.path//"/news"' <<<"$old")}"; path="$(xhttp_normalize_path "$path")" || return 1
-  read -rp "VLESS encryption (none/mlkem768) [$(jq -r '.encryption_mode//"none"' <<<"$old")]: " mode
-  mode="${mode:-$(jq -r '.encryption_mode//"none"' <<<"$old")}"; [[ "$mode" == none || "$mode" == mlkem768 ]] || return 1
-  read -rp "Certificate: existing or letsencrypt [$(jq -r '.certificate_mode//"existing"' <<<"$old")]: " kind
-  kind="${kind:-$(jq -r '.certificate_mode//"existing"' <<<"$old")}"; [[ "$kind" == existing || "$kind" == letsencrypt ]] || return 1
-  if [[ "$kind" == letsencrypt ]]; then
-    command -v certbot >/dev/null || { echo 'Install certbot first, or choose existing certificate.'; return 1; }
-    echo "DNS for $domain must point directly to this server; inbound TCP 80 must be available."
-    certbot certonly --standalone --preferred-challenges http --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring -d "$domain" || return 1
-    cert="/etc/letsencrypt/live/$domain/fullchain.pem"; key="/etc/letsencrypt/live/$domain/privkey.pem"
-  else
-    read -rp "Full chain PEM absolute path [$(jq -r '.cert//empty' <<<"$old")]: " cert
-    cert="${cert:-$(jq -r '.cert//empty' <<<"$old")}"
-    read -rp "Private key PEM absolute path [$(jq -r '.key//empty' <<<"$old")]: " key
-    key="${key:-$(jq -r '.key//empty' <<<"$old")}"
-  fi
-  # Paths appear only in JSON, never interpolated into a shell command/unit.
-  [[ "$cert" == /* && "$key" == /* ]] || return 1
-  [[ "$cert" != /root/* && "$key" != /root/* && "$cert" != /home/* && "$key" != /home/* ]] || {
-    echo 'Store certificates under /etc (ProtectHome hides home directories).'; return 1;
-  }
-  jq --arg id "$id" --arg address "$address" --arg domain "$domain" --argjson port "$port" --argjson backend "$backend" \
-    --arg path "$path" --arg cert "$cert" --arg key "$key" --arg kind "$kind" \
-    '.id=$id|.address=$address|.domain=$domain|.port=$port|.backend_port=$backend|.path=$path|.cert=$cert|.key=$key|.certificate_mode=$kind' <<<"$old" >"$meta" || return 1
-  rx_certificate_check "$meta" || return 1
-  if [[ "$(jq -r '.encryption_mode//"unset"' <<<"$old")" != "$mode" ]]; then
-    rx_generate_encryption "$meta" "$(rx_bin "$id")" "$mode" || return 1
-  fi
-}
-rx_create() (
-  umask 077
-  local id meta output private public name uuid
-  read -rp 'New pair name (letters/numbers/-/_): ' id
-  anytls_valid_id "$id" && [[ ! -e "$(rx_dir "$id")" ]] || return 1
-  install_xray_core "$(rx_name "$id")" || return 1
-  meta="$(mktemp)" || return 1; trap 'rm -f "$meta" "$meta.new"' EXIT
-  rx_collect "$meta" "$id" || return 1
-  output="$("$(rx_bin "$id")" x25519)" || return 1
-  private="$(sed -nE 's/^(PrivateKey|Private Key):[[:space:]]*//p' <<<"$output")"
-  public="$(sed -nE 's/^(PublicKey|Public key|Public Key|Password( \(PublicKey\))?):[[:space:]]*//p' <<<"$output")"
-  [[ -n "$private" && -n "$public" ]] || return 1
-  read -rp 'First user name: ' name; anytls_valid_name "$name" || return 1
-  uuid="$("$(rx_bin "$id")" uuid)" || return 1
-  jq --arg private "$private" --arg public "$public" --arg sid "$(openssl rand -hex 8)" --arg name "$name" --arg uuid "$uuid" \
-    '.private_key=$private|.public_key=$public|.short_id=$sid|.users=[{name:$name,id:$uuid}]' "$meta" >"$meta.new" && mv "$meta.new" "$meta" || return 1
-  rx_commit "$id" "$meta" && rx_renewal_hook && rx_show "$id"
-)
-rx_edit() (
-  umask 077
-  local id="$1" meta
-  meta="$(mktemp)" || return 1; trap 'rm -f "$meta" "$meta.new"' EXIT
-  cp "$(rx_dir "$id")/meta.json" "$meta" || return 1
-  rx_collect "$meta" "$id" && rx_commit "$id" "$meta" && rx_renewal_hook && rx_show "$id"
-)
-rx_user() (
-  umask 077
-  local id="$1" action="$2" meta name uuid
-  meta="$(mktemp)" || return 1; trap 'rm -f "$meta"' EXIT
-  read -rp 'User name: ' name; anytls_valid_name "$name" || return 1
-  if [[ "$action" == add ]]; then
-    jq -e --arg name "$name" 'any(.users[];.name==$name)' "$(rx_dir "$id")/meta.json" >/dev/null && { echo 'Duplicate user.'; return 1; }
-    uuid="$("$(rx_bin "$id")" uuid)" || return 1
-    jq --arg name "$name" --arg uuid "$uuid" '.users += [{name:$name,id:$uuid}]' "$(rx_dir "$id")/meta.json" >"$meta" || return 1
-  else
-    jq -e --arg name "$name" '(.users|length)>1 and any(.users[];.name==$name)' "$(rx_dir "$id")/meta.json" >/dev/null || { echo 'Unknown user or last remaining user.'; return 1; }
-    jq --arg name "$name" '.users|=map(select(.name!=$name))' "$(rx_dir "$id")/meta.json" >"$meta" || return 1
-  fi
-  rx_commit "$id" "$meta" && rx_show "$id"
-)
-rx_show() {
-  local id="$1"
-  echo 'Both links use the shared public port. TLS verification stays enabled.'
-  cat "$(rx_dir "$id")/links.txt"
-  echo "Full Xray client JSON files: $(rx_dir "$id")/<user>-reality.json and <user>-xhttp.json"
-  echo 'Each JSON is a separate client profile (local SOCKS port 10808).'
-}
-rx_status() {
-  local id="$1"
-  jq '{id,address,domain,port,backend_port,path,encryption_mode,users:[.users[].name],forwarding:"REALITY target -> loopback XHTTP TLS"}' "$(rx_dir "$id")/meta.json"
-  systemctl status "$(rx_name "$id")" --no-pager || true
-  journalctl -u "$(rx_name "$id")" -n 30 --no-pager
-}
-rx_update() (
-  local id="$1" tmp active=false
-  tmp="$(mktemp -d)" || return 1; trap 'rm -rf "$tmp"' EXIT
-  cp -a "$(rx_bin "$id")" "$tmp/core" || return 1
-  systemctl is-active --quiet "$(rx_name "$id")" && active=true
-  if ! install_xray_core "$(rx_name "$id")" || ! rx_validate "$(rx_dir "$id")/meta.json" "$tmp/check" "$(rx_bin "$id")" ||
-    { [[ "$active" == true ]] && ! { systemctl restart "$(rx_name "$id")" && sleep 1 && systemctl is-active --quiet "$(rx_name "$id")"; }; }; then
-    install -m 0755 "$tmp/core" "$(rx_bin "$id").restore" && mv -f "$(rx_bin "$id").restore" "$(rx_bin "$id")"
-    [[ "$active" != true ]] || systemctl restart "$(rx_name "$id")"
-    echo 'Core update failed; previous binary restored.'; return 1
-  fi
-)
-rx_delete() {
-  local id="$1" answer
-  read -rp "Delete pair '$id' and all its users? [y/N]: " answer
-  [[ "$answer" == y ]] || return 0
-  systemctl disable --now "$(rx_name "$id")" || return 1
-  rm -f "/etc/systemd/system/$(rx_name "$id").service" "$(rx_bin "$id")"
-  rm -rf "$(rx_dir "$id")"
-  systemctl daemon-reload
-  echo 'Pair removed. External TLS certificates retained.'
-}
-rx_renewal_hook() {
-  mkdir -p /etc/letsencrypt/renewal-hooks/deploy || return 1
-  cat >/etc/letsencrypt/renewal-hooks/deploy/gecko-reality-xhttp <<'RX_HOOK'
-#!/bin/bash
-# Certbot has replaced the live symlinks. Restart only active, valid pairs.
-for meta in /etc/gecko-reality-xhttp/*/meta.json; do
-  [[ -f "$meta" ]] || continue
-  id="${meta%/meta.json}"; id="${id##*/}"
-  [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || continue
-  cert="$(jq -r .cert "$meta")"
-  [[ "$cert" == "${RENEWED_LINEAGE:-/nonexistent}/"* ]] || continue
-  "/usr/bin/gecko-rx-$id" run -test -c "${meta%/meta.json}/config.json" && systemctl try-restart "gecko-rx-$id.service"
-done
-RX_HOOK
-  chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/gecko-reality-xhttp
-}
-rx_warp_refresh_all() {
-  local id
-  while read -r id; do rx_commit "$id" "$(rx_dir "$id")/meta.json" || return 1; done < <(rx_ids)
-}
-rx_menu() {
-  anytls_prerequisites || return 1
-  local choice id
-  while true; do
-    echo '=== Reality + XHTTP TLS pairs [Xray] ==='
-    echo '1) Create pair  2) Edit pair  3) Add shared user  4) Remove shared user'
-    echo '5) Show both links / JSON paths  6) Status and logs'
-    echo '7) Start  8) Stop  9) Restart  10) Update core  11) Delete pair  0) Back'
-    read -rp 'Choose: ' choice
-    case "$choice" in
-      0) return ;;
-      1) rx_create ;;
-      2|3|4|5|6|7|8|9|10|11)
-        id="$(rx_select)" || continue
-        case "$choice" in
-          2) rx_edit "$id" ;; 3) rx_user "$id" add ;; 4) rx_user "$id" remove ;;
-          5) rx_show "$id" ;; 6) rx_status "$id" ;;
-          7) systemctl start "$(rx_name "$id")" ;; 8) systemctl stop "$(rx_name "$id")" ;;
-          9) systemctl restart "$(rx_name "$id")" ;; 10) rx_update "$id" ;; 11) rx_delete "$id" ;;
-        esac ;;
-      *) echo 'Invalid choice.' ;;
-    esac
-    [[ $? == 0 ]] || echo 'Operation failed; review the error above.'
-    read -rp 'Press Enter to continue...' choice
-  done
-}
-# END GECKO REALITY XHTTP PAIRS
-
 # ---- Swap management ----
 GECKO_SWAP_FILE="/swapfile"
 GECKO_SWAP_SYSCTL="/etc/sysctl.d/99-zz-gecko-swap.conf"
@@ -9689,7 +9316,6 @@ while true; do
   echo -e "11) \e[92mSwap RAM Management (custom size, RAM-first)\e[0m"
   echo -e "12) \e[96mMieru Protocol [Core: sing-box-extended]\e[0m"
   echo -e "13) \e[96mAnyTLS Multi-Config [Core: sing-box-extended | TLS / Reality]\e[0m"
-  echo -e "14) Reality + XHTTP TLS Pair [Core: Xray]"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -9770,10 +9396,6 @@ while true; do
   13)
     clear
     anytls_menu
-    ;;
-  14)
-    clear
-    rx_menu
     ;;
   0)
     clear
