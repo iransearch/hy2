@@ -6417,6 +6417,15 @@ GECKO_WARP_DIR="/etc/gecko-warp"
 GECKO_WARP_ENABLED_FILE="$GECKO_WARP_DIR/enabled"
 GECKO_WARP_PORT_FILE="$GECKO_WARP_DIR/proxy-port"
 GECKO_WARP_ROUTES_FILE="$GECKO_WARP_DIR/routes.txt"
+GECKO_WARP_MODE_FILE="$GECKO_WARP_DIR/mode"
+
+gecko_warp_mode() {
+  if [[ -f "$GECKO_WARP_MODE_FILE" ]] && [[ "$(cat "$GECKO_WARP_MODE_FILE")" == all ]]; then
+    echo all
+  else
+    echo selective
+  fi
+}
 
 gecko_warp_is_enabled() {
   [[ -f "$GECKO_WARP_ENABLED_FILE" ]] &&
@@ -6622,11 +6631,13 @@ gecko_warp_apply_singbox_json() {
   if gecko_warp_is_enabled; then
     port="$(gecko_warp_proxy_port)"
     domains="$(gecko_warp_domain_sets_json)" || { rm -f "$tmp"; return 1; }
-    jq --argjson port "$port" --argjson domains "$domains" '
+    jq --arg mode "$(gecko_warp_mode)" --argjson port "$port" --argjson domains "$domains" '
       .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
       | .outbounds += [{type:"socks", tag:"warp", server:"127.0.0.1", server_port:$port, version:"5"}]
       | .route.rules = ((.route.rules // []) | map(select(.outbound != "warp")))
-      | if (($domains.exact | length) + ($domains.suffix | length)) > 0 then
+      | if $mode == "all" then
+          .route.rules = ([{action:"route", outbound:"warp"}] + .route.rules)
+        elif (($domains.exact | length) + ($domains.suffix | length)) > 0 then
           .route.rules += [
             ({action:"route", outbound:"warp"}
              + if ($domains.exact | length) > 0 then {domain:$domains.exact} else {} end
@@ -6657,7 +6668,7 @@ gecko_warp_apply_xray_json() {
   if gecko_warp_is_enabled; then
     port="$(gecko_warp_proxy_port)"
     domains="$(gecko_warp_domain_sets_json)" || { rm -f "$tmp"; return 1; }
-    jq --argjson port "$port" --argjson domains "$domains" '
+    jq --arg mode "$(gecko_warp_mode)" --argjson port "$port" --argjson domains "$domains" '
       # Hand the sniffed domain, not the client supplied IP, to the WARP proxy.
       # With routeOnly the socks5 outbound dials a raw IP, WARP cannot resolve
       # the name itself, and services like Google AI Studio answer differently
@@ -6667,7 +6678,9 @@ gecko_warp_apply_xray_json() {
       | .outbounds += [{protocol:"socks", tag:"warp", settings:{address:"127.0.0.1", port:$port}}]
       | .routing.rules = ((.routing.rules // []) | map(select(.outboundTag != "warp")))
       | (($domains.exact | map("full:" + .)) + ($domains.suffix | map("domain:" + .))) as $xdomains
-      | if ($xdomains | length) > 0 then
+      | if $mode == "all" then
+          .routing.rules = ([{type:"field", network:"tcp,udp", outboundTag:"warp"}] + .routing.rules)
+        elif ($xdomains | length) > 0 then
           .routing.rules += [{type:"field", domain:$xdomains, outboundTag:"warp"}]
         else . end
     ' "$config_file" >"$tmp"
@@ -6687,6 +6700,10 @@ gecko_warp_apply_xray_json() {
 }
 
 build_gecko_warp_acl_rules() {
+  if [[ "$(gecko_warp_mode)" == all ]]; then
+    echo "    - warp(all)"
+    return 0
+  fi
   write_default_gecko_warp_routes || return 1
   while IFS= read -r RULE; do
     RULE="$(echo "$RULE" | sed 's/#.*$//' | xargs)"
@@ -6864,22 +6881,22 @@ gecko_warp_restore_all() {
 }
 
 enable_gecko_real_outbound_via_warp() {
-  local detected_port proxy_port backup_dir
+  local detected_port proxy_port backup_dir mode="${1:-selective}"
+  [[ "$mode" == selective || "$mode" == all ]] || return 1
   clear
   echo "======================================================="
-  echo " Enable unified SELECTIVE outbound via WARP Proxy"
+  echo " Enable unified WARP outbound: $mode"
   echo "======================================================="
-  echo "The same routes will be applied to installed Hysteria2, Reality and XHTTP services."
-  echo "Everything not listed will continue through DIRECT."
-  echo "======================================================="
+  echo "Applies to client traffic in Hysteria2, Reality, XHTTP and AnyTLS."
+  echo "Host system routing (including SSH) is not changed."
   [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
-  write_default_gecko_warp_routes
-  echo
-  echo "Selective WARP route list:"
-  echo "-------------------------------------------------------"
-  show_default_gecko_warp_routes
-  echo "-------------------------------------------------------"
-  echo "These routes will be converted to warp(rule), then direct(all)."
+  if [[ "$mode" == all ]]; then
+    echo "All client TCP/UDP traffic will use WARP; no DIRECT fallback."
+    echo "UDP requires UDP support in the local WARP SOCKS5 proxy."
+  else
+    echo "Listed sites use WARP; other traffic uses DIRECT."
+    show_default_gecko_warp_routes || return 1
+  fi
   echo
 
   detected_port="$(gecko_warp_detect_proxy_port)"
@@ -6910,6 +6927,7 @@ enable_gecko_real_outbound_via_warp() {
   backup_dir="$(mktemp -d /tmp/gecko-warp-backup.XXXXXX)" || return 1
   gecko_warp_backup_all "$backup_dir" || { rm -rf "$backup_dir"; return 1; }
   gecko_warp_prepare_storage
+  printf '%s\n' "$mode" >"$GECKO_WARP_MODE_FILE"
   printf '%s\n' "$proxy_port" >"$GECKO_WARP_PORT_FILE"
   touch "$GECKO_WARP_ENABLED_FILE"
   rm -f "$REALITY_DIR/warp-enabled"
@@ -6920,7 +6938,7 @@ enable_gecko_real_outbound_via_warp() {
     return 1
   fi
   rm -rf "$backup_dir"
-  echo "Unified selective WARP enabled successfully."
+  echo "Unified WARP enabled successfully: $mode."
   echo "Routes: $GECKO_WARP_ROUTES_FILE"
 }
 
@@ -6951,6 +6969,7 @@ show_gecko_warp_status() {
   echo "======================================================="
   if gecko_warp_is_enabled; then
     echo "Unified state: ENABLED (SOCKS5 127.0.0.1:$(gecko_warp_proxy_port))"
+    echo "Routing mode: $(gecko_warp_mode)"
   else
     echo "Unified state: DISABLED"
   fi
@@ -7089,6 +7108,8 @@ gecko_warp_proxy_menu() {
     echo " 4) Disable unified WARP for all installed services"
     echo " 5) Show unified WARP/service status"
     echo " 6) Test local WARP SOCKS5 proxy"
+    echo " 7) Enable ALL client traffic through WARP for all installed services"
+    echo " Current routing: $(gecko_warp_is_enabled && gecko_warp_mode || echo disabled)"
     echo " 0) Back"
     echo "======================================================="
     read -rp "Choose: " WARP_CHOICE
@@ -7099,6 +7120,7 @@ gecko_warp_proxy_menu() {
       4) disable_gecko_real_outbound_via_warp; read -rp "Press Enter to return to WARP menu..." ;;
       5) show_gecko_warp_status; read -rp "Press Enter to return to WARP menu..." ;;
       6) test_gecko_warp_proxy; read -rp "Press Enter to return to WARP menu..." ;;
+      7) enable_gecko_real_outbound_via_warp all; read -rp "Press Enter to return to WARP menu..." ;;
       0) return ;;
       *) echo "Invalid choice."; sleep 1 ;;
     esac
@@ -9385,3 +9407,4 @@ while true; do
     ;;
   esac
 done
+
