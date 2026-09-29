@@ -1653,7 +1653,7 @@ reality_commit_stage() {
     return 1
   fi
 
-  if ! crontab -l 2>/dev/null | grep -Fq "systemctl restart $REALITY_SERVICE"; then
+  if command -v crontab >/dev/null 2>&1 && ! crontab -l 2>/dev/null | grep -Fq "systemctl restart $REALITY_SERVICE"; then
     (crontab -l 2>/dev/null; echo "0 */5 * * * systemctl restart $REALITY_SERVICE") | crontab -
   fi
 
@@ -6418,6 +6418,25 @@ GECKO_WARP_ENABLED_FILE="$GECKO_WARP_DIR/enabled"
 GECKO_WARP_PORT_FILE="$GECKO_WARP_DIR/proxy-port"
 GECKO_WARP_ROUTES_FILE="$GECKO_WARP_DIR/routes.txt"
 GECKO_WARP_MODE_FILE="$GECKO_WARP_DIR/mode"
+GECKO_EGRESS_PROVIDER_FILE="$GECKO_WARP_DIR/provider"
+GECKO_SOCKS_CONFIG="$GECKO_WARP_DIR/socks.json"
+
+gecko_egress_provider() {
+  if [[ -f "$GECKO_EGRESS_PROVIDER_FILE" ]] && [[ "$(cat "$GECKO_EGRESS_PROVIDER_FILE")" == socks ]]; then
+    echo socks
+  else
+    echo warp
+  fi
+}
+
+gecko_egress_proxy_json() {
+  if [[ "$(gecko_egress_provider)" == socks ]]; then
+    gecko_socks_validate_file "$GECKO_SOCKS_CONFIG" || return 1
+    cat "$GECKO_SOCKS_CONFIG"
+  else
+    jq -n --argjson port "$(gecko_warp_proxy_port)" '{server:"127.0.0.1",port:$port,username:"",password:""}'
+  fi
+}
 
 gecko_warp_mode() {
   if [[ -f "$GECKO_WARP_MODE_FILE" ]] && [[ "$(cat "$GECKO_WARP_MODE_FILE")" == all ]]; then
@@ -6624,16 +6643,32 @@ gecko_warp_domain_sets_json() {
 
 # Apply or remove the central selective WARP policy from a sing-box JSON file.
 gecko_warp_apply_singbox_json() {
-  local config_file="$1" tmp port domains
+  local config_file="$1" tmp port domains proxy
   [[ -s "$config_file" ]] || return 1
   tmp="$(mktemp /tmp/gecko-warp-singbox.XXXXXX)" || return 1
 
   if gecko_warp_is_enabled; then
     port="$(gecko_warp_proxy_port)"
-    domains="$(gecko_warp_domain_sets_json)" || { rm -f "$tmp"; return 1; }
-    jq --arg mode "$(gecko_warp_mode)" --argjson port "$port" --argjson domains "$domains" '
+    proxy="$(gecko_egress_proxy_json)" || { rm -f "$tmp"; return 1; }
+    if [[ "$(gecko_warp_mode)" == all ]]; then
+      domains='{"exact":[],"suffix":[]}'
+    else
+      domains="$(gecko_warp_domain_sets_json)" || { rm -f "$tmp"; return 1; }
+    fi
+    jq --arg mode "$(gecko_warp_mode)" --argjson proxy "$proxy" --argjson domains "$domains" '
+      def clear_proxy_dns:
+        if .dns then
+          .dns.servers = ((.dns.servers // []) | map(select(.tag != "gecko-egress-local")))
+          | if .dns == {servers:[]} then del(.dns) else . end
+        else . end;
+      clear_proxy_dns |
       .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
-      | .outbounds += [{type:"socks", tag:"warp", server:"127.0.0.1", server_port:$port, version:"5"}]
+      | .outbounds += [({type:"socks", tag:"warp", server:$proxy.server, server_port:$proxy.port, version:"5"}
+        + if ($proxy.server | test("^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$") or contains(":")) then {} else {domain_resolver:"gecko-egress-local"} end
+        + if $proxy.username != "" then {username:$proxy.username,password:$proxy.password} else {} end)]
+      | if any(.outbounds[]; .tag=="warp" and .domain_resolver=="gecko-egress-local") then
+          .dns.servers = ((.dns.servers // []) + [{type:"local",tag:"gecko-egress-local"}])
+        else . end
       | .route.rules = ((.route.rules // []) | map(select(.outbound != "warp")))
       | if $mode == "all" then
           .route.rules = ([{action:"route", outbound:"warp"}] + .route.rules)
@@ -6647,6 +6682,12 @@ gecko_warp_apply_singbox_json() {
     ' "$config_file" >"$tmp"
   else
     jq '
+      def clear_proxy_dns:
+        if .dns then
+          .dns.servers = ((.dns.servers // []) | map(select(.tag != "gecko-egress-local")))
+          | if .dns == {servers:[]} then del(.dns) else . end
+        else . end;
+      clear_proxy_dns |
       .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
       | .route.rules = ((.route.rules // []) | map(select(.outbound != "warp")))
     ' "$config_file" >"$tmp"
@@ -6661,21 +6702,27 @@ gecko_warp_apply_singbox_json() {
 
 # Apply or remove the same policy from an Xray Reality JSON file.
 gecko_warp_apply_xray_json() {
-  local config_file="$1" tmp port domains
+  local config_file="$1" tmp port domains proxy
   [[ -s "$config_file" ]] || return 1
   tmp="$(mktemp /tmp/gecko-warp-xray.XXXXXX)" || return 1
 
   if gecko_warp_is_enabled; then
     port="$(gecko_warp_proxy_port)"
-    domains="$(gecko_warp_domain_sets_json)" || { rm -f "$tmp"; return 1; }
-    jq --arg mode "$(gecko_warp_mode)" --argjson port "$port" --argjson domains "$domains" '
+    proxy="$(gecko_egress_proxy_json)" || { rm -f "$tmp"; return 1; }
+    if [[ "$(gecko_warp_mode)" == all ]]; then
+      domains='{"exact":[],"suffix":[]}'
+    else
+      domains="$(gecko_warp_domain_sets_json)" || { rm -f "$tmp"; return 1; }
+    fi
+    jq --arg mode "$(gecko_warp_mode)" --argjson proxy "$proxy" --argjson domains "$domains" '
       # Hand the sniffed domain, not the client supplied IP, to the WARP proxy.
       # With routeOnly the socks5 outbound dials a raw IP, WARP cannot resolve
       # the name itself, and services like Google AI Studio answer differently
       # than they do for Hysteria2, which always forwards the domain.
       .inbounds = ((.inbounds // []) | map(if .sniffing then .sniffing.routeOnly = false else . end))
       | .outbounds = ((.outbounds // []) | map(select(.tag != "warp")))
-      | .outbounds += [{protocol:"socks", tag:"warp", settings:{address:"127.0.0.1", port:$port}}]
+      | .outbounds += [{protocol:"socks", tag:"warp", settings:({address:$proxy.server, port:$proxy.port}
+        + if $proxy.username != "" then {user:$proxy.username,pass:$proxy.password} else {} end)}]
       | .routing.rules = ((.routing.rules // []) | map(select(.outboundTag != "warp")))
       | (($domains.exact | map("full:" + .)) + ($domains.suffix | map("domain:" + .))) as $xdomains
       | if $mode == "all" then
@@ -6729,7 +6776,7 @@ show_default_gecko_warp_routes() {
 }
 
 gecko_warp_patch_hysteria() {
-  local config="${1:-/etc/hysteria2/server.yaml}" port
+  local config="${1:-/etc/hysteria2/server.yaml}" port proxy endpoint
   [[ -f "$config" ]] || return 0
   remove_gecko_warp_block_from_config "$config" || return 1
   gecko_warp_is_enabled || return 0
@@ -6738,7 +6785,8 @@ gecko_warp_patch_hysteria() {
     echo "Hysteria2 already has a custom top-level outbounds/acl/sniff section; unified WARP cannot merge it safely."
     return 1
   fi
-  port="$(gecko_warp_proxy_port)"
+  proxy="$(gecko_egress_proxy_json)" || return 1
+  endpoint="$(jq -r '.server | if contains(":") then "["+.+"]" else . end' <<<"$proxy"):$(jq -r .port <<<"$proxy")"
   {
     echo "# BEGIN GECKO WARP SNI SNIFF"
     echo "sniff:"
@@ -6756,12 +6804,16 @@ gecko_warp_patch_hysteria() {
     echo "  - name: warp"
     echo "    type: socks5"
     echo "    socks5:"
-    echo "      addr: 127.0.0.1:$port"
+    printf '      addr: %s\n' "$(jq -Rn --arg v "$endpoint" '$v')"
+    if [[ "$(jq -r .username <<<"$proxy")" != "" ]]; then
+      printf '      username: %s\n' "$(jq -c .username <<<"$proxy")"
+      printf '      password: %s\n' "$(jq -c .password <<<"$proxy")"
+    fi
     echo "acl:"
     echo "  inline:"
     build_gecko_warp_acl_rules
     echo "# END GECKO WARP PROXY OUTBOUND"
-  } >>"$config"
+  } >>"$config" && chmod 0600 "$config"
 }
 
 gecko_warp_refresh_reality() {
@@ -6819,6 +6871,7 @@ gecko_warp_refresh_all() {
   xhttp_for_each_instance gecko_warp_refresh_xhttp || { echo "XHTTP update failed."; failed="true"; }
   echo "Applying to all AnyTLS configs..."
   anytls_warp_refresh_all || { echo "AnyTLS update failed."; failed="true"; }
+  gecko_egress_refresh_mieru || { echo "Mieru update failed."; failed="true"; }
   [[ "$failed" == "false" ]]
 }
 
@@ -6856,6 +6909,7 @@ gecko_warp_backup_all() {
   [[ -d "$GECKO_WARP_DIR" ]] && cp -a "$GECKO_WARP_DIR" "$backup_dir/gecko-warp"
   [[ -f /etc/hysteria2/server.yaml ]] && cp -a /etc/hysteria2/server.yaml "$backup_dir/hysteria.yaml"
   [[ -f "$REALITY_DIR/config.json" ]] && cp -a "$REALITY_DIR/config.json" "$backup_dir/reality.json"
+  [[ ! -f "$MIERU_CONFIG" ]] || cp -a "$MIERU_CONFIG" "$backup_dir/mieru.json" || return 1
   xhttp_for_each_instance xhttp_backup_warp_config "$backup_dir" || return 1
   [[ ! -d "$ANYTLS_INSTANCES_DIR" ]] || cp -a "$ANYTLS_INSTANCES_DIR" "$backup_dir/anytls-instances" || return 1
   return 0
@@ -6868,6 +6922,10 @@ gecko_warp_restore_all() {
   [[ -f "$backup_dir/hysteria.yaml" ]] && cp -a "$backup_dir/hysteria.yaml" /etc/hysteria2/server.yaml
   [[ -f "$backup_dir/reality.json" ]] && cp -a "$backup_dir/reality.json" "$REALITY_DIR/config.json"
   xhttp_for_each_instance xhttp_restore_warp_config "$backup_dir"
+  if [[ -f "$backup_dir/mieru.json" ]]; then
+    cp -a "$backup_dir/mieru.json" "$MIERU_CONFIG"
+    systemctl try-restart "$MIERU_SERVICE" >/dev/null 2>&1 || true
+  fi
   if [[ -d "$backup_dir/anytls-instances" ]]; then
     mkdir -p "$ANYTLS_INSTANCES_DIR"
     cp -a "$backup_dir/anytls-instances/." "$ANYTLS_INSTANCES_DIR/"
@@ -6927,6 +6985,7 @@ enable_gecko_real_outbound_via_warp() {
   backup_dir="$(mktemp -d /tmp/gecko-warp-backup.XXXXXX)" || return 1
   gecko_warp_backup_all "$backup_dir" || { rm -rf "$backup_dir"; return 1; }
   gecko_warp_prepare_storage
+  printf '%s\n' warp >"$GECKO_EGRESS_PROVIDER_FILE"
   printf '%s\n' "$mode" >"$GECKO_WARP_MODE_FILE"
   printf '%s\n' "$proxy_port" >"$GECKO_WARP_PORT_FILE"
   touch "$GECKO_WARP_ENABLED_FILE"
@@ -6946,7 +7005,7 @@ disable_gecko_real_outbound_via_warp() {
   local backup_dir
   clear
   echo "======================================================="
-  echo " Disable unified WARP outbound"
+  echo " Disable shared proxy outbound"
   echo "======================================================="
   [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
   backup_dir="$(mktemp -d /tmp/gecko-warp-backup.XXXXXX)" || return 1
@@ -6959,7 +7018,7 @@ disable_gecko_real_outbound_via_warp() {
     return 1
   fi
   rm -rf "$backup_dir"
-  echo "Unified WARP disabled. The route list and local WARP installation were kept."
+  echo "Shared proxy outbound disabled (DIRECT). Saved proxy settings and WARP routes were kept."
 }
 
 show_gecko_warp_status() {
@@ -6968,7 +7027,8 @@ show_gecko_warp_status() {
   echo " GECKO WARP Proxy Status"
   echo "======================================================="
   if gecko_warp_is_enabled; then
-    echo "Unified state: ENABLED (SOCKS5 127.0.0.1:$(gecko_warp_proxy_port))"
+    echo "Unified state: ENABLED ($(gecko_egress_provider))"
+    gecko_egress_proxy_json | jq -r '"SOCKS5 endpoint: \(.server):\(.port)"'
     echo "Routing mode: $(gecko_warp_mode)"
   else
     echo "Unified state: DISABLED"
@@ -7093,6 +7153,214 @@ edit_gecko_warp_routes() {
   fi
 }
 
+# Custom SOCKS5 provider for the shared GECKO service egress policy.
+# The existing managed tag/markers remain compatible with WARP cleanup.
+gecko_socks_validate_file() {
+  python3 - "$1" <<'PY_SOCKS_VALIDATE'
+import ipaddress, json, re, sys
+try:
+    with open(sys.argv[1]) as f:
+        x = json.load(f)
+    host = x['server']
+    if not isinstance(host, str) or not host or len(host) > 253:
+        raise ValueError('Invalid SOCKS host')
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if not re.fullmatch(r'(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', host):
+            raise ValueError('Use an IP or hostname without scheme, credentials or port')
+        if any(not label or len(label) > 63 or label.startswith('-') or label.endswith('-') for label in host.split('.')):
+            raise ValueError('Invalid hostname')
+    if type(x['port']) is not int or not 1 <= x['port'] <= 65535:
+        raise ValueError('Invalid SOCKS port')
+    for key in ('username', 'password'):
+        value = x[key]
+        if not isinstance(value, str) or len(value.encode('utf-8')) > 255 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError('SOCKS credentials must be at most 255 bytes without control characters')
+    if bool(x['username']) != bool(x['password']):
+        raise ValueError('Provide both username and password, or neither')
+except (OSError, ValueError, KeyError, TypeError):
+    print('Invalid SOCKS configuration: check host, port and credentials.', file=sys.stderr)
+    sys.exit(1)
+PY_SOCKS_VALIDATE
+}
+
+gecko_socks_test_file() {
+  gecko_socks_validate_file "$1" || return 1
+  # Keep credentials out of process arguments and avoid URL/userinfo escaping.
+  python3 - "$1" <<'PY_SOCKS_TEST'
+import json, socket, ssl, struct, sys
+with open(sys.argv[1]) as f:
+    x = json.load(f)
+def receive(sock, size):
+    data = b''
+    while len(data) < size:
+        part = sock.recv(size - len(data))
+        if not part:
+            raise OSError('SOCKS connection closed unexpectedly')
+        data += part
+    return data
+try:
+    with socket.create_connection((x['server'], x['port']), timeout=10) as sock:
+        method = 2 if x['username'] else 0
+        sock.sendall(bytes([5, 1, method]))
+        if receive(sock, 2) != bytes([5, method]):
+            raise OSError('SOCKS5 authentication method rejected')
+        if method == 2:
+            user, password = x['username'].encode(), x['password'].encode()
+            sock.sendall(bytes([1, len(user)]) + user + bytes([len(password)]) + password)
+            if receive(sock, 2) != b'\x01\x00':
+                raise OSError('SOCKS5 username/password rejected')
+        target = b'www.cloudflare.com'
+        sock.sendall(b'\x05\x01\x00\x03' + bytes([len(target)]) + target + struct.pack('!H', 443))
+        version, reply, reserved, kind = receive(sock, 4)
+        if version != 5 or reply != 0:
+            raise OSError(f'SOCKS5 CONNECT failed (code {reply})')
+        if kind == 1:
+            receive(sock, 4)
+        elif kind == 4:
+            receive(sock, 16)
+        elif kind == 3:
+            receive(sock, receive(sock, 1)[0])
+        else:
+            raise OSError('Invalid SOCKS5 reply address')
+        receive(sock, 2)
+        with ssl.create_default_context().wrap_socket(sock, server_hostname=target.decode()) as tls:
+            tls.sendall(b'GET /cdn-cgi/trace HTTP/1.0\r\nHost: www.cloudflare.com\r\nConnection: close\r\n\r\n')
+            response = b''
+            while len(response) < 65536:
+                part = tls.recv(4096)
+                if not part:
+                    break
+                response += part
+            headers, body = response.split(b'\r\n\r\n', 1)
+            if headers.split(b'\r\n', 1)[0].split()[1] != b'200':
+                raise OSError('HTTPS trace returned a non-200 response')
+            trace = body.decode('utf-8', errors='replace').splitlines()
+            if not any(line.startswith('ip=') for line in trace):
+                raise OSError('HTTPS trace contained no exit IP')
+            print('SOCKS5 TCP/HTTPS test passed:')
+            for line in trace:
+                if line.startswith(('ip=', 'colo=', 'warp=')):
+                    print(line)
+            print('UDP is not tested; it requires upstream SOCKS5 UDP ASSOCIATE support.')
+except (OSError, ValueError, IndexError) as e:
+    print(f'SOCKS5 test failed: {e}', file=sys.stderr)
+    sys.exit(1)
+PY_SOCKS_TEST
+}
+
+gecko_socks_enable() (
+  umask 077
+  local candidate="$1" backup
+  [[ "$(id -u)" == 0 ]] || { echo "Run as root."; return 1; }
+  gecko_socks_test_file "$candidate" || { echo "Not enabled. Previous routing was kept."; return 1; }
+  backup="$(mktemp -d /tmp/gecko-socks-backup.XXXXXX)" || return 1
+  trap 'rm -rf "$backup"' EXIT
+  gecko_warp_backup_all "$backup" || return 1
+  if ! {
+    gecko_warp_prepare_storage && chmod 0700 "$GECKO_WARP_DIR" &&
+    { [[ "$candidate" == "$GECKO_SOCKS_CONFIG" ]] || install -m 0600 "$candidate" "$GECKO_SOCKS_CONFIG"; } &&
+    chmod 0600 "$GECKO_SOCKS_CONFIG" &&
+    printf '%s\n' socks >"$GECKO_EGRESS_PROVIDER_FILE" &&
+    printf '%s\n' all >"$GECKO_WARP_MODE_FILE" &&
+    jq -r .port "$GECKO_SOCKS_CONFIG" >"$GECKO_WARP_PORT_FILE" &&
+    touch "$GECKO_WARP_ENABLED_FILE" &&
+    rm -f "$REALITY_DIR/warp-enabled" &&
+    gecko_warp_refresh_all
+  }; then
+    echo "SOCKS activation failed; restoring the previous provider and service configs."
+    gecko_warp_restore_all "$backup"
+    return 1
+  fi
+  echo "Custom SOCKS5 enabled for all client traffic in Hysteria2, Reality, XHTTP, AnyTLS and Mieru."
+  echo "No DIRECT fallback. Host system/SSH routing is unchanged."
+)
+
+gecko_socks_configure() (
+  umask 077
+  local host="" port=1080 username="" password="" old_user="" old_pass="" candidate
+  if [[ -f "$GECKO_SOCKS_CONFIG" ]]; then
+    host="$(jq -r .server "$GECKO_SOCKS_CONFIG")"; port="$(jq -r .port "$GECKO_SOCKS_CONFIG")"
+    old_user="$(jq -r .username "$GECKO_SOCKS_CONFIG")"; old_pass="$(jq -r .password "$GECKO_SOCKS_CONFIG")"
+  fi
+  read -rp "SOCKS5 server IP/hostname [$host]: " username || return 1
+  host="${username:-$host}"; host="${host#[}"; host="${host%]}"
+  read -rp "SOCKS5 port [$port]: " username || return 1
+  port="${username:-$port}"
+  [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port>0 && 10#$port<65536)) || { echo "Invalid port."; return 1; }
+  port=$((10#$port))
+  read -rp "Username (blank = no authentication): " username || return 1
+  if [[ -n "$username" ]]; then
+    read -rsp "Password (blank = keep saved password for same username): " password || return 1; echo
+    [[ -n "$password" || "$username" != "$old_user" ]] || password="$old_pass"
+  fi
+  candidate="$(mktemp /tmp/gecko-socks-settings.XXXXXX)" || return 1
+  trap 'rm -f "$candidate"' EXIT
+  jq -n --arg host "$host" --argjson port "$port" --arg user "$username" --arg pass "$password" \
+    '{server:$host,port:$port,username:$user,password:$pass}' >"$candidate" || return 1
+  gecko_socks_validate_file "$candidate" || return 1
+  gecko_socks_enable "$candidate"
+)
+
+gecko_socks_status() {
+  if gecko_warp_is_enabled; then
+    echo "Active shared provider: $(gecko_egress_provider); mode: $(gecko_warp_mode)"
+  else
+    echo "Shared outbound is disabled (DIRECT)."
+  fi
+  [[ -f "$GECKO_SOCKS_CONFIG" ]] || { echo "No custom SOCKS5 saved."; return 0; }
+  jq -r '"Saved SOCKS5: \(.server):\(.port)\nAuthentication: \(if .username=="" then "none" else "configured (hidden)" end)"' "$GECKO_SOCKS_CONFIG"
+}
+
+gecko_socks_disable() {
+  if ! gecko_warp_is_enabled || [[ "$(gecko_egress_provider)" != socks ]]; then
+    echo "Custom SOCKS5 is not active."
+    return 0
+  fi
+  disable_gecko_real_outbound_via_warp
+}
+
+gecko_egress_refresh_mieru() (
+  [[ -s "$MIERU_CONFIG" ]] || return 0
+  local candidate
+  candidate="$(mktemp /tmp/gecko-egress-mieru.XXXXXX)" || return 1
+  trap 'rm -f "$candidate"' EXIT
+  cp -a "$MIERU_CONFIG" "$candidate" && gecko_warp_apply_singbox_json "$candidate" &&
+    "$MIERU_BINARY" check -c "$candidate" && install -m 0600 "$candidate" "$MIERU_CONFIG" &&
+    systemctl try-restart "$MIERU_SERVICE"
+)
+
+gecko_socks_menu() {
+  local tool choice
+  [[ "$(id -u)" == 0 ]] || { echo "Run as root."; return 1; }
+  for tool in jq python3; do command -v "$tool" >/dev/null || { echo "Missing required tool: $tool"; return 1; }; done
+  while true; do
+    clear
+    echo "Custom SOCKS5 Outbound - all client traffic"
+    gecko_socks_status
+    echo "1) Configure / edit and enable SOCKS5"
+    echo "2) Enable saved SOCKS5"
+    echo "3) Test saved SOCKS5 and show exit IP"
+    echo "4) Show status"
+    echo "5) Disable custom SOCKS5 (DIRECT)"
+    echo "0) Back"
+    echo "Use menu 6 to switch back to WARP; only one shared provider is active."
+    read -rp "Choose: " choice
+    case "$choice" in
+      1) gecko_socks_configure ;;
+      2) gecko_socks_enable "$GECKO_SOCKS_CONFIG" ;;
+      3) gecko_socks_test_file "$GECKO_SOCKS_CONFIG" ;;
+      4) gecko_socks_status ;;
+      5) gecko_socks_disable ;;
+      0) return ;;
+      *) echo "Invalid choice." ;;
+    esac
+    read -rp "Press Enter to return to menu..."
+  done
+}
+
+
 gecko_warp_proxy_menu() {
   while true; do
     clear
@@ -7109,6 +7377,7 @@ gecko_warp_proxy_menu() {
     echo " 5) Show unified WARP/service status"
     echo " 6) Test local WARP SOCKS5 proxy"
     echo " 7) Enable ALL client traffic through WARP for all installed services"
+    echo " Current provider: $(gecko_warp_is_enabled && gecko_egress_provider || echo disabled)"
     echo " Current routing: $(gecko_warp_is_enabled && gecko_warp_mode || echo disabled)"
     echo " 0) Back"
     echo "======================================================="
@@ -7715,6 +7984,7 @@ mieru_write_server_config() {
       {log:{level:"error"},inbounds:[{type:"mieru",tag:"mieru-in",listen:"::",listen_port:$port,transport:$transport,users:$users}],outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}
       | if $pattern == "" then . else .inbounds[0].traffic_pattern = $pattern end' >"$tmp"
   fi
+  gecko_warp_apply_singbox_json "$tmp" || { rm -f "$tmp"; return 1; }
   "$MIERU_BINARY" check -c "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
   install -m 0600 "$tmp" "$MIERU_CONFIG"; local status=$?; rm -f "$tmp"; return "$status"
 }
@@ -8815,6 +9085,7 @@ while true; do
   echo -e "7)  \e[96mGECKO Relay Tunnel Menu (Iran <-> Kharej)\e[0m"
   echo -e "8)  \e[93mGOST Multi-Tunnel Menu\e[0m"
   echo -e "9)  \e[91mCSF Firewall Menu\e[0m"
+  echo -e "10) \e[96mCustom SOCKS5 Outbound (all service traffic)\e[0m"
   echo -e "11) \e[92mSwap RAM Management (custom size, RAM-first)\e[0m"
   echo -e "12) \e[96mMieru Protocol [Core: sing-box-extended]\e[0m"
   echo -e "13) \e[96mAnyTLS Multi-Config [Core: sing-box-extended | TLS / Reality]\e[0m"
@@ -8883,6 +9154,10 @@ while true; do
     clear
     csf_menu
     ;;
+  10)
+    clear
+    gecko_socks_menu
+    ;;
   11)
     clear
     gecko_swap_menu
@@ -8905,4 +9180,5 @@ while true; do
     ;;
   esac
 done
+
 
