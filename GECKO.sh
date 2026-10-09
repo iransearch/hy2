@@ -4109,8 +4109,46 @@ hysteria2_certificate_pin() {
   printf '%s\n' "$fingerprint"
 }
 
+# Native BBR profiles are supported by Hysteria2 2.8.0 and newer.
+hysteria2_choose_bbr_profile() {
+  local version="${1#v}" choice minor
+  HY2_BBR_PROFILE="standard"
+  HY2_CONGESTION_CONFIG=""
+  if [[ ! "$version" =~ ^2\.([0-9]+)\.[0-9]+$ ]]; then
+    echo "Cannot determine BBR profile support for version: $version" >&2
+    return 1
+  fi
+  minor="${BASH_REMATCH[1]}"
+  if (( 10#$minor < 8 )); then
+    echo "Hysteria2 $version does not support configurable BBR profiles (requires 2.8.0+)."
+    echo "Keeping this version's default congestion control."
+    return 0
+  fi
+
+  echo
+  echo "Hysteria2 BBR profile:"
+  echo "  1) standard (default)"
+  echo "  2) conservative"
+  echo "  3) aggressive"
+  echo "This profile controls server sending; it is not negotiated with clients."
+  echo "It applies when BBR is used; client bandwidth settings can select Brutal."
+  while true; do
+    read -rp "Choose BBR profile [1]: " choice || return 1
+    case "${choice:-1}" in
+      1|standard) HY2_BBR_PROFILE="standard"; break ;;
+      2|conservative) HY2_BBR_PROFILE="conservative"; break ;;
+      3|aggressive) HY2_BBR_PROFILE="aggressive"; break ;;
+      *) echo "Invalid BBR profile. Choose 1, 2 or 3." ;;
+    esac
+  done
+  HY2_CONGESTION_CONFIG="congestion:
+  type: bbr
+  bbrProfile: $HY2_BBR_PROFILE"
+}
+
 install_hysteria2_gecko_v292() {
   local HY2_PIN_SHA256 HY2_LINK_HOST HY2_REQUESTED_VERSION
+  local HY2_BBR_PROFILE HY2_CONGESTION_CONFIG
   set -e
   HYSTERIA_BIN="/usr/local/bin/hysteria"
   HYSTERIA_DIR="/etc/hysteria2"
@@ -4162,6 +4200,7 @@ install_hysteria2_gecko_v292() {
   fi
   HYSTERIA_URL="https://github.com/apernet/hysteria/releases/download/app%2F${HYSTERIA_VERSION}/hysteria-linux-${HY2_ARCH}"
   echo "Selected Hysteria core: $HYSTERIA_VERSION"
+  hysteria2_choose_bbr_profile "$HYSTERIA_VERSION" || return 1
 
   read -rp "Port [2020]: " HY2_PORT
   HY2_PORT="${HY2_PORT:-2020}"
@@ -4392,6 +4431,8 @@ auth:
 
 ${OBFS_CONFIG}${MASQ_CONFIG}
 
+${HY2_CONGESTION_CONFIG}
+
 quic:
   initStreamReceiveWindow: 8388608
   maxStreamReceiveWindow: 8388608
@@ -4455,6 +4496,9 @@ EOF
   echo
   echo "======================================================="
   echo "Hysteria2 $HY2_OBFS_NAME installed."
+  if [[ -n "$HY2_CONGESTION_CONFIG" ]]; then
+    echo "BBR profile: $HY2_BBR_PROFILE (server sending)"
+  fi
   echo "Service: hysteria2-gecko.service"
   echo "Config: $HYSTERIA_CONFIG"
   echo "Link saved: $HYSTERIA_DIR/client-link.txt"
