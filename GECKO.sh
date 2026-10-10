@@ -4146,9 +4146,149 @@ hysteria2_choose_bbr_profile() {
   bbrProfile: $HY2_BBR_PROFILE"
 }
 
+# Native ACME keeps certificates renewed and reloads them in memory. Do not pin
+# a renewable leaf certificate in share links: its fingerprint changes on renewal.
+hysteria2_choose_certificate() {
+  local choice
+  HY2_TLS_MODE="selfsigned"
+  HY2_ACME_EMAIL=""
+  HY2_ACME_TYPE="http"
+  HY2_ACME_PORT=80
+  echo
+  echo "TLS certificate:"
+  echo "  1) Self-signed (default)"
+  echo "  2) Let's Encrypt (own domain, automatic renewal)"
+  while true; do
+    read -rp "Choose certificate [1]: " choice || return 1
+    case "${choice:-1}" in
+      1) break ;;
+      2) HY2_TLS_MODE="letsencrypt"; break ;;
+      *) echo "Invalid certificate choice. Choose 1 or 2." ;;
+    esac
+  done
+  if [[ "$HY2_TLS_MODE" == "letsencrypt" ]]; then
+    echo "Point the domain's A/AAAA records to this server (DNS only, no CDN proxy)."
+    read -rp "Your domain / SNI: " HY2_SNI || return 1
+  else
+    read -rp "SNI / certificate CN [www.google.com]: " HY2_SNI || return 1
+    HY2_SNI="${HY2_SNI:-www.google.com}"
+  fi
+  HY2_SNI="${HY2_SNI,,}"
+  xhttp_is_hostname "$HY2_SNI" || { echo "Invalid domain. Enter a hostname, not an IP address or URL."; return 1; }
+  [[ "$HY2_TLS_MODE" == "letsencrypt" ]] || return 0
+
+  read -rp "ACME account email (optional): " HY2_ACME_EMAIL || return 1
+  if [[ -n "$HY2_ACME_EMAIL" && ! "$HY2_ACME_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+    echo "Invalid email address."
+    return 1
+  fi
+  echo "ACME validation:"
+  echo "  1) HTTP-01: TCP 80 (default)"
+  echo "  2) TLS-ALPN-01: TCP 443 (separate from the Hysteria UDP port)"
+  while true; do
+    read -rp "Choose validation [1]: " choice || return 1
+    case "${choice:-1}" in
+      1) break ;;
+      2) HY2_ACME_TYPE="tls"; HY2_ACME_PORT=443; break ;;
+      *) echo "Invalid validation choice. Choose 1 or 2." ;;
+    esac
+  done
+  echo "TCP $HY2_ACME_PORT must remain available and reachable for issuance and renewal."
+  echo "Let's Encrypt certificates are renewed automatically before expiry, not on day 90."
+  echo "Continuing with Let's Encrypt accepts its subscriber agreement."
+}
+
+hysteria2_acme_preflight() {
+  local domain="$1" port="$2"
+  python3 - "$domain" "$port" <<'PY_HY2_ACME_PREFLIGHT'
+import errno, socket, sys
+domain, port = sys.argv[1], int(sys.argv[2])
+try:
+    socket.getaddrinfo(domain, None, type=socket.SOCK_STREAM)
+except OSError as e:
+    print(f'Cannot resolve {domain}: {e}', file=sys.stderr)
+    sys.exit(1)
+for family, addr in [(socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')]:
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.bind((addr, port))
+    except OSError as e:
+        if family == socket.AF_INET6 and e.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+            continue
+        print(f'ACME TCP port {port} is unavailable: {e}. Choose the other validation method or free the port.', file=sys.stderr)
+        sys.exit(1)
+PY_HY2_ACME_PREFLIGHT
+}
+
+hysteria2_tls_config() {
+  local dir="$1" sni_yaml email_yaml dir_yaml
+  if [[ "$HY2_TLS_MODE" == "letsencrypt" ]]; then
+    sni_yaml="$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$HY2_SNI")" || return 1
+    email_yaml="$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$HY2_ACME_EMAIL")" || return 1
+    dir_yaml="$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$dir/acme")" || return 1
+    cat <<EOF_HY2_ACME
+acme:
+  domains:
+    - $sni_yaml
+  email: $email_yaml
+  ca: letsencrypt
+  dir: $dir_yaml
+  type: $HY2_ACME_TYPE
+EOF_HY2_ACME
+  else
+    cat <<EOF_HY2_TLS
+tls:
+  cert: $dir/server.crt
+  key: $dir/server.key
+  sniGuard: disable
+EOF_HY2_TLS
+  fi
+}
+
+hysteria2_link_tls_parameters() {
+  if [[ "$1" == "letsencrypt" ]]; then
+    printf 'insecure=0&allowInsecure=0'
+  else
+    [[ "$2" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf 'insecure=1&allowInsecure=1&pinSHA256=%s' "$2"
+  fi
+}
+
+# ACME issuance happens during startup, after the UDP socket has been bound.
+# Wait for the certificate as well as the service; a listening socket alone
+# does not prove that issuance succeeded. Existing ACME state is reused on repair.
+hysteria2_wait_acme_certificate() {
+  local dir="$1" domain="$2" timeout="${3:-180}" deadline cert
+  deadline=$((SECONDS + timeout))
+  while ((SECONDS < deadline)); do
+    while IFS= read -r cert; do
+      # x509 -checkhost prints a mismatch but can still return exit status 0.
+      # verify checks both the requested hostname and certificate validity.
+      if openssl verify -partial_chain -trusted "$cert" -verify_hostname "$domain" "$cert" >/dev/null 2>&1; then
+        sleep 1
+        if systemctl is-active --quiet hysteria2-gecko.service; then
+          echo "Let's Encrypt certificate ready for $domain."
+          return 0
+        fi
+      fi
+    done < <(find "$dir/acme/certificates" -type f -name "$domain.crt" 2>/dev/null)
+    if [[ "$(systemctl show hysteria2-gecko.service -p NRestarts --value)" != 0 ]]; then
+      break
+    fi
+    sleep 2
+  done
+  echo "Certificate issuance/startup did not complete. No new client link was generated."
+  echo "Check DNS and inbound TCP $HY2_ACME_PORT; keep this port available for renewals."
+  echo "Inspect: journalctl -u hysteria2-gecko.service -n 50 --no-pager"
+  return 1
+}
+
 install_hysteria2_gecko_v292() {
-  local HY2_PIN_SHA256 HY2_LINK_HOST HY2_REQUESTED_VERSION
-  local HY2_BBR_PROFILE HY2_CONGESTION_CONFIG
+  local HY2_PIN_SHA256="" HY2_LINK_HOST HY2_REQUESTED_VERSION
+  local HY2_BBR_PROFILE HY2_CONGESTION_CONFIG HY2_TLS_MODE HY2_TLS_CONFIG HY2_TLS_QUERY
+  local HY2_ACME_EMAIL HY2_ACME_TYPE HY2_ACME_PORT
   set -e
   HYSTERIA_BIN="/usr/local/bin/hysteria"
   HYSTERIA_DIR="/etc/hysteria2"
@@ -4240,8 +4380,10 @@ install_hysteria2_gecko_v292() {
   read -rp "$HY2_OBFS_NAME obfs password [$DEFAULT_OBFS]: " HY2_OBFS
   HY2_OBFS="${HY2_OBFS:-$DEFAULT_OBFS}"
 
-  read -rp "SNI / certificate CN [www.google.com]: " HY2_SNI
-  HY2_SNI="${HY2_SNI:-www.google.com}"
+  hysteria2_choose_certificate || return 1
+  if [[ "$HY2_TLS_MODE" == "letsencrypt" ]]; then
+    hysteria2_acme_preflight "$HY2_SNI" "$HY2_ACME_PORT" || return 1
+  fi
 
   # Gecko packet sizes are intentionally not asked from the user. They do not
   # apply to Salamander and are not carried by the official share URI.
@@ -4408,22 +4550,26 @@ EOF_OBFS
   rm -f "$TMP_BIN"
 
   mkdir -p "$HYSTERIA_DIR"
-  echo "Generating self-signed certificate..."
-  openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
-    -keyout "$HYSTERIA_DIR/server.key" \
-    -out "$HYSTERIA_DIR/server.crt" \
-    -subj "/CN=$HY2_SNI" \
-    -days 3650 >/dev/null 2>&1
-  chmod 600 "$HYSTERIA_DIR/server.key"
-  HY2_PIN_SHA256="$(hysteria2_certificate_pin "$HYSTERIA_DIR/server.crt")" || return 1
+  if [[ "$HY2_TLS_MODE" == "letsencrypt" ]]; then
+    install -d -m 0700 "$HYSTERIA_DIR/acme"
+    echo "Hysteria2 will obtain and automatically renew the Let's Encrypt certificate."
+  else
+    echo "Generating self-signed certificate..."
+    openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+      -keyout "$HYSTERIA_DIR/server.key" \
+      -out "$HYSTERIA_DIR/server.crt" \
+      -subj "/CN=$HY2_SNI" \
+      -days 3650 >/dev/null 2>&1
+    chmod 600 "$HYSTERIA_DIR/server.key"
+    HY2_PIN_SHA256="$(hysteria2_certificate_pin "$HYSTERIA_DIR/server.crt")" || return 1
+  fi
+  HY2_TLS_CONFIG="$(hysteria2_tls_config "$HYSTERIA_DIR")" || return 1
+  HY2_TLS_QUERY="$(hysteria2_link_tls_parameters "$HY2_TLS_MODE" "$HY2_PIN_SHA256")" || return 1
 
   cat > "$HYSTERIA_CONFIG" <<EOF
 listen: :$HY2_PORT
 
-tls:
-  cert: $HYSTERIA_DIR/server.crt
-  key: $HYSTERIA_DIR/server.key
-  sniGuard: disable
+$HY2_TLS_CONFIG
 
 auth:
   type: password
@@ -4443,6 +4589,7 @@ quic:
   maxIncomingStreams: 1024
   disablePathMTUDiscovery: false
 EOF
+  chmod 600 "$HYSTERIA_CONFIG"
 
   cat > "$HYSTERIA_SERVICE" <<EOF
 [Unit]
@@ -4464,18 +4611,30 @@ LogRateLimitBurst=100
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable --now hysteria2-gecko.service
-  systemctl restart hysteria2-gecko.service
-
   if command -v ufw >/dev/null 2>&1; then
     ufw allow "$HY2_PORT/udp" >/dev/null 2>&1 || true
+    if [[ "$HY2_TLS_MODE" == "letsencrypt" ]]; then
+      ufw allow "$HY2_ACME_PORT/tcp" >/dev/null 2>&1 || true
+    fi
   fi
   if command -v csf >/dev/null 2>&1; then
     if ! grep -q "^UDP_IN.*$HY2_PORT" /etc/csf/csf.conf 2>/dev/null; then
       sed -i "s/^UDP_IN = \"\(.*\)\"/UDP_IN = \"\1,$HY2_PORT\"/" /etc/csf/csf.conf || true
-      csf -r >/dev/null 2>&1 || true
     fi
+    if [[ "$HY2_TLS_MODE" == "letsencrypt" ]] &&
+      ! awk -F'"' '/^TCP_IN = / {n=split($2,p,","); for(i=1;i<=n;i++) if(p[i]==port) found=1} END {exit !found}' \
+        port="$HY2_ACME_PORT" /etc/csf/csf.conf; then
+      sed -i "s/^TCP_IN = \"\(.*\)\"/TCP_IN = \"\1,$HY2_ACME_PORT\"/" /etc/csf/csf.conf || true
+    fi
+    csf -r >/dev/null 2>&1 || true
+  fi
+
+  systemctl daemon-reload
+  systemctl enable hysteria2-gecko.service
+  systemctl restart hysteria2-gecko.service
+  if [[ "$HY2_TLS_MODE" == "letsencrypt" ]]; then
+    echo "Waiting for Let's Encrypt issuance (up to 180 seconds)..."
+    hysteria2_wait_acme_certificate "$HYSTERIA_DIR" "$HY2_SNI" || return 1
   fi
 
   SERVER_IP="$(curl -4fsSL --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
@@ -4487,7 +4646,7 @@ EOF
   if [[ "$HY2_LINK_HOST" == *:* && "$HY2_LINK_HOST" != \[*\] ]]; then
     HY2_LINK_HOST="[$HY2_LINK_HOST]"
   fi
-  HY2_LINK="hy2://$EN_AUTH@$HY2_LINK_HOST:$HY2_PORT?sni=$EN_SNI&insecure=1&allowInsecure=1&pinSHA256=$HY2_PIN_SHA256&obfs=$HY2_OBFS_TYPE&obfs-password=$EN_OBFS&bbr_profile=$HY2_BBR_PROFILE#$EN_REMARK"
+  HY2_LINK="hy2://$EN_AUTH@$HY2_LINK_HOST:$HY2_PORT?sni=$EN_SNI&$HY2_TLS_QUERY&obfs=$HY2_OBFS_TYPE&obfs-password=$EN_OBFS&bbr_profile=$HY2_BBR_PROFILE#$EN_REMARK"
 
   cat > "$HYSTERIA_DIR/client-link.txt" <<EOF
 $HY2_LINK
@@ -4502,6 +4661,12 @@ EOF
   echo "Service: hysteria2-gecko.service"
   echo "Config: $HYSTERIA_CONFIG"
   echo "Link saved: $HYSTERIA_DIR/client-link.txt"
+  if [[ "$HY2_TLS_MODE" == "letsencrypt" ]]; then
+    echo "Certificate/SNI: $HY2_SNI (Let's Encrypt)"
+    echo "Automatic renewal: native ACME, before expiry; no cron/Certbot required."
+    echo "Certificate/account storage: $HYSTERIA_DIR/acme (preserved on repair)"
+    echo "Keep TCP $HY2_ACME_PORT reachable and the DNS records pointing to this server."
+  fi
   if [ "$HY2_OBFS_TYPE" = "gecko" ]; then
     echo "Note: Gecko packet sizes are server/config defaults and are NOT included in the client URI."
   fi
