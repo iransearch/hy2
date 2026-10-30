@@ -1440,6 +1440,8 @@ reality_stage_instances() {
   printf '%s' "$stage_dir"
 }
 
+# Xray also checks the filename extension even with -format=json. Keep every
+# temporary candidate passed to this validator suffixed with .json.
 reality_check_config() {
   local config_file="$1" core
   core="$(reality_detect_core 2>/dev/null)" || return 1
@@ -1466,7 +1468,7 @@ reality_enforce_safe_logging() {
   core="$(reality_detect_core 2>/dev/null)" || return 0
   command -v jq >/dev/null 2>&1 || return 0
 
-  candidate="$(mktemp /tmp/reality-logging.XXXXXX)" || return 1
+  candidate="$(mktemp --suffix=.json /tmp/reality-logging.XXXXXX)" || return 1
   case "$core" in
     sing-box)
       jq '.log = ((.log // {}) + {level: "warn", timestamp: true})' \
@@ -1562,7 +1564,7 @@ reality_commit_stage() {
   local stage_dir="$1" candidate check_log backup_dir
   local old_running="false" old_enabled="false" deploy_ok="true"
 
-  candidate="$(mktemp /tmp/reality-config.XXXXXX)" || return 1
+  candidate="$(mktemp --suffix=.json /tmp/reality-config.XXXXXX)" || return 1
   check_log="$(mktemp /tmp/reality-check.XXXXXX)" || {
     rm -f "$candidate"
     return 1
@@ -2820,7 +2822,8 @@ xhttp_install_core() {
   esac
 }
 
-# Validate a candidate config with whichever core is installed.
+# Validate a candidate config with whichever core is installed. Temporary
+# candidates need a .json suffix: Xray checks it even with -format=json.
 xhttp_check_config() {
   local config_file="$1" core="${2:-}"
   [[ -n "$core" ]] || core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
@@ -3175,7 +3178,7 @@ xhttp_disable_logging() {
   [[ -x "/usr/bin/$XHTTP_SERVICE" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 1
 
-  candidate="$(mktemp /tmp/xhttp-no-log.XXXXXX)" || return 1
+  candidate="$(mktemp --suffix=.json /tmp/xhttp-no-log.XXXXXX)" || return 1
   core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
   if [[ "$core" == "xray" ]]; then
     jq '.log = {loglevel: "none"}' "$config_file" >"$candidate" || {
@@ -3499,7 +3502,7 @@ add_xhttp_user() {
   fi
 
   uuid="$(cat /proc/sys/kernel/random/uuid)"
-  candidate="$(mktemp /tmp/xhttp-user.XXXXXX)" || return 1
+  candidate="$(mktemp --suffix=.json /tmp/xhttp-user.XXXXXX)" || return 1
   if ! xhttp_add_user_to_config "$XHTTP_DIR/config.json" "$name" "$uuid" "$core" \
     >"$candidate"; then
     rm -f "$candidate"
@@ -3553,7 +3556,7 @@ remove_xhttp_user() {
     --menu "Select the user to remove:" 20 78 10 \
     "${menu_items[@]}" 2>&1 >/dev/tty) || return
 
-  candidate="$(mktemp /tmp/xhttp-user.XXXXXX)" || return 1
+  candidate="$(mktemp --suffix=.json /tmp/xhttp-user.XXXXXX)" || return 1
   if ! xhttp_remove_user_from_config "$XHTTP_DIR/config.json" "$choice" "$core" \
     >"$candidate"; then
     rm -f "$candidate"
@@ -7041,7 +7044,7 @@ gecko_warp_refresh_xhttp() {
   [[ -f "$XHTTP_DIR/config.json" ]] || return 0
   [[ -x "/usr/bin/$XHTTP_SERVICE" ]] || { echo "XHTTP core is missing."; return 1; }
   core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
-  candidate="$(mktemp /tmp/xhttp-warp.XXXXXX)" || return 1
+  candidate="$(mktemp --suffix=.json /tmp/xhttp-warp.XXXXXX)" || return 1
   cp -a "$XHTTP_DIR/config.json" "$candidate" || { rm -f "$candidate"; return 1; }
   if [[ "$core" == "xray" ]]; then
     gecko_warp_apply_xray_json "$candidate" || { rm -f "$candidate"; return 1; }
