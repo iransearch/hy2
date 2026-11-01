@@ -2567,12 +2567,66 @@ xhttp_collect_encryption_settings() {
   fi
 }
 
+# Both cores require a flat map of HTTP header names to string values. Host is
+# configured separately, and control characters must not enter HTTP headers.
+xhttp_normalize_headers() {
+  python3 - "$1" <<'PY_XHTTP_HEADERS'
+import json, re, sys
+def unique_object(pairs):
+    result, names = {}, set()
+    for key, value in pairs:
+        if key.lower() in names:
+            raise ValueError('Duplicate header name: ' + key)
+        names.add(key.lower())
+        result[key] = value
+    return result
+try:
+    headers = json.loads(sys.argv[1] or '{}', object_pairs_hook=unique_object)
+    if not isinstance(headers, dict):
+        raise ValueError('Headers must be a JSON object')
+    for name, value in headers.items():
+        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+            raise ValueError('Invalid HTTP header name: ' + name)
+        if name.lower() == 'host':
+            raise ValueError('Set Host in the separate XHTTP Host field')
+        if not isinstance(value, str):
+            raise ValueError('Every header value must be a string')
+        if any((ord(c) < 32 and c != '\t') or ord(c) == 127 for c in value):
+            raise ValueError('HTTP header values cannot contain control characters')
+    print(json.dumps(headers, ensure_ascii=True, separators=(',', ':')))
+except (ValueError, TypeError) as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(1)
+PY_XHTTP_HEADERS
+}
+
+# Use a positive range accepted by both Xray's Int32Range and sing-box's Range.
+# Explicit zero/disabled padding is rejected by both current XHTTP cores.
+xhttp_normalize_padding_bytes() {
+  python3 - "$1" <<'PY_XHTTP_PADDING'
+import re, sys
+try:
+    match = re.fullmatch(r'([0-9]+)(?:-([0-9]+))?', sys.argv[1].strip())
+    if not match:
+        raise ValueError('Enter a positive size or range, for example 100-1000')
+    low, high = int(match[1]), int(match[2] or match[1])
+    if not 1 <= low <= high <= 2147483647:
+        raise ValueError('Padding must satisfy 1 <= minimum <= maximum <= 2147483647')
+    print(f'{low}-{high}')
+except ValueError as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(1)
+PY_XHTTP_PADDING
+}
+
 xhttp_collect_settings() {
   local metadata_file="${1:-}"
   local default_port="443" default_address="" default_sni=""
   local default_host="" default_path="" default_mode="auto"
   local default_tls_mode="letsencrypt" default_fingerprint="chrome"
   local default_insecure="false" host_input metadata_loaded="false"
+  local default_headers='{}' default_padding_bytes="100-1000" default_padding_obfs="false"
+  local headers_input padding_input
 
   if [[ -f "$metadata_file" ]] && jq -e . "$metadata_file" >/dev/null 2>&1; then
     metadata_loaded="true"
@@ -2585,6 +2639,9 @@ xhttp_collect_settings() {
     default_tls_mode="$(jq -r '.certificate_mode // "letsencrypt"' "$metadata_file")"
     default_fingerprint="$(jq -r '.fingerprint // "chrome"' "$metadata_file")"
     default_insecure="$(jq -r '.insecure // false' "$metadata_file")"
+    default_headers="$(jq -c '.headers // {}' "$metadata_file")"
+    default_padding_bytes="$(jq -r '.x_padding_bytes // "100-1000"' "$metadata_file")"
+    default_padding_obfs="$(jq -r '.x_padding_obfs_mode // false' "$metadata_file")"
   fi
 
   XHTTP_PORT=$(whiptail --inputbox "Enter listening port:" 10 55 "$default_port" 2>&1 >/dev/tty) || return 1
@@ -2639,6 +2696,25 @@ xhttp_collect_settings() {
   fi
 
   XHTTP_MODE="$(select_xhttp_mode "$default_mode")" || return 1
+  headers_input=$(whiptail --title "XHTTP request headers" --inputbox \
+    'Client request headers as JSON, e.g. {"User-Agent":"Mozilla/5.0"}. Use {} for none. Set Host separately:' \
+    12 88 "$default_headers" 2>&1 >/dev/tty) || return 1
+  if ! XHTTP_HEADERS="$(xhttp_normalize_headers "$headers_input")"; then
+    tui_error 'Invalid XHTTP headers. Use a flat JSON object with string values, without Host or control characters.'
+    return 1
+  fi
+  padding_input=$(whiptail --title "XHTTP padding" --inputbox \
+    "Padding size or range in bytes (for example 100-1000; positive values only):" \
+    11 84 "$default_padding_bytes" 2>&1 >/dev/tty) || return 1
+  if ! XHTTP_PADDING_BYTES="$(xhttp_normalize_padding_bytes "$padding_input")"; then
+    tui_error "Invalid padding size/range. The minimum must be positive and no larger than the maximum."
+    return 1
+  fi
+  XHTTP_PADDING_OBFS=$(whiptail --title "XHTTP padding obfuscation" --default-item "$default_padding_obfs" \
+    --menu "Padding obfuscation mode (shared by server and generated client links):" 16 84 2 \
+    "false" "Disabled (legacy padding, default)" \
+    "true" "Enabled (xPaddingObfsMode)" 2>&1 >/dev/tty) || return 1
+  case "$XHTTP_PADDING_OBFS" in true | false) ;; *) return 1 ;; esac
   XHTTP_FINGERPRINT="$(select_xhttp_fingerprint "$default_fingerprint")" || return 1
 
   if [[ "$XHTTP_TLS_MODE" == "selfsigned" ]]; then
@@ -2887,6 +2963,8 @@ xhttp_remove_user_from_config() {
 # Xray-core flavour of the same VLESS + XHTTP + TLS inbound.
 xhttp_build_xray_config() {
   local output_file="$1" cert_path="$2" key_path="$3" users_json="$4"
+  local headers="${XHTTP_HEADERS:-}"
+  [[ -n "$headers" ]] || headers='{}'
   jq -n \
     --arg decryption "${XHTTP_DECRYPTION:-none}" \
     --argjson port "$XHTTP_PORT" \
@@ -2895,6 +2973,9 @@ xhttp_build_xray_config() {
     --arg cert_path "$cert_path" \
     --arg key_path "$key_path" \
     --arg path "$XHTTP_PATH" \
+    --argjson headers "$headers" \
+    --arg padding_bytes "${XHTTP_PADDING_BYTES:-100-1000}" \
+    --argjson padding_obfs "${XHTTP_PADDING_OBFS:-false}" \
     --argjson users "$users_json" \
     '{
       "log": {
@@ -2926,7 +3007,9 @@ xhttp_build_xray_config() {
             "xhttpSettings": ({
               "path": $path,
               "mode": "auto",
-              "xPaddingBytes": "100-1000",
+              "headers": $headers,
+              "xPaddingBytes": $padding_bytes,
+              "xPaddingObfsMode": $padding_obfs,
               "noSSEHeader": false,
               "scMaxEachPostBytes": 1000000,
               "scMaxBufferedPosts": 30,
@@ -2958,6 +3041,8 @@ xhttp_build_xray_config() {
 xhttp_build_server_config() {
   local output_file="$1" cert_path="$2" key_path="$3" users_json="$4"
   local core="${5:-}"
+  local headers="${XHTTP_HEADERS:-}"
+  [[ -n "$headers" ]] || headers='{}'
   [[ -n "$core" ]] || core="$(xhttp_detect_core 2>/dev/null)" || core="sing-box"
   if [[ "$core" == "xray" ]]; then
     xhttp_build_xray_config "$output_file" "$cert_path" "$key_path" "$users_json"
@@ -2970,6 +3055,9 @@ xhttp_build_server_config() {
     --arg cert_path "$cert_path" \
     --arg key_path "$key_path" \
     --arg path "$XHTTP_PATH" \
+    --argjson headers "$headers" \
+    --arg padding_bytes "${XHTTP_PADDING_BYTES:-100-1000}" \
+    --argjson padding_obfs "${XHTTP_PADDING_OBFS:-false}" \
     --argjson users "$users_json" \
     '{
       "log": {
@@ -2997,8 +3085,9 @@ xhttp_build_server_config() {
             "mode": "auto",
             "host": "",
             "path": $path,
-            "headers": {},
-            "x_padding_bytes": "100-1000",
+            "headers": $headers,
+            "x_padding_bytes": $padding_bytes,
+            "x_padding_obfs_mode": $padding_obfs,
             "no_sse_header": false,
             "sc_max_each_post_bytes": 1000000,
             "sc_max_buffered_posts": 30,
@@ -3028,6 +3117,8 @@ xhttp_build_server_config() {
 
 xhttp_write_metadata() {
   local output_file="$1"
+  local headers="${XHTTP_HEADERS:-}"
+  [[ -n "$headers" ]] || headers='{}'
   jq -n \
     --arg encryption "${XHTTP_ENCRYPTION:-none}" \
     --arg encryption_mode "${XHTTP_ENCRYPTION_MODE:-none}" \
@@ -3037,6 +3128,9 @@ xhttp_write_metadata() {
     --arg host "$XHTTP_HOST" \
     --arg path "$XHTTP_PATH" \
     --arg mode "$XHTTP_MODE" \
+    --argjson headers "$headers" \
+    --arg padding_bytes "${XHTTP_PADDING_BYTES:-100-1000}" \
+    --argjson padding_obfs "${XHTTP_PADDING_OBFS:-false}" \
     --arg fingerprint "$XHTTP_FINGERPRINT" \
     --argjson insecure "$XHTTP_INSECURE" \
     --arg certificate_mode "$XHTTP_TLS_MODE" \
@@ -3049,6 +3143,9 @@ xhttp_write_metadata() {
       "host": $host,
       "path": $path,
       "mode": $mode,
+      "headers": $headers,
+      "x_padding_bytes": $padding_bytes,
+      "x_padding_obfs_mode": $padding_obfs,
       "fingerprint": $fingerprint,
       "insecure": $insecure,
       "certificate_mode": $certificate_mode
@@ -3080,7 +3177,7 @@ xhttp_certificate_pin() {
 
 xhttp_build_link() {
   local metadata_file="$1" uuid="$2" name="$3" pcs="${4:-}"
-  local address port sni host path mode fingerprint insecure authority query encryption
+  local address port sni host path mode fingerprint insecure authority query encryption extra
 
   [[ -n "$pcs" ]] || pcs="$(xhttp_certificate_pin "$(dirname "$metadata_file")/config.json")" || return 1
   [[ "$pcs" =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -3093,6 +3190,14 @@ xhttp_build_link() {
   mode="$(jq -r '.mode' "$metadata_file")"
   fingerprint="$(jq -r '.fingerprint' "$metadata_file")"
   insecure="$(jq -r '.insecure // false' "$metadata_file")"
+  # Share canonical Xray-style extra with either core; sing-box's snake_case
+  # transport keys stay internal to its generated server configuration.
+  extra="$(jq -c '{
+    headers: (.headers // {}),
+    mode: (.mode // "auto"),
+    xPaddingBytes: (.x_padding_bytes // "100-1000"),
+    xPaddingObfsMode: (.x_padding_obfs_mode // false)
+  }' "$metadata_file")" || return 1
 
   if [[ "$address" == *:* ]]; then
     authority="[$address]"
@@ -3110,6 +3215,7 @@ xhttp_build_link() {
     query+="&host=$(xhttp_urlencode "$host")"
   fi
   query+="&path=$(xhttp_urlencode "$path")&mode=$(xhttp_urlencode "$mode")"
+  query+="&extra=$(xhttp_urlencode "$extra")"
 
   printf 'vless://%s@%s:%s?%s#%s' \
     "$uuid" "$authority" "$port" "$query" "$(xhttp_urlencode "$name")"
