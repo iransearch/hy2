@@ -2567,8 +2567,9 @@ xhttp_collect_encryption_settings() {
   fi
 }
 
-# Both cores require a flat map of HTTP header names to string values. Host is
-# configured separately, and control characters must not enter HTTP headers.
+# Accept JSON, Name="Value" assignments, or literal Name: Value header lines.
+# Normalize to the flat string map both cores need; never evaluate shell input.
+# Host is configured separately, and header values cannot contain controls.
 xhttp_normalize_headers() {
   python3 - "$1" <<'PY_XHTTP_HEADERS'
 import json, re, sys
@@ -2581,7 +2582,26 @@ def unique_object(pairs):
         result[key] = value
     return result
 try:
-    headers = json.loads(sys.argv[1] or '{}', object_pairs_hook=unique_object)
+    raw = sys.argv[1].strip()
+    if not raw or raw.startswith(('{', '[')):
+        headers = json.loads(raw or '{}', object_pairs_hook=unique_object)
+    else:
+        pairs = []
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            match = re.fullmatch(r'([^:=]+?)\s*([=:])\s*(.*)', line.strip())
+            if not match:
+                raise ValueError('Use JSON, Name="Value", or Name: Value headers')
+            name, separator, value = match[1].strip(), match[2], match[3].strip()
+            # Quotes wrap assignment values, while HTTP-style colon values
+            # stay literal (e.g. If-None-Match: "etag"). Preserve inner bytes.
+            if separator == '=' and value.startswith(('"', "'")):
+                if len(value) < 2 or value[-1] != value[0]:
+                    raise ValueError('Unclosed header value quote')
+                value = value[1:-1]
+            pairs.append((name, value))
+        headers = unique_object(pairs)
     if not isinstance(headers, dict):
         raise ValueError('Headers must be a JSON object')
     for name, value in headers.items():
@@ -2697,10 +2717,10 @@ xhttp_collect_settings() {
 
   XHTTP_MODE="$(select_xhttp_mode "$default_mode")" || return 1
   headers_input=$(whiptail --title "XHTTP request headers" --inputbox \
-    'Client request headers as JSON, e.g. {"User-Agent":"Mozilla/5.0"}. Use {} for none. Set Host separately:' \
+    'Client headers: JSON or Name="Value", e.g. User-Agent="Mozilla/5.0". Multiple headers: one per line. Use {} for none. Set Host separately:' \
     12 88 "$default_headers" 2>&1 >/dev/tty) || return 1
   if ! XHTTP_HEADERS="$(xhttp_normalize_headers "$headers_input")"; then
-    tui_error 'Invalid XHTTP headers. Use a flat JSON object with string values, without Host or control characters.'
+    tui_error 'Invalid XHTTP headers. Use JSON or Name="Value" (one header per line), without Host or control characters.'
     return 1
   fi
   padding_input=$(whiptail --title "XHTTP padding" --inputbox \
