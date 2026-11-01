@@ -4112,6 +4112,35 @@ hysteria2_certificate_pin() {
   printf '%s\n' "$fingerprint"
 }
 
+# Match the native Gecko bounds: 1 <= minPacketSize <= maxPacketSize <= 2048.
+hysteria2_choose_gecko_packet_sizes() {
+  local value default_max=1200
+  GECKO_MIN=512
+  GECKO_MAX=1200
+  echo
+  echo "Gecko handshake packet sizes (bytes):"
+  echo "Choose a range from 1 to 2048; maximum must be at least minimum."
+  while true; do
+    read -rp "Minimum packet size [512]: " value || return 1
+    value="${value:-512}"
+    if [[ "$value" =~ ^[0-9]{1,4}$ ]] && ((10#$value >= 1 && 10#$value <= 2048)); then
+      GECKO_MIN=$((10#$value))
+      break
+    fi
+    echo "Invalid minimum packet size. Enter a whole number from 1 to 2048."
+  done
+  ((GECKO_MIN > default_max)) && default_max="$GECKO_MIN"
+  while true; do
+    read -rp "Maximum packet size [$default_max]: " value || return 1
+    value="${value:-$default_max}"
+    if [[ "$value" =~ ^[0-9]{1,4}$ ]] && ((10#$value >= GECKO_MIN && 10#$value <= 2048)); then
+      GECKO_MAX=$((10#$value))
+      break
+    fi
+    echo "Invalid maximum packet size. Enter a whole number from $GECKO_MIN to 2048."
+  done
+}
+
 # Native BBR profiles are supported by Hysteria2 2.8.0 and newer.
 hysteria2_choose_bbr_profile() {
   local version="${1#v}" choice minor
@@ -4292,6 +4321,7 @@ install_hysteria2_gecko_v292() {
   local HY2_PIN_SHA256="" HY2_LINK_HOST HY2_REQUESTED_VERSION
   local HY2_BBR_PROFILE HY2_CONGESTION_CONFIG HY2_TLS_MODE HY2_TLS_CONFIG HY2_TLS_QUERY
   local HY2_ACME_EMAIL HY2_ACME_TYPE HY2_ACME_PORT
+  local GECKO_MIN=512 GECKO_MAX=1200 HY2_GECKO_QUERY=""
   set -e
   HYSTERIA_BIN="/usr/local/bin/hysteria"
   HYSTERIA_DIR="/etc/hysteria2"
@@ -4388,10 +4418,11 @@ install_hysteria2_gecko_v292() {
     hysteria2_acme_preflight "$HY2_SNI" "$HY2_ACME_PORT" || return 1
   fi
 
-  # Gecko packet sizes are intentionally not asked from the user. They do not
-  # apply to Salamander and are not carried by the official share URI.
-  GECKO_MIN=512
-  GECKO_MAX=1200
+  if [[ "$HY2_OBFS_TYPE" == "gecko" ]]; then
+    hysteria2_choose_gecko_packet_sizes || return 1
+    # v2rayN-compatible extension; these fields are not in the official URI spec.
+    HY2_GECKO_QUERY="&minPacketSize=$GECKO_MIN&maxPacketSize=$GECKO_MAX"
+  fi
 
   read -rp "Remark [$HY2_DEFAULT_REMARK]: " HY2_REMARK
   HY2_REMARK="${HY2_REMARK:-$HY2_DEFAULT_REMARK}"
@@ -4649,7 +4680,7 @@ EOF
   if [[ "$HY2_LINK_HOST" == *:* && "$HY2_LINK_HOST" != \[*\] ]]; then
     HY2_LINK_HOST="[$HY2_LINK_HOST]"
   fi
-  HY2_LINK="hy2://$EN_AUTH@$HY2_LINK_HOST:$HY2_PORT?sni=$EN_SNI&$HY2_TLS_QUERY&obfs=$HY2_OBFS_TYPE&obfs-password=$EN_OBFS&bbr_profile=$HY2_BBR_PROFILE#$EN_REMARK"
+  HY2_LINK="hy2://$EN_AUTH@$HY2_LINK_HOST:$HY2_PORT?sni=$EN_SNI&$HY2_TLS_QUERY&obfs=$HY2_OBFS_TYPE&obfs-password=$EN_OBFS$HY2_GECKO_QUERY&bbr_profile=$HY2_BBR_PROFILE#$EN_REMARK"
 
   cat > "$HYSTERIA_DIR/client-link.txt" <<EOF
 $HY2_LINK
@@ -4671,7 +4702,7 @@ EOF
     echo "Keep TCP $HY2_ACME_PORT reachable and the DNS records pointing to this server."
   fi
   if [ "$HY2_OBFS_TYPE" = "gecko" ]; then
-    echo "Note: Gecko packet sizes are server/config defaults and are NOT included in the client URI."
+    echo "Gecko packet sizes: $GECKO_MIN-$GECKO_MAX bytes (config and client link)."
   fi
   echo "-------------------------------------------------------"
   echo "$HY2_LINK"
