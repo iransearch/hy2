@@ -2647,6 +2647,7 @@ xhttp_collect_settings() {
   local default_insecure="false" host_input metadata_loaded="false"
   local default_headers='{}' default_padding_bytes="100-1000" default_padding_obfs="false"
   local headers_input padding_input
+  local -a headers_prompt_options=(--defaultno)
 
   if [[ -f "$metadata_file" ]] && jq -e . "$metadata_file" >/dev/null 2>&1; then
     metadata_loaded="true"
@@ -2660,6 +2661,9 @@ xhttp_collect_settings() {
     default_fingerprint="$(jq -r '.fingerprint // "chrome"' "$metadata_file")"
     default_insecure="$(jq -r '.insecure // false' "$metadata_file")"
     default_headers="$(jq -c '.headers // {}' "$metadata_file")"
+    if jq -e 'type == "object" and length > 0' <<<"$default_headers" >/dev/null 2>&1; then
+      headers_prompt_options=()
+    fi
     default_padding_bytes="$(jq -r '.x_padding_bytes // "100-1000"' "$metadata_file")"
     default_padding_obfs="$(jq -r '.x_padding_obfs_mode // false' "$metadata_file")"
   fi
@@ -2716,12 +2720,20 @@ xhttp_collect_settings() {
   fi
 
   XHTTP_MODE="$(select_xhttp_mode "$default_mode")" || return 1
-  headers_input=$(whiptail --title "XHTTP request headers" --inputbox \
-    'Client headers: JSON or Name="Value", e.g. User-Agent="Mozilla/5.0". Multiple headers: one per line. Use {} for none. Set Host separately:' \
-    12 88 "$default_headers" 2>&1 >/dev/tty) || return 1
-  if ! XHTTP_HEADERS="$(xhttp_normalize_headers "$headers_input")"; then
-    tui_error 'Invalid XHTTP headers. Use JSON or Name="Value" (one header per line), without Host or control characters.'
-    return 1
+  XHTTP_HEADERS='{}'
+  if whiptail --title "XHTTP request headers" "${headers_prompt_options[@]}" \
+    --yes-button "Enable" --no-button "Disable" \
+    --yesno "Enable custom XHTTP request headers?" 10 72; then
+    headers_input=$(whiptail --title "XHTTP request headers" --inputbox \
+      'Client headers: JSON or Name="Value", e.g. User-Agent="Mozilla/5.0". Multiple headers: one per line. Use {} for none. Set Host separately:' \
+      12 88 "$default_headers" 2>&1 >/dev/tty) || return 1
+    if ! XHTTP_HEADERS="$(xhttp_normalize_headers "$headers_input")"; then
+      tui_error 'Invalid XHTTP headers. Use JSON or Name="Value" (one header per line), without Host or control characters.'
+      return 1
+    fi
+  else
+    # No skips the header editor; Escape cancels setup like the other dialogs.
+    case "$?" in 1) ;; *) return 1 ;; esac
   fi
   padding_input=$(whiptail --title "XHTTP padding" --inputbox \
     "Padding size or range in bytes (for example 100-1000; positive values only):" \
