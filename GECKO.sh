@@ -4011,6 +4011,89 @@ EOF_HY2_LIMITS
 }
 
 
+hy2_disable_ipv6() {
+  local grub_file=/etc/default/grub sysctl_file=/etc/sysctl.conf backup
+  if [[ "$(id -u)" != 0 ]]; then
+    echo "Please run as root."
+    return 1
+  fi
+  if [[ ! -f "$grub_file" ]] || ! command -v update-grub >/dev/null || ! command -v sysctl >/dev/null; then
+    echo "This option requires sysctl, $grub_file and update-grub."
+    return 1
+  fi
+
+  backup="$(mktemp -d /root/hy2-ipv6-backup.XXXXXX)" || return 1
+  cp -p "$grub_file" "$backup/grub" || return 1
+  if [[ -e "$sysctl_file" ]]; then
+    cp -p "$sysctl_file" "$backup/sysctl.conf" || return 1
+  else
+    : > "$backup/sysctl.conf" || return 1
+  fi
+  echo "Backups: $backup"
+
+  if ! awk '
+    BEGIN { sq = sprintf("%c", 39) }
+    match($0, /^[[:blank:]]*(export[[:blank:]]+)?GRUB_CMDLINE_LINUX(_DEFAULT)?=/) {
+      prefix = substr($0, 1, RLENGTH)
+      rest = substr($0, RLENGTH + 1)
+      if (match(rest, /^"([^"\\]|\\.)*"/) || match(rest, "^" sq "[^" sq "]*" sq)) {
+        quote = substr(rest, 1, 1)
+        value = substr(rest, 2, RLENGTH - 2)
+      } else {
+        match(rest, /^[[:alnum:]_./:=,+-]*/)
+        quote = "\""
+        value = substr(rest, 1, RLENGTH)
+      }
+      suffix = substr(rest, RLENGTH + 1)
+      if (suffix !~ /^([[:blank:]]+#[^[:cntrl:]]*|[[:blank:]]*)$/) exit 1
+      original = value
+      while (sub(/(^|[[:space:]])ipv6[.]disable(=[^[:space:]]*)?([[:space:]]|$)/, " ", value)) {}
+      if (value != original) sub(/[[:blank:]]+$/, "", value)
+      if (prefix !~ /_DEFAULT=$/) {
+        value = (value == "" ? "" : value " ") "ipv6.disable=1"
+        found = 1
+      }
+      if (value != original) $0 = prefix quote value quote suffix
+    }
+    { print }
+    END { if (!found) print "GRUB_CMDLINE_LINUX=\"ipv6.disable=1\"" }
+  ' "$backup/grub" > "$backup/grub.new" || ! sh -n "$backup/grub.new"; then
+    echo "Unable to update the GRUB arguments safely. No settings changed."
+    return 1
+  fi
+  awk '
+    $0 != "# GECKO: Disable IPv6" &&
+    !/^[[:blank:]]*-?[[:blank:]]*net[./]ipv6[./]conf[./](all|default|lo)[./]disable_ipv6[[:blank:]]*=/ { print }
+    END {
+      print "# GECKO: Disable IPv6"
+      print "net.ipv6.conf.all.disable_ipv6 = 1"
+      print "net.ipv6.conf.default.disable_ipv6 = 1"
+      print "net.ipv6.conf.lo.disable_ipv6 = 1"
+    }
+  ' "$backup/sysctl.conf" > "$backup/sysctl.conf.new" || return 1
+
+  if ! cat "$backup/grub.new" > "$grub_file" || ! update-grub; then
+    cat "$backup/grub" > "$grub_file" || echo "Restore GRUB defaults from $backup/grub."
+    echo "GRUB update failed; IPv6 sysctl settings were not applied."
+    return 1
+  fi
+  if ! cat "$backup/sysctl.conf.new" > "$sysctl_file"; then
+    echo "GRUB was updated, but $sysctl_file could not be written."
+    return 1
+  fi
+  if [[ ! -e /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] &&
+    grep -Eq '(^|[[:space:]])ipv6\.disable=1([[:space:]]|$)' /proc/cmdline; then
+    echo "IPv6 is already disabled by the running kernel."
+  elif ! sysctl -p "$sysctl_file"; then
+    echo "GRUB was updated, but sysctl reported an error. Check the output above."
+    return 1
+  else
+    echo "IPv6 disabled on the running system."
+  fi
+  echo "Reboot manually to apply the GRUB setting: sudo reboot"
+}
+
+
 hysteria_version_from_binary() {
   local bin="$1" out version
   [[ -x "$bin" ]] || return 1
@@ -9470,6 +9553,7 @@ while true; do
   echo -e "11) \e[92mSwap RAM Management (custom size, RAM-first)\e[0m"
   echo -e "12) \e[96mMieru Protocol [Core: sing-box-extended]\e[0m"
   echo -e "13) \e[96mAnyTLS Multi-Config [Core: sing-box-extended | TLS / Reality]\e[0m"
+  echo -e "14) \e[91mDisable IPv6 (sysctl + GRUB)\e[0m"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -9550,6 +9634,11 @@ while true; do
   13)
     clear
     anytls_menu
+    ;;
+  14)
+    clear
+    hy2_disable_ipv6 || true
+    read -rp "Press Enter to return to menu..."
     ;;
   0)
     clear
