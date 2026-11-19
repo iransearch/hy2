@@ -9,6 +9,7 @@ source <(curl -sSL https://raw.githubusercontent.com/TheyCallMeSecond/config-exa
 #   - Manage simultaneous TCP/gRPC Reality configs with optional XTLS Vision.
 #   - Generate matched X25519 or ML-KEM-768 VLESS Encryption pairs for Reality.
 #   - Add a complete VLESS + XHTTP + TLS manager.
+#   - Switch VLESS WebSocket TLS between sing-box-extended and Xray-core.
 #   - Manage VMess AEAD over plain TCP with either core and v2 share links.
 # The Legacy menu and every custom menu below remain unchanged.
 # -----------------------------------------------------------------------------
@@ -36,6 +37,7 @@ GECKO_LOG_CLEANUP_JOB="/etc/cron.daily/cleanup-var-log"
 GECKO_WS_DIR="/etc/ws"
 GECKO_WS_BINARY="/usr/bin/WS"
 GECKO_WS_UNIT_FILE="/etc/systemd/system/WS.service"
+GECKO_WS_LOCK_FILE="/run/gecko-ws.lock"
 GECKO_WS_RENEW_HOOK="/etc/letsencrypt/renewal-hooks/deploy/gecko-ws"
 GECKO_WS_LE_LIVE_DIR="/etc/letsencrypt/live"
 
@@ -416,6 +418,7 @@ install_core() {
 
 install_xray_core() {
   local Protocol="${1:-}" machine arch latest_release_url latest_tag version
+  local destination="${2:-/usr/bin/$Protocol}"
   local archive_name download_url digest_url digest_data expected_sha actual_sha
   local tmp_dir binary_path downloaded_line installed_line installed_version newest_version
 
@@ -466,8 +469,8 @@ install_xray_core() {
   digest_url="${download_url}.dgst"
 
   installed_version=""
-  if [[ -x "/usr/bin/$Protocol" ]]; then
-    installed_line="$("/usr/bin/$Protocol" version 2>/dev/null | head -n 1)"
+  if [[ -x "$destination" ]]; then
+    installed_line="$("$destination" version 2>/dev/null | head -n 1)"
     if [[ "$installed_line" =~ ^Xray[[:space:]]+([^[:space:]]+) ]]; then
       installed_version="${BASH_REMATCH[1]}"
     fi
@@ -485,7 +488,7 @@ install_xray_core() {
     fi
     echo "Updating Xray: $installed_version -> $version"
   else
-    echo "No valid Xray binary found at /usr/bin/$Protocol; installation required."
+    echo "No valid Xray binary found at $destination; installation required."
   fi
 
   tmp_dir="$(mktemp -d /tmp/xray-core.XXXXXX)" || {
@@ -532,12 +535,12 @@ install_xray_core() {
     tui_error "The downloaded Xray binary version does not match $latest_tag."
     return 1
   fi
-  if ! install -m 0755 "$binary_path" "/usr/bin/$Protocol"; then
+  if ! install -m 0755 "$binary_path" "$destination"; then
     rm -rf "$tmp_dir"
-    tui_error "Could not install Xray to /usr/bin/$Protocol."
+    tui_error "Could not install Xray to $destination."
     return 1
   fi
-  installed_line="$("/usr/bin/$Protocol" version 2>/dev/null | head -n 1)"
+  installed_line="$("$destination" version 2>/dev/null | head -n 1)"
   rm -rf "$tmp_dir"
   if [[ "$installed_line" != "Xray $version "* && "$installed_line" != "Xray $version" ]]; then
     tui_error "Xray was copied, but the installed binary did not run correctly."
@@ -3781,6 +3784,259 @@ uninstall_xhttp() {
 
 # Keep the upstream WS screens and link format, while making its certificate
 # path independent of the destructive upstream get_ssl/check_dep helpers.
+gecko_ws_lock() {
+  exec 9>"$GECKO_WS_LOCK_FILE" && flock -n 9 && return 0
+  tui_error "Another WebSocket operation is in progress."
+  return 1
+}
+
+gecko_ws_detect_core() {
+  if [[ -f "$GECKO_WS_UNIT_FILE.d/60-gecko-ws-core.conf" ]]; then
+    printf 'xray'
+  else
+    printf 'sing-box'
+  fi
+}
+
+# config.json stays authoritative for both cores, including the upstream user
+# and WARP menus. Xray renders its own configuration at every service start.
+gecko_ws_write_xray_filter() {
+  cat <<'JQ_WS_XRAY'
+def list: if . == null then [] elif type == "array" then . else [.] end;
+def only($keys; $where):
+  (keys_unsorted - $keys) as $extra
+  | if $extra == [] then . else error("Unsupported \($where) fields: \($extra | join(", "))") end;
+def endpoint:
+  (.server | if contains(":") and (startswith("[") | not) then "[" + . + "]" else . end)
+  + ":" + (.server_port | tostring);
+def outbound:
+  {tag: (.tag // .type)} + (
+    if .type == "direct" then
+      only(["type", "tag"]; "direct outbound") | {protocol: "freedom"}
+    elif .type == "block" then
+      {protocol: "blackhole"}
+    elif .type == "wireguard" then
+      only(["type", "tag", "server", "server_port", "local_address", "private_key",
+            "peer_public_key", "pre_shared_key", "reserved", "mtu", "system_interface"]; "WARP outbound")
+      | {protocol: "wireguard", settings: {
+          secretKey: .private_key, address: (.local_address | list), noKernelTun: (.system_interface != true),
+          mtu: (.mtu // 1408), reserved: (.reserved // [0, 0, 0]),
+          peers: [{endpoint: endpoint, publicKey: .peer_public_key,
+                   allowedIPs: ["0.0.0.0/0", "::/0"]}
+                  + if (.pre_shared_key // "") != "" then {preSharedKey: .pre_shared_key} else {} end]
+        }}
+    else error("Unsupported WebSocket outbound type: \(.type)") end
+  );
+def geo($sets):
+  . as $tag | $sets[$tag] as $set
+  | if $set.type == "remote" and $set.format == "binary"
+      and $set.url == ("https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/" + $tag + ".srs")
+      and ($tag | test("^geo(site|ip)-[a-z0-9-]+$"))
+    then sub("^(?<kind>geosite|geoip)-"; "\(.kind):")
+    else error("Unsupported WebSocket rule set: \($tag)") end;
+def routing($sets):
+  if .action == "sniff" then only(["action"]; "sniff rule") | empty
+  else
+    only(["action", "outbound", "inbound", "network", "rule_set",
+          "domain", "domain_suffix", "domain_keyword", "domain_regex", "ip_cidr"]; "routing rule")
+    | if .action != null and .action != "route" and .action != "reject"
+      then error("Unsupported WebSocket routing action: \(.action)") else . end
+    | . as $rule
+    | (if .action == "reject" or .outbound == "block" then "gecko-ws-reject"
+       else .outbound // error("Missing outbound in WebSocket routing rule") end) as $out
+    | ({type: "field", outboundTag: $out, network: (if .network == null then "tcp,udp" else .network | list | join(",") end)}
+      + (if $rule.inbound then {inboundTag: ($rule.inbound | list)} else {} end)) as $base
+    | [($rule.rule_set | list | .[] | geo($sets))] as $geo
+    | ([($rule.domain | list | .[] | "full:" + .), ($rule.domain_suffix | list | .[] | "domain:" + .),
+        ($rule.domain_keyword | list | .[] | "plain:" + .), ($rule.domain_regex | list | .[] | "regexp:" + .)]
+       + ($geo | map(select(startswith("geosite:"))))) as $domains
+    | (($rule.ip_cidr | list) + ($geo | map(select(startswith("geoip:"))))) as $ips
+    | if ($domains + $ips) == [] then $base
+      else (if $domains != [] then $base + {domain: $domains} else empty end),
+           (if $ips != [] then $base + {ip: $ips} else empty end)
+      end
+  end;
+
+only(["log", "inbounds", "outbounds", "route", "experimental"]; "configuration")
+| (.inbounds[0] | only(["type", "tag", "listen", "listen_port", "users", "tls", "transport",
+                        "multiplex", "sniff", "sniff_override_destination"]; "inbound")) as $in
+| ($in.tls | only(["enabled", "server_name", "alpn", "certificate_path", "key_path",
+                   "min_version", "max_version"]; "TLS")) as $tls
+| ($in.transport | only(["type", "path", "headers", "max_early_data", "early_data_header_name"]; "WebSocket")) as $ws
+| if (.inbounds | length) != 1 or $in.type != "vless" or $ws.type != "ws" or $tls.enabled != true
+  then error("Expected one VLESS WebSocket TLS inbound") else . end
+| if ($ws.headers // {}) != {} or ($ws.max_early_data // 0) != 0
+  then error("Custom WebSocket response headers or early data require sing-box") else . end
+| if $in.multiplex.padding == true or $in.multiplex.brutal.enabled == true
+  then error("WebSocket multiplex padding or TCP Brutal require sing-box") else . end
+| ($in.tag // "vless-in") as $tag
+| ((.route // {}) | only(["rules", "rule_set", "final"]; "routing")) as $route
+| ([$route.rule_set[]? | {key: .tag, value: .}] | from_entries) as $sets
+| ([($route.rules // [])[] | routing($sets)]
+   + if ($route.final // "") != "" then [{type: "field", network: "tcp,udp", outboundTag: $route.final}]
+     else [] end) as $rules
+| (.outbounds | map(outbound)) as $outbounds
+| ($outbounds + if any($rules[]; .outboundTag == "gecko-ws-reject") then
+    [{tag: "gecko-ws-reject", protocol: "blackhole"}] else [] end) as $targets
+| if $outbounds == [] or any($rules[]; .outboundTag as $out | all($targets[]; .tag != $out)) then
+    error("Missing outbound for WebSocket routing")
+  else . end
+| {
+    log: {loglevel: (if .log.disabled then "none" else
+      (.log.level // "info") | if . == "warn" then "warning" elif . == "trace" then "debug"
+      elif . == "fatal" or . == "panic" then "error" else . end end)},
+    inbounds: [{
+      tag: $tag, protocol: "vless", port: $in.listen_port, listen: ($in.listen // "::"),
+      settings: {decryption: "none", clients: [$in.users[] |
+        only(["name", "uuid", "flow"]; "VLESS user")
+        | if (.flow // "") != "" then error("VLESS flow requires a compatible transport") else
+            {email: (.name // ""), id: .uuid} end]},
+      streamSettings: {
+        network: "ws", security: "tls", wsSettings: {path: ($ws.path // "/")},
+        tlsSettings: ({
+          serverName: ($tls.server_name // ""), alpn: (($tls.alpn // ["http/1.1"]) | list),
+          certificates: [{certificateFile: $tls.certificate_path, keyFile: $tls.key_path}]
+        } + (if $tls.min_version then {minVersion: $tls.min_version} else {} end)
+          + (if $tls.max_version then {maxVersion: $tls.max_version} else {} end))
+      },
+      sniffing: {
+        enabled: ($in.sniff == true or any($route.rules[]?; .action == "sniff")),
+        destOverride: ["http", "tls", "quic"],
+        routeOnly: ($in.sniff == true and $in.sniff_override_destination != true)
+      }
+    }],
+    outbounds: $targets,
+    routing: {domainStrategy: "AsIs", rules: $rules}
+  }
+JQ_WS_XRAY
+}
+
+gecko_ws_check_core_config() {
+  local core="$1" config="$2" rendered="$3" core_dir="$4"
+  if [[ "$core" == xray ]]; then
+    jq -e -f "$core_dir/config.jq" "$config" >"$rendered" &&
+      XRAY_LOCATION_ASSET="$core_dir" "$core_dir/WS" run -test -format=json -c "$rendered"
+  else
+    "$GECKO_WS_BINARY" check -c "$config"
+  fi
+}
+
+gecko_ws_wait_listener() {
+  local port="$1" pid attempt
+  for ((attempt = 0; attempt < 10; attempt++)); do
+    pid="$(systemctl show --property=MainPID --value WS.service)" || return 1
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] &&
+      ss -H -ltnp "sport = :$port" | grep -Fq "pid=$pid,"; then
+      systemctl is-active --quiet WS.service && return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+gecko_ws_apply_core() (
+  local target="$1" current work port asset was_active=false changed=false committed=false
+  local config="$GECKO_WS_DIR/config.json" core_dir="$GECKO_WS_DIR/xray"
+  local dropin_dir="$GECKO_WS_UNIT_FILE.d" dropin="$GECKO_WS_UNIT_FILE.d/60-gecko-ws-core.conf"
+  umask 077
+  gecko_ws_lock || return 1
+  [[ -s "$config" && -f "$GECKO_WS_UNIT_FILE" ]] || { tui_error "WebSocket is not installed yet."; return 1; }
+  [[ "$target" == xray || "$target" == sing-box ]] || return 1
+  current="$(gecko_ws_detect_core)"
+  [[ "$current" != "$target" ]] || return 0
+  port="$(jq -er '.inbounds[0].listen_port | numbers | select(. == floor and . > 0 and . < 65536)' "$config")" || return 1
+  work="$(mktemp -d "$GECKO_WS_DIR/.core-switch.XXXXXX")" || return 1
+
+  gecko_ws_finish_switch() {
+    local status="$1" restored=true
+    trap - EXIT INT TERM
+    if [[ "$changed" == true && "$committed" != true ]]; then
+      if [[ "$target" == xray ]]; then
+        rm -f "$dropin" || restored=false
+        [[ -d "$work/xray" ]] || rm -rf "$core_dir" || restored=false
+        [[ ! -d "$work/old-xray" ]] || mv "$work/old-xray" "$core_dir" || restored=false
+      else
+        install -m 0644 "$work/old-dropin" "$dropin" || restored=false
+      fi
+      systemctl daemon-reload || restored=false
+      if [[ "$was_active" == true ]]; then
+        systemctl restart WS.service && gecko_ws_wait_listener "$port" || restored=false
+      fi
+      if [[ "$restored" == true ]]; then
+        tui_error "WebSocket failed to start with the selected core. The previous core was restored."
+      else
+        tui_error "WebSocket core rollback failed. Recovery files are in $work."
+        exit 1
+      fi
+    fi
+    rm -rf "$work"
+    exit "$status"
+  }
+  trap 'gecko_ws_finish_switch "$?"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  cp -a "$config" "$work/source.json" || return 1
+  if [[ "$target" == xray ]]; then
+    mkdir "$work/xray" || return 1
+    gecko_ws_write_xray_filter >"$work/xray/config.jq" || return 1
+    if ! jq -e -f "$work/xray/config.jq" "$work/source.json" >"$work/xray.json"; then
+      tui_error "Xray cannot translate this WebSocket configuration. See the error above."
+      return 1
+    fi
+    install_xray_core WS "$work/xray/WS" || return 1
+    if jq -e 'any(.route.rules[]?; ((.rule_set // []) | length) > 0)' "$work/source.json" >/dev/null; then
+      # The upstream .srs rules have Xray assets from the same publisher.
+      for asset in geosite.dat geoip.dat; do
+        curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
+          -o "$work/xray/$asset" \
+          "https://raw.githubusercontent.com/Chocolate4U/Iran-v2ray-rules/release/$asset" || {
+          tui_error "Could not download $asset for WebSocket routing."; return 1
+        }
+      done
+    fi
+    if ! XRAY_LOCATION_ASSET="$work/xray" "$work/xray/WS" run -test -format=json -c "$work/xray.json"; then
+      tui_error "Xray rejected the WebSocket configuration."; return 1
+    fi
+    cat >"$work/dropin" <<EOF_WS_XRAY
+[Service]
+ExecStartPre=/bin/sh -ec 'umask 077; jq -e -f "$core_dir/config.jq" "$config" >"$core_dir/config.json"'
+ExecStart=
+ExecStart=$core_dir/WS run -format=json -c $core_dir/config.json
+ExecReload=
+Environment=XRAY_LOCATION_ASSET=$core_dir
+EOF_WS_XRAY
+  else
+    [[ -x "$GECKO_WS_BINARY" ]] || install_core WS || return 1
+    if ! gecko_ws_check_core_config sing-box "$work/source.json" "" ""; then
+      tui_error "The installed sing-box core rejected the WebSocket configuration."; return 1
+    fi
+    cp -a "$dropin" "$work/old-dropin" || return 1
+  fi
+
+  if ! cmp -s "$config" "$work/source.json"; then
+    tui_error "WebSocket settings were edited during preparation. Retry the core change."
+    return 1
+  fi
+  systemctl is-active --quiet WS.service && was_active=true
+  changed=true
+  if [[ "$target" == xray ]]; then
+    install -d -m 0755 "$dropin_dir" || return 1
+    [[ ! -e "$core_dir" ]] || mv "$core_dir" "$work/old-xray" || return 1
+    mv "$work/xray" "$core_dir" || return 1
+    install -m 0644 "$work/dropin" "$dropin" || return 1
+  else
+    rm -f "$dropin" || return 1
+  fi
+  systemctl daemon-reload || return 1
+  if [[ "$was_active" == true ]]; then
+    systemctl restart WS.service && gecko_ws_wait_listener "$port" || return 1
+  fi
+  committed=true
+  [[ "$target" != sing-box ]] || rm -rf "$core_dir"
+  return 0
+)
+
 gecko_ws_open_tcp_port() {
   local port="$1"
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -q 'Status: active'; then
@@ -3842,15 +4098,17 @@ if declare -F uninstall_ws >/dev/null 2>&1; then
 fi
 
 gecko_ws_safe_setup() (
-  local operation="$1" work committed=false was_active=false was_enabled=false
+  local operation="$1" work core committed=false was_active=false was_enabled=false
   [[ "$(id -u)" == 0 ]] || { tui_error "Run as root."; return 1; }
   gecko_tui_check_dependencies || return 1
+  gecko_ws_lock || return 1
   if [[ "$operation" == install && -f "$GECKO_WS_DIR/config.json" ]]; then
     tui_error "WebSocket is already installed. Use Modify Config."; return 1
   fi
   if [[ "$operation" == modify && ! -f "$GECKO_WS_DIR/config.json" ]]; then
     tui_error "WebSocket is not installed yet."; return 1
   fi
+  core="$(gecko_ws_detect_core)"
   work="$(mktemp -d /tmp/gecko-ws-setup.XXXXXX)" || return 1
   # Back up everything before the upstream installer writes or removes files.
   [[ ! -d "$GECKO_WS_DIR" ]] || cp -a "$GECKO_WS_DIR" "$work/old-dir" || { rm -rf "$work"; return 1; }
@@ -3903,14 +4161,20 @@ gecko_ws_safe_setup() (
     gecko_ws_migrate_config "$work/source.json" "$work/config.json" "$user_port" "$domain" || exit 1
     install -m 0600 "$work/config.json" "$GECKO_WS_DIR/config.json" || exit 1
     uuid="$(jq -er '.inbounds[0].users[0].uuid' "$GECKO_WS_DIR/config.json")" || exit 1
-    "$GECKO_WS_BINARY" check -c "$GECKO_WS_DIR/config.json" || exit 1
+    if [[ "$core" == xray ]]; then
+      cp -a "$work/old-dir/xray" "$GECKO_WS_DIR/xray" || exit 1
+    fi
+    gecko_ws_check_core_config "$core" "$GECKO_WS_DIR/config.json" \
+      "$work/check-xray.json" "$GECKO_WS_DIR/xray" || exit 1
   }
   systemctl() {
     if [[ "$1" == enable && "$*" == *'--now WS'* ]]; then
       gecko_ws_prepare_renewal "$domain" || exit 1
-      "$GECKO_WS_BINARY" check -c "$GECKO_WS_DIR/config.json" || exit 1
+      gecko_ws_check_core_config "$core" "$GECKO_WS_DIR/config.json" \
+        "$work/check-xray.json" "$GECKO_WS_DIR/xray" || exit 1
       command systemctl "$@" || exit 1
       command systemctl is-active --quiet WS.service || exit 1
+      [[ "$core" != xray ]] || gecko_ws_wait_listener "$user_port" || exit 1
       committed=true
     else
       command systemctl "$@"
@@ -3926,11 +4190,65 @@ gecko_ws_safe_setup() (
 
 install_ws() { gecko_ws_safe_setup install; }
 modify_ws_config() { gecko_ws_safe_setup modify; }
-uninstall_ws() {
+uninstall_ws() (
+  gecko_ws_lock || return 1
   gecko_upstream_uninstall_ws
   local status="$?"
-  [[ -d "$GECKO_WS_DIR" ]] || rm -f "$GECKO_WS_RENEW_HOOK"
+  if [[ ! -d "$GECKO_WS_DIR" ]]; then
+    rm -f "$GECKO_WS_RENEW_HOOK" "$GECKO_WS_UNIT_FILE.d/60-gecko-ws-core.conf"
+    rmdir "$GECKO_WS_UNIT_FILE.d" 2>/dev/null || true
+    systemctl daemon-reload || return 1
+  fi
   return "$status"
+)
+
+gecko_ws_change_core() {
+  local current target
+  [[ -s "$GECKO_WS_DIR/config.json" ]] || { tui_error "WebSocket is not installed yet."; return 1; }
+  current="$(gecko_ws_detect_core)"
+  target=$(whiptail --clear --title "VLESS WebSocket TLS Core" --default-item "$current" \
+    --menu "Select the core for WS.service:" 15 68 2 \
+    "sing-box" "sing-box-extended" "xray" "Xray-core" 2>&1 >/dev/tty) || return 0
+  [[ "$current" != "$target" ]] || return 0
+  if gecko_ws_apply_core "$target"; then
+    whiptail --msgbox "WebSocket core changed to $target. Existing user links are ready to use." 10 70
+  else
+    return 1
+  fi
+}
+
+gecko_ws_locked_command() (
+  gecko_ws_lock && "$@"
+)
+
+gecko_ws_manager_menu() {
+  local choice core
+  while true; do
+    core="not installed"
+    if [[ -s "$GECKO_WS_DIR/config.json" ]]; then
+      case "$(gecko_ws_detect_core)" in
+        xray) core="Xray-core" ;;
+        sing-box) core="sing-box-extended" ;;
+      esac
+    fi
+    choice=$(whiptail --clear --title "VLESS + TLS + WebSocket ($core)" \
+      --menu "Please select an option:" 22 72 9 \
+      1 "Install" 2 "Modify Config" 3 "Add a new user" 4 "Remove an existing user" \
+      5 "Show User Configs" 6 "Enable/Disable WARP" 7 "Uninstall" 8 "Change Core" \
+      0 "Back to Main Menu" 2>&1 >/dev/tty) || return 0
+    clear
+    case "$choice" in
+      1) install_ws ;;
+      2) modify_ws_config ;;
+      3) gecko_ws_locked_command add_ws_user ;;
+      4) gecko_ws_locked_command remove_ws_user ;;
+      5) show_ws_config ;;
+      6) gecko_ws_locked_command toggle_warp_ws ;;
+      7) uninstall_ws ;;
+      8) gecko_ws_change_core ;;
+      0) return 0 ;;
+    esac
+  done
 }
 
 # VMess AEAD over plain TCP. Metadata is core-neutral so users survive edits
@@ -4259,6 +4577,7 @@ gecko_ensure_system_tools() {
       ss) if [[ "$manager" == apt-get ]]; then package=iproute2; else package=iproute; fi ;;
       whiptail) if [[ "$manager" == apt-get ]]; then package=whiptail; else package=newt; fi ;;
       crontab) if [[ "$manager" == apt-get ]]; then package=cron; else package=cronie; fi ;;
+      flock) package=util-linux ;;
       sha256sum | sort | install) package=coreutils ;;
       find) package=findutils ;;
       awk) package=gawk ;;
@@ -4289,7 +4608,7 @@ gecko_tui_check_dependencies() {
   # os-release (Debian normally identifies itself as "Debian GNU/Linux").
   # These menus use Python's standard library; no pip packages are required.
   gecko_ensure_system_tools curl wget jq python3 whiptail openssl certbot lsof ss tar \
-    sha256sum find awk grep sed sort install crontab qrencode
+    sha256sum find awk grep sed sort install crontab qrencode flock
 }
 
 vmess_tcp_manager_menu() {
@@ -4360,6 +4679,22 @@ EOF_XHTTP_TUI_CASE
   printf '%s\n' "$script"
 }
 
+inject_ws_tui_menu() {
+  printf '%s\n' "$1" | awk '
+    /^    "VLESS-WebSocket-tls"\)$/ {
+      print
+      print "        gecko_ws_manager_menu"
+      print "        ;;"
+      replacing = 1
+      found++
+      next
+    }
+    replacing && /^    "VLESS-gRPC-tls"\)$/ { replacing = 0 }
+    !replacing { print }
+    END { if (found != 1 || replacing) exit 1 }
+  '
+}
+
 # Load the upstream TUI menu in the current shell, but omit its Source.sh line.
 # This keeps the menu UI current while retaining the overrides defined above.
 tui() {
@@ -4388,6 +4723,10 @@ tui() {
   fi
   if ! filtered_script="$(inject_vmess_tcp_tui_menu "$filtered_script")"; then
     tui_error "The upstream TUI menu changed and the VMess TCP item could not be inserted safely."
+    return 1
+  fi
+  if ! filtered_script="$(inject_ws_tui_menu "$filtered_script")"; then
+    tui_error "The upstream TUI menu changed and the WebSocket core menu could not be inserted safely."
     return 1
   fi
 
