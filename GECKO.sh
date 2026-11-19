@@ -4080,12 +4080,50 @@ vmess_tcp_refresh_egress() {
   vmess_tcp_apply "$VMESS_TCP_DIR/meta.json"
 }
 
-vmess_tcp_manager_menu() {
-  local tool choice
-  [[ "$(id -u)" == 0 ]] || { tui_error "Run as root."; return 1; }
-  for tool in jq python3 curl ss whiptail; do
-    command -v "$tool" >/dev/null 2>&1 || { tui_error "Required program is missing: $tool"; return 1; }
+vmess_tcp_check_dependencies() {
+  local tool manager package
+  local -a required=(jq python3 curl ss whiptail tar sha256sum find awk grep sed sort install)
+  local -a missing=() packages=(ca-certificates)
+  for tool in "${required[@]}"; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
+  ((${#missing[@]} > 0)) || return 0
+  if command -v apt-get >/dev/null 2>&1; then manager=apt-get
+  elif command -v dnf >/dev/null 2>&1; then manager=dnf
+  elif command -v yum >/dev/null 2>&1; then manager=yum
+  else
+    tui_error "Missing programs: ${missing[*]}. Automatic installation requires apt-get, dnf or yum."
+    return 1
+  fi
+  for tool in "${missing[@]}"; do
+    case "$tool" in
+      ss) if [[ "$manager" == apt-get ]]; then package=iproute2; else package=iproute; fi ;;
+      whiptail) if [[ "$manager" == apt-get ]]; then package=whiptail; else package=newt; fi ;;
+      sha256sum | sort | install) package=coreutils ;;
+      find) package=findutils ;;
+      awk) package=gawk ;;
+      *) package="$tool" ;;
+    esac
+    [[ " ${packages[*]} " == *" $package "* ]] || packages+=("$package")
+  done
+  echo "Installing missing VMess TCP dependencies: ${missing[*]}"
+  if [[ "$manager" == apt-get ]]; then
+    apt-get update || { tui_error "Could not refresh package lists. Check package repositories/network and retry."; return 1; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" || {
+      tui_error "Could not install VMess TCP dependencies."; return 1;
+    }
+  elif ! "$manager" install -y "${packages[@]}"; then
+    tui_error "Could not install VMess TCP dependencies."; return 1
+  fi
+  for tool in "${required[@]}"; do
+    command -v "$tool" >/dev/null 2>&1 || { tui_error "Required program is still missing after installation: $tool"; return 1; }
+  done
+}
+
+vmess_tcp_manager_menu() {
+  local choice
+  [[ "$(id -u)" == 0 ]] || { tui_error "Run as root."; return 1; }
+  vmess_tcp_check_dependencies || return 1
   while true; do
     choice=$(whiptail --title "VMess + TCP (no TLS)" --menu "VMess AEAD, alterId=0, security=auto, TCP header=none:" 24 90 12 \
       1 "Install" 2 "Edit settings / switch core" 3 "Add user" 4 "Remove user" 5 "Show VMess links" \
