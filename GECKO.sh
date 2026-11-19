@@ -9,6 +9,7 @@ source <(curl -sSL https://raw.githubusercontent.com/TheyCallMeSecond/config-exa
 #   - Manage simultaneous TCP/gRPC Reality configs with optional XTLS Vision.
 #   - Generate matched X25519 or ML-KEM-768 VLESS Encryption pairs for Reality.
 #   - Add a complete VLESS + XHTTP + TLS manager.
+#   - Manage VMess AEAD over plain TCP with either core and v2 share links.
 # The Legacy menu and every custom menu below remain unchanged.
 # -----------------------------------------------------------------------------
 TUI_EXTENDED_REPO="shtorm-7/sing-box-extended"
@@ -26,6 +27,11 @@ XHTTP_INSTANCES_DIR="/etc/xhttp-instances"
 ANYTLS_DIR="/etc/anytls"
 ANYTLS_INSTANCES_DIR="$ANYTLS_DIR/instances"
 ANYTLS_BINARY="/usr/bin/AT"
+VMESS_TCP_DIR="/etc/vmess-tcp"
+VMESS_TCP_CORE_NAME="VMESS-TCP"
+VMESS_TCP_BINARY="/usr/bin/$VMESS_TCP_CORE_NAME"
+VMESS_TCP_SERVICE="vmess-tcp.service"
+VMESS_TCP_UNIT_FILE="/etc/systemd/system/$VMESS_TCP_SERVICE"
 GECKO_LOG_CLEANUP_JOB="/etc/cron.daily/cleanup-var-log"
 
 # Hysteria's native core uses HYSTERIA_LOG_LEVEL, while the Hysteria inbound
@@ -3768,6 +3774,346 @@ uninstall_xhttp() {
   clear
 }
 
+# VMess AEAD over plain TCP. Metadata is core-neutral so users survive edits
+# and core switches; links use the v2 Base64(JSON) VMess sharing format.
+vmess_tcp_validate_metadata() {
+  python3 - "$1" <<'PY_VMESS_VALIDATE'
+import ipaddress, json, re, sys, uuid
+try:
+    with open(sys.argv[1]) as f:
+        m = json.load(f)
+    if m['core'] not in ('xray', 'sing-box'):
+        raise ValueError('Invalid VMess core')
+    if type(m['port']) is not int or not 1 <= m['port'] <= 65535:
+        raise ValueError('Invalid TCP port')
+    address = m['address']
+    if not isinstance(address, str) or not 1 <= len(address) <= 253:
+        raise ValueError('Invalid client address')
+    try:
+        ipaddress.ip_address(address)
+    except ValueError:
+        if not all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label) for label in address.split('.')):
+            raise ValueError('Enter an IP address or hostname without a scheme, port or path')
+    if not isinstance(m['remark'], str) or not 1 <= len(m['remark']) <= 128 or any(ord(c) < 32 or ord(c) == 127 for c in m['remark']):
+        raise ValueError('Invalid remark')
+    if not isinstance(m['users'], list) or not m['users']:
+        raise ValueError('At least one VMess user is required')
+    names, ids = set(), set()
+    for user in m['users']:
+        name, user_id = user['name'], str(uuid.UUID(user['uuid']))
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,31}', name):
+            raise ValueError('Invalid user name')
+        if user_id != user['uuid'] or name in names or user_id in ids:
+            raise ValueError('UUIDs must be canonical and user names/UUIDs must be unique')
+        names.add(name)
+        ids.add(user_id)
+except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(1)
+PY_VMESS_VALIDATE
+}
+
+vmess_tcp_collect_user() {
+  local uuid_input
+  VMESS_TCP_USER_NAME=$(whiptail --inputbox "User name (letters, numbers, '.', '_' or '-'):" 10 78 default 2>&1 >/dev/tty) || return 1
+  xhttp_valid_user_name "$VMESS_TCP_USER_NAME" || { tui_error "Invalid VMess user name."; return 1; }
+  uuid_input=$(whiptail --inputbox "VMess UUID (a random UUID is supplied):" 10 78 "$(cat /proc/sys/kernel/random/uuid)" 2>&1 >/dev/tty) || return 1
+  VMESS_TCP_USER_UUID="$(python3 -c 'import sys,uuid; print(uuid.UUID(sys.argv[1]))' "$uuid_input" 2>/dev/null)" || {
+    tui_error "Enter a valid UUID."; return 1;
+  }
+}
+
+vmess_tcp_collect_settings() {
+  local current="$1" output="$2" core=xray port=1701 address="${WAN4:-${WAN6:-}}" remark=V-TCP users old_port="" listeners
+  if [[ -f "$current" ]]; then
+    vmess_tcp_validate_metadata "$current" || return 1
+    core="$(jq -r .core "$current")"; port="$(jq -r .port "$current")"; old_port="$port"
+    address="$(jq -r .address "$current")"; remark="$(jq -r .remark "$current")"
+    users="$(jq -c .users "$current")"
+  fi
+  core=$(whiptail --title "VMess + TCP core" --default-item "$core" --menu "Select core (plain TCP, no TLS):" 16 78 2 \
+    xray "Xray-core" sing-box "sing-box-extended" 2>&1 >/dev/tty) || return 1
+  case "$core" in xray | sing-box) ;; *) return 1 ;; esac
+  port=$(whiptail --inputbox "Listening TCP port:" 10 64 "$port" 2>&1 >/dev/tty) || return 1
+  [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || { tui_error "Invalid TCP port."; return 1; }
+  port=$((10#$port))
+  if [[ "$port" != "$old_port" ]] || ! systemctl is-active --quiet "$VMESS_TCP_SERVICE"; then
+    listeners="$(ss -H -lnt)" || { tui_error "Could not inspect listening TCP ports."; return 1; }
+    if awk -v p="$port" '{n=split($4,a,":"); if(a[n]==p) busy=1} END {exit !busy}' <<<"$listeners"; then
+      tui_error "TCP port $port is already listening."; return 1
+    fi
+  fi
+  address=$(whiptail --inputbox "Client connection address (this server's public IP or hostname):" 11 86 "$address" 2>&1 >/dev/tty) || return 1
+  address="$(xhttp_normalize_address "$address")" || { tui_error "Invalid client address."; return 1; }
+  remark=$(whiptail --inputbox "Link remark:" 10 70 "$remark" 2>&1 >/dev/tty) || return 1
+  if [[ ! -f "$current" ]]; then
+    vmess_tcp_collect_user || return 1
+    users="$(jq -nc --arg name "$VMESS_TCP_USER_NAME" --arg uuid "$VMESS_TCP_USER_UUID" '[{name:$name,uuid:$uuid}]')" || return 1
+  fi
+  (umask 077; jq -n --arg core "$core" --argjson port "$port" --arg address "$address" --arg remark "$remark" \
+    --argjson users "$users" '{core:$core,port:$port,address:$address,remark:$remark,users:$users}' >"$output") || return 1
+  vmess_tcp_validate_metadata "$output" || { tui_error "Invalid VMess settings."; return 1; }
+}
+
+vmess_tcp_build_config() {
+  local meta="$1" output="$2" core listen="0.0.0.0"
+  vmess_tcp_validate_metadata "$meta" || return 1
+  core="$(jq -r .core "$meta")"
+  [[ ! -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] ||
+    [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" != 0 ]] || listen="::"
+  if [[ "$core" == xray ]]; then
+    jq --arg listen "$listen" '{
+      log:{loglevel:"none"},
+      inbounds:[{tag:"vmess-tcp-in",listen:$listen,port:.port,protocol:"vmess",
+        settings:{users:[.users[] | {id:.uuid,email:.name,level:0}]},
+        streamSettings:{network:"raw",security:"none",rawSettings:{header:{type:"none"}}},
+        sniffing:{enabled:true,destOverride:["http","tls","quic"],routeOnly:true}}],
+      outbounds:[{tag:"direct",protocol:"freedom"}],routing:{domainStrategy:"AsIs",rules:[]}
+    }' "$meta" >"$output" || return 1
+    gecko_warp_apply_xray_json "$output"
+  else
+    jq --arg listen "$listen" '{
+      log:{level:"error"},
+      inbounds:[{type:"vmess",tag:"vmess-tcp-in",listen:$listen,listen_port:.port,
+        users:[.users[] | {name:.name,uuid:.uuid,alterId:0}]}],
+      outbounds:[{type:"direct",tag:"direct"}],route:{rules:[{action:"sniff"}],final:"direct"}
+    }' "$meta" >"$output" || return 1
+    gecko_warp_apply_singbox_json "$output"
+  fi
+}
+
+vmess_tcp_check_config() {
+  case "$2" in
+    xray) "$VMESS_TCP_BINARY" run -test -format=json -c "$1" ;;
+    sing-box) "$VMESS_TCP_BINARY" check -c "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+vmess_tcp_write_links() {
+  vmess_tcp_validate_metadata "$1/meta.json" || return 1
+  python3 - "$1" <<'PY_VMESS_LINKS'
+import base64, json, os, sys
+directory = sys.argv[1]
+with open(os.path.join(directory, 'meta.json')) as f:
+    meta = json.load(f)
+with open(os.path.join(directory, 'user-config.txt'), 'w') as f:
+    os.chmod(f.name, 0o600)
+    for user in meta['users']:
+        name = meta['remark'] if user['name'] == 'default' else meta['remark'] + '-' + user['name']
+        profile = dict(v='2', ps=name, add=meta['address'], port=str(meta['port']), id=user['uuid'],
+            aid='0', scy='auto', net='tcp', type='none', host='', path='', tls='', sni='',
+            alpn='', fp='', insecure='0', vcn='', pcs='')
+        encoded = base64.b64encode(json.dumps(profile, ensure_ascii=False, separators=(',', ':')).encode()).decode()
+        f.write('vmess://' + encoded + '\n')
+PY_VMESS_LINKS
+}
+
+vmess_tcp_write_service() {
+  cat >"$1" <<EOF_VMESS_SERVICE
+[Unit]
+Description=VMess AEAD TCP ($2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$VMESS_TCP_BINARY run -c $VMESS_TCP_DIR/config.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+
+[Install]
+WantedBy=multi-user.target
+EOF_VMESS_SERVICE
+}
+
+# Validate before replacing live files; roll back core, accounts, unit and
+# running/enabled state together if installation, validation or restart fails.
+vmess_tcp_apply() (
+  local meta="$1" update_core="${2:-false}" work core old_core="" changed=false success=false
+  local was_active=false was_enabled=false fresh=true
+  vmess_tcp_validate_metadata "$meta" || return 1
+  work="$(mktemp -d /tmp/vmess-tcp-apply.XXXXXX)" || return 1
+  vmess_tcp_finish() {
+    local status="$1"
+    if [[ "$changed" == true && "$success" != true ]]; then
+      systemctl stop "$VMESS_TCP_SERVICE" >/dev/null 2>&1 || true
+      systemctl disable "$VMESS_TCP_SERVICE" >/dev/null 2>&1 || true
+      rm -rf "$VMESS_TCP_DIR"
+      [[ ! -d "$work/old-dir" ]] || cp -a "$work/old-dir" "$VMESS_TCP_DIR"
+      rm -f "$VMESS_TCP_BINARY" "$VMESS_TCP_UNIT_FILE"
+      [[ ! -f "$work/old-core" ]] || install -m 0755 "$work/old-core" "$VMESS_TCP_BINARY"
+      [[ ! -f "$work/old-unit" ]] || cp -a "$work/old-unit" "$VMESS_TCP_UNIT_FILE"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      if [[ "$was_enabled" == true ]]; then systemctl enable "$VMESS_TCP_SERVICE" >/dev/null 2>&1 || true
+      else systemctl disable "$VMESS_TCP_SERVICE" >/dev/null 2>&1 || true; fi
+      [[ "$was_active" != true ]] || systemctl start "$VMESS_TCP_SERVICE" >/dev/null 2>&1 || true
+      tui_error "VMess update failed; the previous installation was restored."
+    fi
+    rm -rf "$work"
+    trap - EXIT
+    exit "$status"
+  }
+  trap 'vmess_tcp_finish "$?"' EXIT
+  mkdir "$work/new" || return 1
+  cp "$meta" "$work/new/meta.json" || return 1
+  if [[ -d "$VMESS_TCP_DIR" ]]; then cp -a "$VMESS_TCP_DIR" "$work/old-dir" || return 1; fi
+  if [[ -f "$VMESS_TCP_DIR/meta.json" ]]; then
+    fresh=false
+    old_core="$(jq -r .core "$VMESS_TCP_DIR/meta.json")"
+  fi
+  [[ ! -e "$VMESS_TCP_BINARY" ]] || cp -a "$VMESS_TCP_BINARY" "$work/old-core" || return 1
+  [[ ! -f "$VMESS_TCP_UNIT_FILE" ]] || cp -a "$VMESS_TCP_UNIT_FILE" "$work/old-unit" || return 1
+  systemctl is-active --quiet "$VMESS_TCP_SERVICE" && was_active=true
+  systemctl is-enabled --quiet "$VMESS_TCP_SERVICE" && was_enabled=true
+  core="$(jq -r .core "$meta")"
+  if [[ ! -x "$VMESS_TCP_BINARY" || "$old_core" != "$core" || "$update_core" == true ]]; then
+    changed=true
+    systemctl stop "$VMESS_TCP_SERVICE" >/dev/null 2>&1 || true
+    case "$core" in
+      xray) install_xray_core "$VMESS_TCP_CORE_NAME" || return 1 ;;
+      sing-box) install_core "$VMESS_TCP_CORE_NAME" || return 1 ;;
+    esac
+  fi
+  vmess_tcp_build_config "$work/new/meta.json" "$work/new/config.json" || return 1
+  if ! vmess_tcp_check_config "$work/new/config.json" "$core" >"$work/check.log" 2>&1; then
+    cat "$work/check.log" >&2
+    tui_error "The selected core rejected the VMess configuration."; return 1
+  fi
+  vmess_tcp_write_links "$work/new" || return 1
+  vmess_tcp_write_service "$work/new/unit" "$core" || return 1
+  changed=true
+  install -d -m 0700 "$VMESS_TCP_DIR" || return 1
+  local file
+  for file in meta.json config.json user-config.txt; do
+    install -m 0600 "$work/new/$file" "$VMESS_TCP_DIR/$file" || return 1
+  done
+  install -m 0644 "$work/new/unit" "$VMESS_TCP_UNIT_FILE" || return 1
+  systemctl daemon-reload || return 1
+  if [[ "$fresh" == true ]]; then
+    systemctl enable --now "$VMESS_TCP_SERVICE" || return 1
+    systemctl is-active --quiet "$VMESS_TCP_SERVICE" || return 1
+  elif [[ "$was_active" == true ]]; then
+    systemctl restart "$VMESS_TCP_SERVICE" || return 1
+    systemctl is-active --quiet "$VMESS_TCP_SERVICE" || return 1
+  fi
+  success=true
+)
+
+vmess_tcp_show_links() {
+  [[ -f "$VMESS_TCP_DIR/meta.json" ]] || { tui_error "VMess TCP is not installed."; return 1; }
+  vmess_tcp_write_links "$VMESS_TCP_DIR" || return 1
+  whiptail --title "VMess + TCP user links" --textbox "$VMESS_TCP_DIR/user-config.txt" 24 100
+}
+
+vmess_tcp_configure() (
+  local operation="$1" work port
+  if [[ "$operation" == install && -e "$VMESS_TCP_DIR" ]]; then
+    tui_error "VMess TCP already exists. Use Edit settings."; return 1
+  fi
+  if [[ "$operation" == modify && ! -f "$VMESS_TCP_DIR/meta.json" ]]; then
+    tui_error "VMess TCP is not installed."; return 1
+  fi
+  work="$(mktemp -d /tmp/vmess-tcp-edit.XXXXXX)" || return 1
+  trap 'rm -rf "$work"' EXIT
+  vmess_tcp_collect_settings "$VMESS_TCP_DIR/meta.json" "$work/meta.json" || return 1
+  vmess_tcp_apply "$work/meta.json" || return 1
+  port="$(jq -r .port "$work/meta.json")"
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q 'Status: active'; then
+    ufw allow "$port/tcp" || echo "Could not open TCP $port in UFW."
+  fi
+  if command -v csf >/dev/null 2>&1 && [[ -f /etc/csf/csf.conf ]]; then
+    if { csf_port_exists_in_conf TCP_IN "$port" || csf_add_port_to_conf TCP_IN "$port"; } &&
+      { csf_port_exists_in_conf TCP_OUT "$port" || csf_add_port_to_conf TCP_OUT "$port"; }; then
+      csf -r >/dev/null 2>&1 || echo "Could not reload CSF."
+    fi
+  fi
+  vmess_tcp_show_links
+)
+
+vmess_tcp_change_user() (
+  local action="$1" work choice name uuid
+  [[ -f "$VMESS_TCP_DIR/meta.json" ]] || { tui_error "VMess TCP is not installed."; return 1; }
+  work="$(mktemp -d /tmp/vmess-tcp-user.XXXXXX)" || return 1
+  trap 'rm -rf "$work"' EXIT
+  if [[ "$action" == add ]]; then
+    vmess_tcp_collect_user || return 1
+    jq --arg name "$VMESS_TCP_USER_NAME" --arg uuid "$VMESS_TCP_USER_UUID" \
+      '.users += [{name:$name,uuid:$uuid}]' "$VMESS_TCP_DIR/meta.json" >"$work/meta.json" || return 1
+  else
+    [[ "$(jq '.users | length' "$VMESS_TCP_DIR/meta.json")" -gt 1 ]] || { tui_error "The last VMess user cannot be removed."; return 1; }
+    local -a items=()
+    while IFS=$'\t' read -r name uuid; do items+=("$name" "$uuid"); done < <(jq -r '.users[] | [.name,.uuid] | @tsv' "$VMESS_TCP_DIR/meta.json")
+    choice=$(whiptail --title "Remove VMess user" --menu "Select a user:" 20 86 10 "${items[@]}" 2>&1 >/dev/tty) || return 1
+    jq --arg name "$choice" '.users |= map(select(.name != $name))' "$VMESS_TCP_DIR/meta.json" >"$work/meta.json" || return 1
+  fi
+  vmess_tcp_validate_metadata "$work/meta.json" || { tui_error "Duplicate or invalid VMess user/UUID."; return 1; }
+  vmess_tcp_apply "$work/meta.json" && vmess_tcp_show_links
+)
+
+vmess_tcp_uninstall() {
+  whiptail --title "Delete VMess TCP" --defaultno --yesno "Delete VMess TCP and all its users?" 10 76 || return 0
+  systemctl disable --now "$VMESS_TCP_SERVICE" || return 1
+  rm -f "$VMESS_TCP_UNIT_FILE" "$VMESS_TCP_BINARY"
+  rm -rf "$VMESS_TCP_DIR"
+  systemctl daemon-reload
+}
+
+vmess_tcp_refresh_egress() {
+  [[ -f "$VMESS_TCP_DIR/meta.json" ]] || return 0
+  [[ -x "$VMESS_TCP_BINARY" ]] || { echo "VMess TCP core is missing."; return 1; }
+  vmess_tcp_apply "$VMESS_TCP_DIR/meta.json"
+}
+
+vmess_tcp_manager_menu() {
+  local tool choice
+  [[ "$(id -u)" == 0 ]] || { tui_error "Run as root."; return 1; }
+  for tool in jq python3 curl ss whiptail; do
+    command -v "$tool" >/dev/null 2>&1 || { tui_error "Required program is missing: $tool"; return 1; }
+  done
+  while true; do
+    choice=$(whiptail --title "VMess + TCP (no TLS)" --menu "VMess AEAD, alterId=0, security=auto, TCP header=none:" 24 90 12 \
+      1 "Install" 2 "Edit settings / switch core" 3 "Add user" 4 "Remove user" 5 "Show VMess links" \
+      6 "Update core" 7 "Delete VMess TCP" 8 "Status" 9 "Start" 10 "Stop" 11 "Restart" 0 "Back" 2>&1 >/dev/tty) || return 0
+    case "$choice" in
+      1) vmess_tcp_configure install ;;
+      2) vmess_tcp_configure modify ;;
+      3) vmess_tcp_change_user add ;;
+      4) vmess_tcp_change_user remove ;;
+      5) vmess_tcp_show_links ;;
+      6) vmess_tcp_apply "$VMESS_TCP_DIR/meta.json" true ;;
+      7) vmess_tcp_uninstall ;;
+      8) systemctl --no-pager --full status "$VMESS_TCP_SERVICE" || true; read -rp "Press Enter to return..." ;;
+      9) systemctl start "$VMESS_TCP_SERVICE" ;;
+      10) systemctl stop "$VMESS_TCP_SERVICE" ;;
+      11) systemctl restart "$VMESS_TCP_SERVICE" ;;
+      0) return 0 ;;
+    esac
+  done
+}
+
+inject_vmess_tcp_tui_menu() {
+  local script="$1" marker='        "VLESS-gRPC-tls" "Manage VLESS-gRPC-tls" \' case_marker='    "VLESS-WebSocket-tls")'
+  local entry='        "VMess-TCP" "Manage VMess + TCP (no TLS)" \' handler
+  IFS= read -r -d '' handler <<'EOF_VMESS_TUI_CASE' || true
+    "VMess-TCP")
+        vmess_tcp_manager_menu
+        ;;
+EOF_VMESS_TUI_CASE
+  if [[ "$script" != *'"VMess-TCP" "Manage VMess + TCP (no TLS)"'* ]]; then
+    [[ "$script" == *"$marker"* ]] || return 1
+    script="${script/"$marker"/"$marker"$'\n'"$entry"}"
+  fi
+  if [[ "$script" != *'"VMess-TCP")'* ]]; then
+    [[ "$script" == *"$case_marker"* ]] || return 1
+    script="${script/"$case_marker"/"$handler"$'\n'"$case_marker"}"
+  fi
+  printf '%s\n' "$script"
+}
+
 inject_xhttp_tui_menu() {
   local script="$1"
   local main_marker='        "VLESS-gRPC-tls" "Manage VLESS-gRPC-tls" \'
@@ -3816,6 +4162,10 @@ tui() {
     tui_error "The upstream TUI menu changed and the XHTTP item could not be inserted safely."
     return 1
   fi
+  if ! filtered_script="$(inject_vmess_tcp_tui_menu "$filtered_script")"; then
+    tui_error "The upstream TUI menu changed and the VMess TCP item could not be inserted safely."
+    return 1
+  fi
 
   # Source the downloaded menu from FD 3 so stdin remains attached to the
   # terminal.  Otherwise link screens immediately consume EOF and disappear.
@@ -3832,7 +4182,7 @@ get_storage_usage
 check_system_info
 check_system_ip
 
-processes=("SH:Hysteria2:/etc/hysteria2/server.json" "ST:ShadowTLS:/etc/shadowtls/config.json" "WS:WebSocket:/etc/ws/config.json" "RS:Reality:/etc/reality/config.json" "NS:Naive:/etc/naive/config.json" "TS:TUIC:/etc/tuic/server.json" "GS:gRPC:/etc/grpc/config.json" "XH:XHTTP:/etc/xhttp/config.json")
+processes=("SH:Hysteria2:/etc/hysteria2/server.json" "ST:ShadowTLS:/etc/shadowtls/config.json" "WS:WebSocket:/etc/ws/config.json" "RS:Reality:/etc/reality/config.json" "NS:Naive:/etc/naive/config.json" "TS:TUIC:/etc/tuic/server.json" "GS:gRPC:/etc/grpc/config.json" "XH:XHTTP:/etc/xhttp/config.json" "VMESS-TCP:VMess-TCP:/etc/vmess-tcp/config.json")
 
 
 apply_hy2_network_and_limits_optimize() {
@@ -7335,6 +7685,7 @@ gecko_warp_refresh_all() {
   xhttp_for_each_instance gecko_warp_refresh_xhttp || { echo "XHTTP update failed."; failed="true"; }
   echo "Applying to all AnyTLS configs..."
   anytls_warp_refresh_all || { echo "AnyTLS update failed."; failed="true"; }
+  vmess_tcp_refresh_egress || { echo "VMess TCP update failed."; failed="true"; }
   gecko_egress_refresh_mieru || { echo "Mieru update failed."; failed="true"; }
   [[ "$failed" == "false" ]]
 }
@@ -7376,6 +7727,10 @@ gecko_warp_backup_all() {
   [[ ! -f "$MIERU_CONFIG" ]] || cp -a "$MIERU_CONFIG" "$backup_dir/mieru.json" || return 1
   xhttp_for_each_instance xhttp_backup_warp_config "$backup_dir" || return 1
   [[ ! -d "$ANYTLS_INSTANCES_DIR" ]] || cp -a "$ANYTLS_INSTANCES_DIR" "$backup_dir/anytls-instances" || return 1
+  if [[ -f "$VMESS_TCP_DIR/meta.json" ]]; then
+    cp -a "$VMESS_TCP_DIR" "$backup_dir/vmess-tcp" || return 1
+    if systemctl is-active --quiet "$VMESS_TCP_SERVICE"; then touch "$backup_dir/vmess-tcp-active" || return 1; fi
+  fi
   return 0
 }
 
@@ -7386,6 +7741,15 @@ gecko_warp_restore_all() {
   [[ -f "$backup_dir/hysteria.yaml" ]] && cp -a "$backup_dir/hysteria.yaml" /etc/hysteria2/server.yaml
   [[ -f "$backup_dir/reality.json" ]] && cp -a "$backup_dir/reality.json" "$REALITY_DIR/config.json"
   xhttp_for_each_instance xhttp_restore_warp_config "$backup_dir"
+  if [[ -d "$backup_dir/vmess-tcp" ]]; then
+    rm -rf "$VMESS_TCP_DIR"
+    cp -a "$backup_dir/vmess-tcp" "$VMESS_TCP_DIR" || return 1
+    if [[ -f "$backup_dir/vmess-tcp-active" ]]; then
+      systemctl restart "$VMESS_TCP_SERVICE" || return 1
+    else
+      systemctl stop "$VMESS_TCP_SERVICE" || return 1
+    fi
+  fi
   if [[ -f "$backup_dir/mieru.json" ]]; then
     cp -a "$backup_dir/mieru.json" "$MIERU_CONFIG"
     systemctl try-restart "$MIERU_SERVICE" >/dev/null 2>&1 || true
@@ -7409,7 +7773,7 @@ enable_gecko_real_outbound_via_warp() {
   echo "======================================================="
   echo " Enable unified WARP outbound: $mode"
   echo "======================================================="
-  echo "Applies to client traffic in Hysteria2, Reality, XHTTP and AnyTLS."
+  echo "Applies to client traffic in Hysteria2, Reality, XHTTP, AnyTLS and VMess TCP."
   echo "Host system routing (including SSH) is not changed."
   [ "$(id -u)" -eq 0 ] || { echo "Please run as root."; return 1; }
   if [[ "$mode" == all ]]; then
@@ -7511,6 +7875,10 @@ show_gecko_warp_status() {
   else
     echo 'XHTTP: not installed'
   fi
+  printf 'VMess TCP: '
+  if [[ -f "$VMESS_TCP_DIR/config.json" ]]; then
+    jq -e 'any(.outbounds[]?; (.tag // "") == "warp")' "$VMESS_TCP_DIR/config.json" >/dev/null && echo 'warp: enabled' || echo 'warp: disabled'
+  else echo 'not installed'; fi
   if [[ -n "$(anytls_ids)" ]]; then
     local anytls_id
     while read -r anytls_id; do
