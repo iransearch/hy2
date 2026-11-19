@@ -4004,9 +4004,21 @@ vmess_tcp_apply() (
 )
 
 vmess_tcp_show_links() {
+  local link user_name index=0
   [[ -f "$VMESS_TCP_DIR/meta.json" ]] || { tui_error "VMess TCP is not installed."; return 1; }
   vmess_tcp_write_links "$VMESS_TCP_DIR" || return 1
-  whiptail --title "VMess + TCP user links" --textbox "$VMESS_TCP_DIR/user-config.txt" 24 100
+  clear
+  echo "VMess + TCP (no TLS) [core: $(jq -r .core "$VMESS_TCP_DIR/meta.json")]"
+  echo "Links saved: $VMESS_TCP_DIR/user-config.txt"
+  echo
+  while IFS= read -r link; do
+    [[ -n "$link" ]] || continue
+    user_name="$(jq -r --argjson index "$index" '.users[$index].name' "$VMESS_TCP_DIR/meta.json")"
+    ((index += 1))
+    printf '[%s] %s\n%s\n\n' "$index" "$user_name" "$link"
+  done <"$VMESS_TCP_DIR/user-config.txt"
+  read -rp "Press Enter to return..." || true
+  clear
 }
 
 vmess_tcp_configure() (
