@@ -33,6 +33,11 @@ VMESS_TCP_BINARY="/usr/bin/$VMESS_TCP_CORE_NAME"
 VMESS_TCP_SERVICE="vmess-tcp.service"
 VMESS_TCP_UNIT_FILE="/etc/systemd/system/$VMESS_TCP_SERVICE"
 GECKO_LOG_CLEANUP_JOB="/etc/cron.daily/cleanup-var-log"
+GECKO_WS_DIR="/etc/ws"
+GECKO_WS_BINARY="/usr/bin/WS"
+GECKO_WS_UNIT_FILE="/etc/systemd/system/WS.service"
+GECKO_WS_RENEW_HOOK="/etc/letsencrypt/renewal-hooks/deploy/gecko-ws"
+GECKO_WS_LE_LIVE_DIR="/etc/letsencrypt/live"
 
 # Hysteria's native core uses HYSTERIA_LOG_LEVEL, while the Hysteria inbound
 # installed from the upstream TUI runs on sing-box and uses config.json.
@@ -2862,7 +2867,7 @@ xhttp_obtain_letsencrypt_certificate() {
     tui_error "Let's Encrypt completed without creating the expected certificate files."
     return 1
   fi
-  install -m 0644 "$cert_dir/fullchain.pem" "$target_dir/server.crt"
+  install -m 0644 "$cert_dir/fullchain.pem" "$target_dir/server.crt" || return 1
   install -m 0600 "$cert_dir/privkey.pem" "$target_dir/server.key"
 }
 
@@ -3774,6 +3779,160 @@ uninstall_xhttp() {
   clear
 }
 
+# Keep the upstream WS screens and link format, while making its certificate
+# path independent of the destructive upstream get_ssl/check_dep helpers.
+gecko_ws_open_tcp_port() {
+  local port="$1"
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q 'Status: active'; then
+    ufw allow "$port/tcp" || return 1
+  fi
+  if command -v csf >/dev/null 2>&1 && [[ -f /etc/csf/csf.conf ]]; then
+    if ! csf_port_exists_in_conf TCP_IN "$port"; then
+      csf_add_port_to_conf TCP_IN "$port" && csf -r || return 1
+    fi
+  fi
+}
+
+gecko_ws_migrate_config() {
+  local source_file="$1" output_file="$2" port="$3" domain="$4" listen="0.0.0.0"
+  [[ ! -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] ||
+    [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" != 0 ]] || listen="::"
+  jq --argjson port "$port" --arg domain "$domain" --arg dir "$GECKO_WS_DIR" --arg listen "$listen" '
+    ([.outbounds[]? | select(.type == "block") | .tag]) as $blocked
+    | (any(.inbounds[]?; .sniff == true)) as $sniff
+    | .inbounds[0].listen_port = $port
+    | .inbounds[0].tls.server_name = $domain
+    | .inbounds[0].tls.certificate_path = ($dir + "/server.crt")
+    | .inbounds[0].tls.key_path = ($dir + "/server.key")
+    | if (.inbounds[0].listen // "::") == "::" then .inbounds[0].listen = $listen else . end
+    | .inbounds |= map(del(.sniff, .sniff_override_destination, .sniff_timeout))
+    | .outbounds |= map(select(.type != "block"))
+    | .route.rules = ((.route.rules // []) | walk(
+        if type == "object" and has("outbound") then
+          .outbound as $target
+          | if ($blocked | index($target)) != null then .action = "reject" | del(.outbound) else . end
+        else . end))
+    | if $sniff and (any(.route.rules[]?; .action == "sniff") | not) then
+        .route.rules = ([{action:"sniff"}] + .route.rules)
+      else . end
+  ' "$source_file" >"$output_file"
+}
+
+gecko_ws_prepare_renewal() {
+  local domain="$1" cert_dir="$GECKO_WS_LE_LIVE_DIR/$1"
+  ln -sfn "$cert_dir/fullchain.pem" "$GECKO_WS_DIR/server.crt" || return 1
+  ln -sfn "$cert_dir/privkey.pem" "$GECKO_WS_DIR/server.key" || return 1
+  install -d -m 0755 "$(dirname "$GECKO_WS_RENEW_HOOK")" || return 1
+  {
+    printf '#!/bin/bash\n'
+    printf '[[ "$RENEWED_LINEAGE" == %q ]] || exit 0\n' "$cert_dir"
+    printf 'systemctl try-restart WS.service\n'
+  } >"$GECKO_WS_RENEW_HOOK" || return 1
+  chmod 0755 "$GECKO_WS_RENEW_HOOK"
+}
+
+if declare -F install_ws >/dev/null 2>&1; then
+  eval "$(declare -f install_ws | sed '1s/^install_ws[[:space:]]*()/gecko_upstream_install_ws()/')"
+fi
+if declare -F modify_ws_config >/dev/null 2>&1; then
+  eval "$(declare -f modify_ws_config | sed '1s/^modify_ws_config[[:space:]]*()/gecko_upstream_modify_ws_config()/')"
+fi
+if declare -F uninstall_ws >/dev/null 2>&1; then
+  eval "$(declare -f uninstall_ws | sed '1s/^uninstall_ws[[:space:]]*()/gecko_upstream_uninstall_ws()/')"
+fi
+
+gecko_ws_safe_setup() (
+  local operation="$1" work committed=false was_active=false was_enabled=false
+  [[ "$(id -u)" == 0 ]] || { tui_error "Run as root."; return 1; }
+  gecko_tui_check_dependencies || return 1
+  if [[ "$operation" == install && -f "$GECKO_WS_DIR/config.json" ]]; then
+    tui_error "WebSocket is already installed. Use Modify Config."; return 1
+  fi
+  if [[ "$operation" == modify && ! -f "$GECKO_WS_DIR/config.json" ]]; then
+    tui_error "WebSocket is not installed yet."; return 1
+  fi
+  work="$(mktemp -d /tmp/gecko-ws-setup.XXXXXX)" || return 1
+  # Back up everything before the upstream installer writes or removes files.
+  [[ ! -d "$GECKO_WS_DIR" ]] || cp -a "$GECKO_WS_DIR" "$work/old-dir" || { rm -rf "$work"; return 1; }
+  [[ ! -e "$GECKO_WS_BINARY" ]] || cp -a "$GECKO_WS_BINARY" "$work/old-core" || { rm -rf "$work"; return 1; }
+  [[ ! -f "$GECKO_WS_UNIT_FILE" ]] || cp -a "$GECKO_WS_UNIT_FILE" "$work/old-unit" || { rm -rf "$work"; return 1; }
+  [[ ! -f "$GECKO_WS_RENEW_HOOK" ]] || cp -a "$GECKO_WS_RENEW_HOOK" "$work/old-hook" || { rm -rf "$work"; return 1; }
+  command systemctl is-active --quiet WS.service && was_active=true
+  command systemctl is-enabled --quiet WS.service && was_enabled=true
+  gecko_ws_finish() {
+    local status="$1"
+    xhttp_restart_http_services
+    if [[ "$committed" != true ]]; then
+      command systemctl stop WS.service >/dev/null 2>&1 || true
+      command systemctl disable WS.service >/dev/null 2>&1 || true
+      rm -rf "$GECKO_WS_DIR"
+      rm -f "$GECKO_WS_BINARY" "$GECKO_WS_UNIT_FILE" "$GECKO_WS_RENEW_HOOK"
+      [[ ! -d "$work/old-dir" ]] || cp -a "$work/old-dir" "$GECKO_WS_DIR"
+      [[ ! -f "$work/old-core" ]] || install -m 0755 "$work/old-core" "$GECKO_WS_BINARY"
+      [[ ! -f "$work/old-unit" ]] || cp -a "$work/old-unit" "$GECKO_WS_UNIT_FILE"
+      [[ ! -f "$work/old-hook" ]] || cp -a "$work/old-hook" "$GECKO_WS_RENEW_HOOK"
+      command systemctl daemon-reload >/dev/null 2>&1 || true
+      [[ "$was_enabled" != true ]] || command systemctl enable WS.service >/dev/null 2>&1 || true
+      [[ "$was_active" != true ]] || command systemctl start WS.service >/dev/null 2>&1 || true
+    fi
+    rm -rf "$work"
+    trap - EXIT
+    exit "$status"
+  }
+  trap 'gecko_ws_finish "$?"' EXIT
+  # Local overrides are confined to this subshell; other protocol/legacy
+  # installers keep their original helpers and behavior.
+  set_ufw() { gecko_ws_open_tcp_port "$user_port" || exit 1; }
+  get_ssl() {
+    [[ "$1" == ws ]] || exit 1
+    domain="${2,,}"
+    xhttp_is_hostname "$domain" || { tui_error "Invalid certificate domain."; exit 1; }
+    [[ "$user_port" =~ ^[0-9]{1,5}$ ]] && ((10#$user_port >= 1 && 10#$user_port <= 65535)) || { tui_error "Invalid WS TCP port."; exit 1; }
+    user_port=$((10#$user_port))
+    gecko_ws_open_tcp_port 80 || exit 1
+    if ! xhttp_obtain_letsencrypt_certificate "$GECKO_WS_DIR" "$domain"; then
+      tui_error "WS certificate issuance failed. Previous WS files/accounts will be restored. Check DNS and inbound TCP 80."
+      exit 1
+    fi
+    # Modify must keep all existing users, paths, headers and routing policies.
+    if [[ "$operation" == modify ]]; then
+      cp "$work/old-dir/config.json" "$work/source.json" || exit 1
+    else
+      cp "$GECKO_WS_DIR/config.json" "$work/source.json" || exit 1
+    fi
+    gecko_ws_migrate_config "$work/source.json" "$work/config.json" "$user_port" "$domain" || exit 1
+    install -m 0600 "$work/config.json" "$GECKO_WS_DIR/config.json" || exit 1
+    uuid="$(jq -er '.inbounds[0].users[0].uuid' "$GECKO_WS_DIR/config.json")" || exit 1
+    "$GECKO_WS_BINARY" check -c "$GECKO_WS_DIR/config.json" || exit 1
+  }
+  systemctl() {
+    if [[ "$1" == enable && "$*" == *'--now WS'* ]]; then
+      gecko_ws_prepare_renewal "$domain" || exit 1
+      "$GECKO_WS_BINARY" check -c "$GECKO_WS_DIR/config.json" || exit 1
+      command systemctl "$@" || exit 1
+      command systemctl is-active --quiet WS.service || exit 1
+      committed=true
+    else
+      command systemctl "$@"
+    fi
+  }
+  set -e
+  case "$operation" in
+    install) gecko_upstream_install_ws ;;
+    modify) gecko_upstream_modify_ws_config ;;
+    *) return 1 ;;
+  esac
+)
+
+install_ws() { gecko_ws_safe_setup install; }
+modify_ws_config() { gecko_ws_safe_setup modify; }
+uninstall_ws() {
+  gecko_upstream_uninstall_ws
+  local status="$?"
+  [[ -d "$GECKO_WS_DIR" ]] || rm -f "$GECKO_WS_RENEW_HOOK"
+  return "$status"
+}
+
 # VMess AEAD over plain TCP. Metadata is core-neutral so users survive edits
 # and core switches; links use the v2 Base64(JSON) VMess sharing format.
 vmess_tcp_validate_metadata() {
@@ -4080,9 +4239,9 @@ vmess_tcp_refresh_egress() {
   vmess_tcp_apply "$VMESS_TCP_DIR/meta.json"
 }
 
-vmess_tcp_check_dependencies() {
+gecko_ensure_system_tools() {
   local tool manager package
-  local -a required=(jq python3 curl ss whiptail tar sha256sum find awk grep sed sort install)
+  local -a required=("$@")
   local -a missing=() packages=(ca-certificates)
   for tool in "${required[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
@@ -4099,6 +4258,7 @@ vmess_tcp_check_dependencies() {
     case "$tool" in
       ss) if [[ "$manager" == apt-get ]]; then package=iproute2; else package=iproute; fi ;;
       whiptail) if [[ "$manager" == apt-get ]]; then package=whiptail; else package=newt; fi ;;
+      crontab) if [[ "$manager" == apt-get ]]; then package=cron; else package=cronie; fi ;;
       sha256sum | sort | install) package=coreutils ;;
       find) package=findutils ;;
       awk) package=gawk ;;
@@ -4106,18 +4266,30 @@ vmess_tcp_check_dependencies() {
     esac
     [[ " ${packages[*]} " == *" $package "* ]] || packages+=("$package")
   done
-  echo "Installing missing VMess TCP dependencies: ${missing[*]}"
+  echo "Installing missing system dependencies: ${missing[*]}"
   if [[ "$manager" == apt-get ]]; then
     apt-get update || { tui_error "Could not refresh package lists. Check package repositories/network and retry."; return 1; }
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" || {
-      tui_error "Could not install VMess TCP dependencies."; return 1;
+      tui_error "Could not install system dependencies."; return 1;
     }
   elif ! "$manager" install -y "${packages[@]}"; then
-    tui_error "Could not install VMess TCP dependencies."; return 1
+    tui_error "Could not install system dependencies."; return 1
   fi
   for tool in "${required[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || { tui_error "Required program is still missing after installation: $tool"; return 1; }
   done
+}
+
+vmess_tcp_check_dependencies() {
+  gecko_ensure_system_tools jq python3 curl ss whiptail tar sha256sum find awk grep sed sort install
+}
+
+gecko_tui_check_dependencies() {
+  # Select packages by package-manager availability rather than NAME from
+  # os-release (Debian normally identifies itself as "Debian GNU/Linux").
+  # These menus use Python's standard library; no pip packages are required.
+  gecko_ensure_system_tools curl wget jq python3 whiptail openssl certbot lsof ss tar \
+    sha256sum find awk grep sed sort install crontab qrencode
 }
 
 vmess_tcp_manager_menu() {
@@ -4192,6 +4364,8 @@ EOF_XHTTP_TUI_CASE
 # This keeps the menu UI current while retaining the overrides defined above.
 tui() {
   local tui_script filtered_script status
+
+  gecko_tui_check_dependencies || return 1
 
   if ! tui_script="$(curl -fsSL --retry 3 --connect-timeout 15 "$TUI_MENU_URL")"; then
     tui_error "Could not download the TUI menu."
@@ -9979,7 +10153,6 @@ while true; do
   case $user_choice in
 
   1)
-    check_dep
     clear    
     tui
     ;;
