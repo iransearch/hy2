@@ -4575,6 +4575,7 @@ gecko_ensure_system_tools() {
   for tool in "${missing[@]}"; do
     case "$tool" in
       ss) if [[ "$manager" == apt-get ]]; then package=iproute2; else package=iproute; fi ;;
+      ssh) if [[ "$manager" == apt-get ]]; then package=openssh-client; else package=openssh-clients; fi ;;
       whiptail) if [[ "$manager" == apt-get ]]; then package=whiptail; else package=newt; fi ;;
       crontab) if [[ "$manager" == apt-get ]]; then package=cron; else package=cronie; fi ;;
       flock) package=util-linux ;;
@@ -7825,6 +7826,307 @@ gecko_relay_tunnel_menu() {
   done
 }
 
+# =======================================================
+# Find the best tunnel: TunTunnel benchmark with SSH coordination
+# =======================================================
+
+gecko_find_best_tunnel() {
+  gecko_ensure_system_tools curl python3 ssh || return 1
+  python3 -u -c "$(cat <<'PY_GECKO_TUNNEL_BENCH'
+import base64
+import getpass
+import hashlib
+import ipaddress
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import zlib
+
+
+# Pin the same benchmark on both hosts. Load upstream's benchmark at runtime.
+SOURCE_COMMIT = "1136c2b1bef5033b0a3dbdb4cc451f14eb627cb0"
+SOURCE_SHA256 = "a3b6ffcde06c2ee9bfcd64c10be2767645c3aed8922330e38696dc83c2b750d1"
+SOURCE_URL = f"https://raw.githubusercontent.com/mahdiweb3/tuntunnel/{SOURCE_COMMIT}/tunnel-extra.sh"
+REMOTE_SETUP = r'''
+set -eu
+set --
+command -v python3 >/dev/null 2>&1 || set -- "$@" python3
+command -v curl >/dev/null 2>&1 || set -- "$@" curl
+[ "$#" -gt 0 ] || exit 0
+if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y "$@"
+elif command -v dnf >/dev/null 2>&1; then dnf install -y "$@"
+elif command -v yum >/dev/null 2>&1; then yum install -y "$@"
+elif command -v apk >/dev/null 2>&1; then apk add --no-cache "$@"
+elif command -v zypper >/dev/null 2>&1; then zypper --non-interactive install "$@"
+else
+    printf 'Cannot install foreign benchmark prerequisites: %s\n' "$*" >&2
+    exit 1
+fi
+'''
+
+
+# Let each agent remove only its own benchmark interfaces even on SSH EOF.
+AGENT_LIFETIME = '''
+benchmark_interfaces = set()
+original_dispatch = dispatch
+
+def close_interfaces():
+    for name in list(benchmark_interfaces):
+        try:
+            run(["ip", "link", "del", "dev", name], timeout=5)
+        except (OSError, RuntimeError):
+            pass
+
+def end_agent(signum, _):
+    raise SystemExit(128 + signum)
+
+atexit.register(close_interfaces)
+for sig in (signal.SIGHUP, signal.SIGTERM):
+    signal.signal(sig, end_agent)
+
+def dispatch(op, k):
+    argv = k.get("argv", []) if op == "run" else []
+    if argv[:4] == ["ip", "link", "add", "name"]:
+        create = argv[4]
+    elif argv[:3] == ["ip", "tunnel", "add"]:
+        create = argv[3]
+    else:
+        create = None
+    remove = argv[4] if argv[:4] == ["ip", "link", "del", "dev"] else None
+    if remove and remove.startswith("gkbt") and remove not in benchmark_interfaces:
+        return dict(code=0, stdout="", stderr="")
+    if (argv[:3] == ["ip", "addr", "add"] or argv[:3] == ["ip", "link", "set"]):
+        name = argv[-1] if argv[1] == "addr" else argv[3]
+        if name.startswith("gkbt") and name not in benchmark_interfaces:
+            return dict(code=1, stdout="", stderr="Benchmark interface was not created")
+    result = original_dispatch(op, k)
+    if create and create.startswith("gkbt") and result["code"] == 0:
+        benchmark_interfaces.add(create)
+    if remove and result["code"] == 0:
+        benchmark_interfaces.discard(remove)
+    return result
+
+'''
+
+
+def load_benchmark(remote):
+    download = ["curl", "-fsSL", "--connect-timeout", "10", "--max-time", "40", SOURCE_URL]
+    for command in (download, remote(download)):
+        try:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=50)
+        except subprocess.TimeoutExpired:
+            continue
+        if result.returncode == 0 and hashlib.sha256(result.stdout).hexdigest() == SOURCE_SHA256:
+            return decode_benchmark(result.stdout)
+    raise RuntimeError("Could not download and verify the pinned TunTunnel benchmark on either server")
+
+
+def decode_benchmark(source):
+    match = re.search(rb"^BENCH_ZLIB_B64 = '([A-Za-z0-9+/=]+)'$", source, re.M)
+    if match is None:
+        raise RuntimeError("The pinned TunTunnel script has no benchmark payload")
+    payload = zlib.decompress(base64.b64decode(match[1], validate=True)).decode()
+    # Keep upstream transports and scoring. Give the two native profiles
+    # independent interfaces/subnets and meter parallel profiles independently.
+    replacements = {
+        'ifname_a = f"tb-ipip-a"': 'ifname_a = "gkbta" + token[:9]',
+        'ifname_b = f"tb-ipip-b" if a is b else f"tb-ipip-a"':
+            'ifname_b = "gkbtb" + token[:9]\n            native_a, native_b = gecko_native_pair(a, b)',
+        "'10.222.99.1/30'": 'native_a + "/30"',
+        "'10.222.99.2/30'": 'native_b + "/30"',
+        "'10.222.99.2'": "native_b",
+        "node.call('resources_start', names=names)": "node.call('resources_start', names=names, id=p['id'])",
+        "node.call('resources_end') for node": "node.call('resources_end', id=p['id']) for node",
+        "Foreign Server (Local)": "Foreign Server (SSH)",
+        "Iran (paired agent)": "Iran (local)",
+    }
+    for old, new in replacements.items():
+        if old not in payload:
+            raise RuntimeError("The benchmark adapter does not match the pinned source")
+        payload = payload.replace(old, new)
+
+    namespace = {"__name__": "gecko_tuntunnel_benchmark", "gecko_native_pair": native_pair}
+    exec(compile(payload, "tuntunnel-benchmark", "exec"), namespace)
+    # Keep downloaded cores in the agent's work directory, including as root.
+    agent = namespace["AGENT"].replace('pathlib.Path("/usr/local/bin" if os.geteuid() == 0 else root)', "root")
+    before, marker, after = agent.partition("for line in sys.stdin:")
+    if not marker:
+        raise RuntimeError("The benchmark agent does not match the pinned source")
+    namespace["AGENT"] = before + AGENT_LIFETIME + marker + after
+    return namespace
+
+
+allocated_subnets = set()
+subnet_lock = threading.Lock()
+
+
+def native_pair(a, b):
+    used = []
+    for node in (a, b):
+        used.extend(
+            ipaddress.IPv4Network(r["dst"], strict=False)
+            for r in node.inv["routes"]["-4"] if r.get("dst", "default") != "default"
+        )
+    # Draw /30 networks from the IPv4 benchmarking range.
+    start = int(ipaddress.IPv4Address("198.18.0.0"))
+    with subnet_lock:
+        for _ in range(128):
+            subnet = ipaddress.IPv4Network((start + 4 * secrets.randbelow(32768), 30))
+            if subnet not in allocated_subnets and not any(subnet.overlaps(network) for network in used):
+                allocated_subnets.add(subnet)
+                return tuple(map(str, subnet.hosts()))
+    raise RuntimeError("No unused IPv4 /30 is available for the native IPIP benchmark")
+
+
+def coordinated_benchmark(namespace, remote, privilege, sudo_password):
+    class BenchNode(namespace["Node"]):
+        def __init__(self, target, command, overrides, password=None):
+            self.target = target
+            self.overrides = overrides
+            self.lock = threading.Lock()
+            self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         text=True, bufsize=1, start_new_session=True)
+            try:
+                if password is not None:
+                    self.proc.stdin.write(password + "\n")
+                    self.proc.stdin.flush()
+                self.root = self.call("root")
+            except BaseException:
+                self.close()
+                raise
+
+        def close(self):
+            try:
+                try:
+                    self.proc.stdin.close()
+                except OSError:
+                    pass
+                try:
+                    self.proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    self.proc.terminate()
+                    try:
+                        self.proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.proc.kill()
+                        self.proc.wait()
+            finally:
+                self.proc.stdout.close()
+
+    agent = ["-u", "-c", namespace["AGENT"]]
+    namespace["PairedNode"] = lambda _host, _port, _key, overrides: BenchNode(
+        "Iran (local)", [sys.executable, *agent], overrides
+    )
+    namespace["Node"] = lambda _target, overrides: BenchNode(
+        "Abroad (SSH)", remote([*privilege, "python3", *agent]), overrides, sudo_password
+    )
+    path = namespace["check_path"]
+
+    def check_distinct_path(a, b, ar, br):
+        if ar["ip"] == br["ip"]:
+            raise ValueError("Select different Iran and Abroad addresses")
+        return path(a, b, ar, br)
+
+    namespace["check_path"] = check_distinct_path
+    report = Path.cwd() / f"tunnel-bench-results-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}.json"
+    sys.argv = ["gecko-find-best-tunnel", "--role", "abroad", "--iran-host", "local",
+                "--pair-key", "managed-by-ssh", "--output", str(report)]
+    return namespace["main"]()
+
+
+def main():
+    print("\nFind the best tunnel  |  Run from the Iran server")
+    address = input("Foreign server IP (Enter to go back): ").strip()
+    if not address:
+        return 0
+    host = str(ipaddress.ip_address(address))
+    port = int(input("Foreign SSH port [22]: ").strip() or "22")
+    if not 1 <= port <= 65535:
+        raise ValueError("SSH port must be between 1 and 65535")
+    user = input("Foreign SSH username [root]: ").strip() or "root"
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", user):
+        raise ValueError("Invalid SSH username")
+
+    os.umask(0o077)
+    with tempfile.TemporaryDirectory(prefix="gkbt-", dir="/tmp") as work:
+        control = str(Path(work) / "ssh")
+        ssh = ["ssh", "-F", "/dev/null", "-T", "-S", control, "-p", str(port), "-l", user,
+               "-o", "StrictHostKeyChecking=ask", "-o", "ConnectTimeout=12",
+               "-o", "ConnectionAttempts=1", "-o", "NumberOfPasswordPrompts=1",
+               "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"]
+
+        def remote(argv):
+            # Refuse a new TCP connection if the authenticated master is gone.
+            return [*ssh, "-o", "BatchMode=yes", "-o", "ProxyCommand=false", "--", host, shlex.join(argv)]
+
+        def stop_ssh():
+            if Path(control).exists():
+                try:
+                    subprocess.run([*ssh, "-O", "exit", "--", host], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+        print("Connecting by SSH. Enter the foreign password if prompted.")
+        try:
+            subprocess.run([*ssh, "-M", "-f", "-N", "-o", "ControlPersist=120", "--", host], check=True)
+            privilege, sudo_password = [], None
+            uid = subprocess.check_output(remote(["id", "-u"]), stdin=subprocess.DEVNULL,
+                                          text=True, timeout=20).strip()
+            if uid != "0":
+                privilege = ["sudo", "-n", "--"]
+                probe = subprocess.run(remote([*privilege, "id", "-u"]), stdin=subprocess.DEVNULL,
+                                       capture_output=True, text=True, timeout=20)
+                if probe.returncode or probe.stdout.strip() != "0":
+                    sudo_password = getpass.getpass("Foreign sudo password: ")
+                    privilege = ["sudo", "-S", "-k", "-p", "", "--"]
+
+            print("Preparing the foreign benchmark host...")
+            setup_input = ({"stdin": subprocess.DEVNULL} if sudo_password is None
+                           else {"input": sudo_password + "\n"})
+            subprocess.run(remote([*privilege, "sh", "-c", REMOTE_SETUP]),
+                           **setup_input, text=True, timeout=600, check=True)
+            namespace = load_benchmark(remote)
+            return coordinated_benchmark(namespace, remote, privilege, sudo_password)
+        finally:
+            stop_ssh()
+
+
+def interrupt(_signum, _frame):
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGHUP, interrupt)
+signal.signal(signal.SIGTERM, interrupt)
+try:
+    sys.exit(main())
+except (EOFError, KeyboardInterrupt):
+    print("\nTunnel benchmark cancelled.", file=sys.stderr)
+    sys.exit(130)
+except subprocess.CalledProcessError as exc:
+    print(f"SSH or foreign setup failed (exit {exc.returncode}). Check SSH access, sudo and package output.",
+          file=sys.stderr)
+    sys.exit(1)
+except subprocess.TimeoutExpired:
+    print("Timed out while preparing the tunnel benchmark.", file=sys.stderr)
+    sys.exit(1)
+except (OSError, RuntimeError, ValueError) as exc:
+    print(f"Tunnel benchmark failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY_GECKO_TUNNEL_BENCH
+)"
+}
+
 
 # =======================================================
 # Unified GECKO WARP selective outbound
@@ -10528,6 +10830,7 @@ while true; do
   echo -e "12) \e[96mMieru Protocol [Core: sing-box-extended]\e[0m"
   echo -e "13) \e[96mAnyTLS Multi-Config [Core: sing-box-extended | TLS / Reality]\e[0m"
   echo -e "14) \e[91mDisable IPv6 (sysctl + GRUB)\e[0m"
+  echo -e "15) \e[96mFind the best tunnel\e[0m"
   echo -e "0)  \e[95mExit\e[0m"
 
   read -p "Enter your choice: " user_choice
@@ -10611,6 +10914,11 @@ while true; do
   14)
     clear
     hy2_disable_ipv6 || true
+    read -rp "Press Enter to return to menu..."
+    ;;
+  15)
+    clear
+    gecko_find_best_tunnel
     read -rp "Press Enter to return to menu..."
     ;;
   0)
