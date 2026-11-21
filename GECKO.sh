@@ -6065,12 +6065,54 @@ csf_apply_install_port_defaults_c() {
 
 # ---- 1) Install ----
 
+csf_install_dependencies_c() (
+  local os_release=/etc/os-release ID="" VERSION_ID="" VERSION_CODENAME="" csf_apt_tmp
+  local -a apt_options=()
+
+  [[ -r "$os_release" ]] || os_release=/usr/lib/os-release
+  if [[ -r "$os_release" ]]; then
+    . "$os_release" || return 1
+  fi
+
+  if [[ "$ID" == debian && ( "$VERSION_CODENAME" == bullseye || "$VERSION_ID" == 11 ) ]]; then
+    csf_info_c "Using temporary Debian 11 (Bullseye) archive sources for CSF dependencies..."
+    csf_apt_tmp=$(mktemp -d /tmp/csf-perl-apt.XXXXXX) || return 1
+    trap 'rm -rf -- "$csf_apt_tmp"' EXIT
+
+    chmod 0755 "$csf_apt_tmp" || return 1
+    install -d -m 0755 "$csf_apt_tmp/sources.list.d" "$csf_apt_tmp/lists" || return 1
+    cat >"$csf_apt_tmp/sources.list" <<'EOF_CSF_APT' || return 1
+deb [check-valid-until=no] https://archive.debian.org/debian bullseye main
+deb [check-valid-until=no] https://archive.debian.org/debian-security bullseye-security main
+EOF_CSF_APT
+    apt_options=(
+      -o "Dir::Etc::sourcelist=$csf_apt_tmp/sources.list"
+      -o "Dir::Etc::sourceparts=$csf_apt_tmp/sources.list.d"
+      -o "Dir::State::lists=$csf_apt_tmp/lists"
+    )
+  fi
+
+  if ! apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update; then
+    csf_err_c "Could not refresh APT indexes for CSF dependencies."
+    return 1
+  fi
+  if ! apt-get "${apt_options[@]}" install -y wget vim perl libwww-perl liblwp-protocol-https-perl \
+    libgd-graph-perl sendmail dnsutils iptables; then
+    csf_err_c "Could not install CSF dependencies."
+    return 1
+  fi
+  if ! perl -MFile::Find -MNet::SMTP -MMath::BigInt -e 'print "Perl modules OK\n";'; then
+    csf_err_c "Required Perl modules failed to load."
+    return 1
+  fi
+)
+
 csf_install_c() {
   clear
   echo "======================================================="
   echo " CSF Firewall â€” Install"
   echo "======================================================="
-  if csf_is_installed; then
+  if csf_is_installed && [[ -s /etc/csf/csf.conf ]]; then
     csf_warn_c "CSF is already installed."
     csf --version 2>/dev/null || true
     csf_apply_install_port_defaults_c || return 1
@@ -6079,9 +6121,7 @@ csf_install_c() {
   fi
 
   csf_info_c "Installing dependencies..."
-  apt-get update -y
-  apt-get install -y wget vim perl libwww-perl liblwp-protocol-https-perl \
-    libgd-graph-perl sendmail dnsutils iptables
+  csf_install_dependencies_c || return 1
 
   csf_info_c "Downloading CSF..."
   cd /usr/src/ || { csf_err_c "Cannot cd to /usr/src/"; return 1; }
@@ -6091,11 +6131,14 @@ csf_install_c() {
   [ -s csf.tgz ] || { csf_err_c "Downloaded file is empty."; return 1; }
 
   csf_info_c "Extracting..."
-  tar -xzf csf.tgz
+  tar -xzf csf.tgz || { csf_err_c "Could not extract the CSF archive."; return 1; }
   cd csf || { csf_err_c "Cannot cd to csf directory."; return 1; }
 
   csf_info_c "Running installer..."
-  sh install.sh
+  if ! sh install.sh || ! csf_is_installed || [[ ! -s /etc/csf/csf.conf ]]; then
+    csf_err_c "CSF setup did not complete. Check the installer output above."
+    return 1
+  fi
 
   # Disable firewalld if present
   if systemctl is-active --quiet firewalld 2>/dev/null; then
