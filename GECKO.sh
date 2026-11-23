@@ -6006,6 +6006,62 @@ csf_set_conf_value_c() {
 # Cloudflare One Client/WARP egress ports. This covers MASQUE plus WireGuard
 # default and fallback UDP transports so WARP can change endpoints safely.
 CSF_CLOUDFLARE_WARP_UDP_OUT_PORTS=(443 500 1701 2408 4443 4500 8095 8443)
+CSF_DEFAULT_DENY_IPV4=(
+  85.17.155.52 85.17.155.53 178.162.202.96 178.162.202.97
+  64.62.203.97 64.62.203.98 46.165.199.7 46.165.199.9
+  85.17.70.16 85.17.70.38 85.214.228.140 63.32.168.222
+  34.229.166.50 35.212.43.152 35.212.64.89
+)
+
+csf_apply_install_deny_defaults_c() {
+  if ! perl - /etc/csf/csf.deny "${CSF_DEFAULT_DENY_IPV4[@]}" <<'EOF_CSF_DENY'
+use strict;
+use warnings;
+use Fcntl qw(O_RDWR O_CREAT LOCK_EX SEEK_SET);
+use IO::Handle;
+
+my ($file, @addresses) = @ARGV;
+my %pending = map { $_ => 1 } @addresses;
+
+# CSF uses the same exclusive lock when updating csf.deny.
+sysopen(my $deny, $file, O_RDWR | O_CREAT, 0600) or die "Cannot open $file: $!\n";
+flock($deny, LOCK_EX) or die "Cannot lock $file: $!\n";
+local $/;
+local $! = 0;
+my $original = <$deny> // '';
+die "Cannot read $file: $!\n" if $!;
+
+my $updated = $original;
+$updated =~ s{^[ \t]*((\d+(?:\.\d+){3})(?:/32)?)[ \t]*(#[^\r\n]*)?(?=\r?$)}{
+  my ($entry, $ip, $comment, $line) = ($1, $2, $3, $&);
+  if (delete $pending{$ip}) {
+    $comment //= '# GECKO default deny';
+    $comment .= ' - do not delete' unless $comment =~ /do not delete/i;
+    $line = "$entry $comment";
+  }
+  $line;
+}gme;
+
+if (%pending) {
+  $updated .= "\n" if length($updated) && $updated !~ /\n\z/;
+  for my $ip (@addresses) {
+    next unless delete $pending{$ip};
+    $updated .= "$ip # GECKO default deny - do not delete\n";
+  }
+}
+
+if ($updated ne $original) {
+  seek($deny, 0, SEEK_SET) && print({$deny} $updated) && $deny->flush()
+    && truncate($deny, length($updated)) or die "Cannot update $file: $!\n";
+}
+close($deny) or die "Cannot close $file: $!\n";
+EOF_CSF_DENY
+  then
+    csf_err_c "Could not apply default permanent IP blocks."
+    return 1
+  fi
+  csf_ok_c "Default permanent blocks saved for ${#CSF_DEFAULT_DENY_IPV4[@]} IPv4 addresses."
+}
 
 csf_apply_install_port_defaults_c() {
   local key port
@@ -6117,7 +6173,12 @@ csf_install_c() {
     csf_warn_c "CSF is already installed."
     csf --version 2>/dev/null || true
     csf_apply_install_port_defaults_c || return 1
-    csf -r >/dev/null 2>&1 && csf_ok_c "CSF rules reloaded."
+    csf_apply_install_deny_defaults_c || return 1
+    if ! csf -r >/dev/null || ! systemctl try-restart lfd; then
+      csf_err_c "Default rules were saved, but CSF or LFD failed to reload."
+      return 1
+    fi
+    csf_ok_c "CSF rules reloaded."
     return 0
   fi
 
@@ -6150,15 +6211,19 @@ csf_install_c() {
 
   # Disable TESTING mode
   csf_info_c "Setting TESTING = 0 in csf.conf..."
-  sed -i 's/^TESTING = "1"/TESTING = "0"/' /etc/csf/csf.conf
+  sed -i 's/^TESTING = "1"/TESTING = "0"/' /etc/csf/csf.conf || {
+    csf_err_c "Could not disable CSF testing mode."
+    return 1
+  }
 
   csf_apply_install_port_defaults_c || return 1
+  csf_apply_install_deny_defaults_c || return 1
 
   # Start and enable services
-  systemctl start csf
-  systemctl start lfd
-  systemctl enable csf
-  systemctl enable lfd
+  if ! systemctl enable --now csf lfd; then
+    csf_err_c "Default rules were saved, but CSF or LFD failed to start."
+    return 1
+  fi
 
   echo
   csf_ok_c "CSF installed and activated."
