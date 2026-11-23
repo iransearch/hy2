@@ -6012,16 +6012,32 @@ CSF_DEFAULT_DENY_IPV4=(
   85.17.70.16 85.17.70.38 85.214.228.140 63.32.168.222
   34.229.166.50 35.212.43.152 35.212.64.89
 )
+# IPv6 addresses from the same resolved domains and abuse reports.
+CSF_DEFAULT_DENY_IPV6=(
+  2001:470:1:332::ef 2001:470:1:332::fe 2001:470:575::97
+  2a01:238:42de:1700:85:214:228:140
+)
 
 csf_apply_install_deny_defaults_c() {
-  if ! perl - /etc/csf/csf.deny "${CSF_DEFAULT_DENY_IPV4[@]}" <<'EOF_CSF_DENY'
+  if ! perl - /etc/csf/csf.deny "${CSF_DEFAULT_DENY_IPV4[@]}" "${CSF_DEFAULT_DENY_IPV6[@]}" <<'EOF_CSF_DENY'
 use strict;
 use warnings;
 use Fcntl qw(O_RDWR O_CREAT LOCK_EX SEEK_SET);
 use IO::Handle;
+use Socket qw(AF_INET AF_INET6 inet_pton);
+
+sub address_key {
+  my ($entry) = @_;
+  my ($ip, $prefix) = split m{/}, $entry, 2;
+  my $family = index($ip, ':') >= 0 ? AF_INET6 : AF_INET;
+  my $host_prefix = $family == AF_INET6 ? 128 : 32;
+  return if defined($prefix) && $prefix ne "$host_prefix";
+  my $packed = inet_pton($family, $ip);
+  return defined($packed) ? $family . ':' . unpack('H*', $packed) : undef;
+}
 
 my ($file, @addresses) = @ARGV;
-my %pending = map { $_ => 1 } @addresses;
+my %pending = map { address_key($_) => 1 } @addresses;
 
 # CSF uses the same exclusive lock when updating csf.deny.
 sysopen(my $deny, $file, O_RDWR | O_CREAT, 0600) or die "Cannot open $file: $!\n";
@@ -6032,9 +6048,10 @@ my $original = <$deny> // '';
 die "Cannot read $file: $!\n" if $!;
 
 my $updated = $original;
-$updated =~ s{^[ \t]*((\d+(?:\.\d+){3})(?:/32)?)[ \t]*(#[^\r\n]*)?(?=\r?$)}{
-  my ($entry, $ip, $comment, $line) = ($1, $2, $3, $&);
-  if (delete $pending{$ip}) {
+$updated =~ s{^[ \t]*([0-9a-fA-F:.]+(?:/(?:32|128))?)[ \t]*(#[^\r\n]*)?(?=\r?$)}{
+  my ($entry, $comment, $line) = ($1, $2, $&);
+  my $key = address_key($entry);
+  if (defined($key) && delete $pending{$key}) {
     $comment //= '# GECKO default deny';
     $comment .= ' - do not delete' unless $comment =~ /do not delete/i;
     $line = "$entry $comment";
@@ -6045,7 +6062,7 @@ $updated =~ s{^[ \t]*((\d+(?:\.\d+){3})(?:/32)?)[ \t]*(#[^\r\n]*)?(?=\r?$)}{
 if (%pending) {
   $updated .= "\n" if length($updated) && $updated !~ /\n\z/;
   for my $ip (@addresses) {
-    next unless delete $pending{$ip};
+    next unless delete $pending{address_key($ip)};
     $updated .= "$ip # GECKO default deny - do not delete\n";
   }
 }
@@ -6060,7 +6077,10 @@ EOF_CSF_DENY
     csf_err_c "Could not apply default permanent IP blocks."
     return 1
   fi
-  csf_ok_c "Default permanent blocks saved for ${#CSF_DEFAULT_DENY_IPV4[@]} IPv4 addresses."
+  csf_ok_c "Default permanent blocks saved for ${#CSF_DEFAULT_DENY_IPV4[@]} IPv4 and ${#CSF_DEFAULT_DENY_IPV6[@]} IPv6 addresses."
+  if ! grep -Eq '^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*"1"' /etc/csf/csf.conf; then
+    csf_warn_c "IPv6 addresses were saved, but IPv6 blocking requires IPV6 = \"1\" in csf.conf."
+  fi
 }
 
 csf_apply_install_port_defaults_c() {
